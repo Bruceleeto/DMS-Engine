@@ -1,2 +1,5 @@
 *.o
 *.a
+converter/strippy
+clipping_sh4zam/pc/
+clipping_sh4zam/test.elf

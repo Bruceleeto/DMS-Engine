@@ -145,7 +145,6 @@ pvr_dr_state_t* dc_list_begin(int pvr_list) {
 
     /* Open new list */
     pvr_list_begin(pvr_list);
-    pvr_dr_init(&g_engine.dr_state);
     g_engine.current_list = pvr_list;
 
     return &g_engine.dr_state;

@@ -58,11 +58,11 @@ void dc_debug_init(void) {
 
 void dc_debug_sphere(shz_vec3_t center, float radius,
                      uint32_t argb, const DCCamera* cam) {
-    pvr_dr_state_t* dr = dc_list_begin(PVR_LIST_OP_POLY);
+    dc_list_begin(PVR_LIST_OP_POLY);
     const shz_mat4x4_t* pv = dc_camera_get_pv(cam);
 
     /* Submit debug poly header */
-    shz_sq_memcpy32_1(pvr_dr_target(*dr), &dbg_poly_header);
+    shz_sq_memcpy32_1(pvr_dr_target(0), &dbg_poly_header);
 
     float ox = center.x - cam->pos.x;
     float oy = center.y - cam->pos.y;
@@ -90,7 +90,7 @@ void dc_debug_sphere(shz_vec3_t center, float radius,
             t = shz_vec4_swizzle(t, 1, 2, 3, 0);
 
             float inv_w = (t.w > 0.001f) ? shz_invf_fsrra(t.w) : 0.0f;
-            pvr_vertex_t* pv_vert = pvr_dr_target(*dr);
+            pvr_vertex_t* pv_vert = pvr_dr_target(0);
             pv_vert->flags = src[i].flags;
             pv_vert->x = t.x * inv_w;
             pv_vert->y = t.y * inv_w;

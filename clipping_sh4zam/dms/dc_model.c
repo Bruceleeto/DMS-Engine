@@ -609,9 +609,12 @@ static void update_bounds_from_skeleton(DMSModel* model) {
         float bx = wp->elem2D[3][0];
         float by = wp->elem2D[3][1];
         float bz = wp->elem2D[3][2];
-        if (bx < minx) minx = bx; if (bx > maxx) maxx = bx;
-        if (by < miny) miny = by; if (by > maxy) maxy = by;
-        if (bz < minz) minz = bz; if (bz > maxz) maxz = bz;
+        if (bx < minx) minx = bx;
+        if (bx > maxx) maxx = bx;
+        if (by < miny) miny = by;
+        if (by > maxy) maxy = by;
+        if (bz < minz) minz = bz;
+        if (bz > maxz) maxz = bz;
     }
 
     float ex = (maxx - minx) * 0.5f;
@@ -854,9 +857,9 @@ DMSModel* dc_model_load(const char* filename) {
                                     (pvr_list == PVR_LIST_PT_POLY) ? "PT" : "TR";
 
             int tid = mesh->texture_id;
-            printf("  Mesh %lu: matflags=0x%04x alpha=%d tid=%d list=%s ds=%d color=0x%08x\n",
-                   (unsigned long)m, mesh->material_flags, alpha_mode, tid, list_name, double_sided,
-                   mesh->material_color);
+            printf("  Mesh %lu: matflags=0x%04lx alpha=%d tid=%d list=%s ds=%d color=0x%08lx\n",
+                   (unsigned long)m, (unsigned long)mesh->material_flags, alpha_mode, tid, list_name, double_sided,
+                   (unsigned long)mesh->material_color);
 
             if (tid >= 0 && tid < (int)tex_count && model->textures[tid].ptr) {
                 dttex_info_t* tex = &model->textures[tid];
@@ -887,7 +890,7 @@ DMSModel* dc_model_load(const char* filename) {
 
             /* Print first vertex color for debugging */
             if (mesh->vertex_count > 0)
-                printf("    -> v[0].argb=0x%08x\n", mesh->vertices[0].argb);
+                printf("    -> v[0].argb=0x%08lx\n", (unsigned long)mesh->vertices[0].argb);
         }
     }
 
@@ -923,7 +926,6 @@ void dc_model_load_textures(DMSModel* model, const char* base_path) {
         pvr_poly_cxt_t cxt;
 
         int alpha_mode   = mesh->material_flags & 0x3;
-        int double_sided = (mesh->material_flags >> 2) & 0x1;
         int tex_filter   = (mesh->material_flags >> 9) & 0x1;
 
         int pvr_list;
