@@ -16,14 +16,12 @@
 static DCCamera camera;
 static DCPlayer player;
 static ColWorld* col_world = NULL;
-static bool noclip = false;
 
 static DMSModel* dms_model = NULL;
 static shz_vec3_t dms_pos;
 static float dms_scale = 1.0f;
 
 static DMSModel* robot_model = NULL;
-static shz_vec3_t robot_pos;
 static float robot_scale = 1.0f;
 
 /* ========== PROFILING ========== */
@@ -87,6 +85,7 @@ int main(int argc, char* argv[]) {
 
     dc_camera_init(&camera);
     dc_player_init(&player);
+    player.cam_mode = DC_CAM_THIRD;
 
     /* Load world */
     dms_model = dc_model_load("/pc/world/test.dms");
@@ -104,15 +103,23 @@ int main(int argc, char* argv[]) {
         ColGroundHit gh = col_ground(col_world, spawn, 200.0f);
         if (gh.hit)
             spawn.y = gh.y + player.eye_height;
-        camera.pos = spawn;
         player.pos = spawn;
+
+        /* Initialize camera behind player */
+        shz_sincos_t _sc = shz_sincosf(player.yaw);
+        float _feet = spawn.y - player.eye_height;
+        camera.pos = shz_vec3_init(
+            spawn.x - _sc.sin * player.cam_distance,
+            _feet + player.cam_height,
+            spawn.z - _sc.cos * player.cam_distance
+        );
     }
 
-    /* Load robot */
+    /* Load robot (player character model) */
     robot_model = dc_model_load("/pc/robot/robot.dms");
     if (robot_model)
         dc_model_load_textures(robot_model, "/pc/robot");
-    robot_pos = shz_vec3_init(0.0f, 0.0f, 0.0f);
+    robot_scale = 1.0f;
 
     char fps_str[32];
     snprintf(fps_str, sizeof(fps_str), "FPS: --");
@@ -122,31 +129,31 @@ int main(int argc, char* argv[]) {
 
         dc_frame_begin();
         float dt = dc_delta_time();
-
-        /* ---- Animation ---- */
-        uint64_t t0 = perf_cntr_timer_ns();
-        dc_model_animate(robot_model, dt);
-        prof.anim_ns += perf_cntr_timer_ns() - t0;
-
-        /* ---- Player + Camera ---- */
-        t0 = perf_cntr_timer_ns();
         const DCInput* inp = dc_input_get(0);
 
-        /* Toggle noclip with X button */
-        if (inp && dc_input_pressed(inp, CONT_X)) {
-            noclip = !noclip;
-            if (!noclip) {
-                /* Returning to normal: sync player to camera pos */
-                player.pos = camera.pos;
-                player.vy = 0.0f;
+        /* ---- Animation: run when moving, freeze when idle ---- */
+        uint64_t t0 = perf_cntr_timer_ns();
+        {
+            bool is_moving = false;
+            if (inp) {
+                float sx = inp->stick_x;
+                float sy = inp->stick_y;
+                is_moving = (sx * sx + sy * sy > 0.02f);
+                if (!is_moving) {
+                    is_moving = dc_input_held(inp, CONT_DPAD_UP) ||
+                                dc_input_held(inp, CONT_DPAD_DOWN) ||
+                                dc_input_held(inp, CONT_DPAD_LEFT) ||
+                                dc_input_held(inp, CONT_DPAD_RIGHT);
+                }
             }
-        }
 
-        if (noclip) {
-            dc_camera_fps(&camera, inp, 20.0f, 2.0f, dt);
-        } else {
-            dc_player_update(&player, &camera, inp, col_world);
+            dc_model_set_anim(robot_model, 12);  /* sn_run_loop */
+            dc_model_animate(robot_model, is_moving ? dt * 3.0f : 0.0f);
         }
+        prof.anim_ns += perf_cntr_timer_ns() - t0;
+
+        /* ---- Input ---- */
+        t0 = perf_cntr_timer_ns();
 
         /* Reset (Y button) */
         if (inp && dc_input_held(inp, CONT_Y)) {
@@ -155,36 +162,45 @@ int main(int argc, char* argv[]) {
             camera.pos = player.pos;
             camera.yaw = 0.0f;
             camera.pitch = 0.0f;
-            noclip = false;
         }
 
+        dc_player_update(&player, &camera, inp, col_world, dt);
         dc_camera_update(&camera);
         prof.camera_ns += perf_cntr_timer_ns() - t0;
 
         /* ---- FPS string ---- */
         snprintf(fps_str, sizeof(fps_str), "FPS: %.1f", dc_fps());
 
-        /* ---- Rendering (by PVR list: OP → TR → PT) ---- */
+        /* ---- Robot position: at player feet ---- */
+        shz_vec3_t robot_pos = shz_vec3_init(
+            player.pos.x,
+            player.pos.y - player.eye_height,
+            player.pos.z
+        );
+
+        /* ---- Rendering (by PVR list: OP -> TR -> PT) ---- */
         t0 = perf_cntr_timer_ns();
         dc_model_reset_stats();
 
-        /* Pass 1: Opaque (PVR_LIST_OP_POLY) */
+        /* Pass 1: Opaque */
         dc_list_begin(PVR_LIST_OP_POLY);
         dc_model_draw_list(dms_model, dms_pos, dms_scale, &camera, PVR_LIST_OP_POLY);
-        dc_model_draw_list(robot_model, robot_pos, robot_scale, &camera, PVR_LIST_OP_POLY);
+        dc_model_draw_list_rotated(robot_model, robot_pos, robot_scale,
+                                   -(player.yaw + player.model_yaw_offset), &camera, PVR_LIST_OP_POLY);
 
-        /* Pass 2: Transparent (PVR_LIST_TR_POLY) */
+        /* Pass 2: Transparent */
         dc_list_begin(PVR_LIST_TR_POLY);
         dc_model_draw_list(dms_model, dms_pos, dms_scale, &camera, PVR_LIST_TR_POLY);
-        dc_model_draw_list(robot_model, robot_pos, robot_scale, &camera, PVR_LIST_TR_POLY);
+        dc_model_draw_list_rotated(robot_model, robot_pos, robot_scale,
+                                   -(player.yaw + player.model_yaw_offset), &camera, PVR_LIST_TR_POLY);
 
-        /* Pass 3: Punch-through (PVR_LIST_PT_POLY) */
+        /* Pass 3: Punch-through + HUD */
         dc_list_begin(PVR_LIST_PT_POLY);
         dc_model_draw_list(dms_model, dms_pos, dms_scale, &camera, PVR_LIST_PT_POLY);
-        dc_model_draw_list(robot_model, robot_pos, robot_scale, &camera, PVR_LIST_PT_POLY);
+        dc_model_draw_list_rotated(robot_model, robot_pos, robot_scale,
+                                   -(player.yaw + player.model_yaw_offset), &camera, PVR_LIST_PT_POLY);
+
         dc_draw_text(fps_str, 10, 10, 16, DC_COLOR_GREEN);
-        if (noclip)
-            dc_draw_text("NOCLIP", 10, 28, 16, DC_COLOR_GREEN);
 
         /* On-screen profile */
         if (prof_lines[0][0]) {

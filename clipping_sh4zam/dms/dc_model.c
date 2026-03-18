@@ -395,7 +395,7 @@ static void render_skinned(const DMSVertex* src, int count,
  * ================================================================ */
 
 static void draw_mesh(DMSMesh* mesh, DMSModel* model,
-                      shz_vec3_t pos, float scale,
+                      shz_vec3_t pos, float scale, float yaw,
                       const DCCamera* cam, pvr_dr_state_t* dr) {
     float bcx, bcy, bcz, br;
     int is_animated = (model->skeleton != NULL);
@@ -444,6 +444,7 @@ static void draw_mesh(DMSMesh* mesh, DMSModel* model,
         /* Build MVP with Z negation baked into scale */
         shz_xmtrx_load_4x4((shz_mat4x4_t*)pv);
         shz_xmtrx_translate(rx, ry, -rz);
+        if (yaw != 0.0f) shz_xmtrx_apply_rotation_y(yaw);
         shz_xmtrx_apply_scale(scale, scale, -scale);
 
         shz_mat4x4_t mvp;
@@ -458,6 +459,7 @@ static void draw_mesh(DMSMesh* mesh, DMSModel* model,
 
         shz_xmtrx_load_4x4((shz_mat4x4_t*)pv);
         shz_xmtrx_translate(rx, ry, -rz);
+        if (yaw != 0.0f) shz_xmtrx_apply_rotation_y(yaw);
         shz_xmtrx_apply_scale(scale, scale, scale);
 
         if (needs_clip) {
@@ -476,6 +478,11 @@ static void draw_mesh(DMSMesh* mesh, DMSModel* model,
 
 void dc_model_draw(DMSModel* model, shz_vec3_t pos, float scale,
                    const DCCamera* cam) {
+    dc_model_draw_rotated(model, pos, scale, 0.0f, cam);
+}
+
+void dc_model_draw_rotated(DMSModel* model, shz_vec3_t pos, float scale,
+                           float yaw, const DCCamera* cam) {
     if (!model || model->mesh_count == 0) return;
 
     int32_t current_tex = -2;
@@ -500,12 +507,17 @@ void dc_model_draw(DMSModel* model, shz_vec3_t pos, float scale,
             current_tex = mesh->texture_id;
             shz_sq_memcpy32_1(pvr_dr_target(*dr), &mesh->header);
         }
-        draw_mesh(mesh, model, pos, scale, cam, dr);
+        draw_mesh(mesh, model, pos, scale, yaw, cam, dr);
     }
 }
 
 void dc_model_draw_list(DMSModel* model, shz_vec3_t pos, float scale,
                         const DCCamera* cam, int target_list) {
+    dc_model_draw_list_rotated(model, pos, scale, 0.0f, cam, target_list);
+}
+
+void dc_model_draw_list_rotated(DMSModel* model, shz_vec3_t pos, float scale,
+                                float yaw, const DCCamera* cam, int target_list) {
     if (!model || model->mesh_count == 0) return;
 
     int32_t current_tex = -2;
@@ -526,7 +538,7 @@ void dc_model_draw_list(DMSModel* model, shz_vec3_t pos, float scale,
             current_tex = mesh->texture_id;
             shz_sq_memcpy32_1(pvr_dr_target(*dr), &mesh->header);
         }
-        draw_mesh(mesh, model, pos, scale, cam, dr);
+        draw_mesh(mesh, model, pos, scale, yaw, cam, dr);
     }
 }
 
@@ -634,6 +646,19 @@ void dc_model_animate(DMSModel* model, float dt) {
 
     update_skeleton(model->skeleton, dt);
     update_bounds_from_skeleton(model);
+}
+
+void dc_model_set_anim(DMSModel* model, int anim_index) {
+    if (!model || !model->skeleton) return;
+    if (anim_index < 0 || anim_index >= model->skeleton->animCount) return;
+    if (model->skeleton->currentAnim == anim_index) return;
+    model->skeleton->currentAnim = anim_index;
+    model->skeleton->currentTime = 0.0f;
+}
+
+int dc_model_get_anim(DMSModel* model) {
+    if (!model || !model->skeleton) return -1;
+    return model->skeleton->currentAnim;
 }
 
 /* ================================================================

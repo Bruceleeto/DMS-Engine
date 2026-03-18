@@ -9,7 +9,7 @@
 #define SCR_W   640.0f
 #define SCR_H   480.0f
 #define NEAR_Z  0.1f
-#define FAR_Z   100.0f
+#define FAR_Z   500.0f
 
 /* ---- Player constants ---- */
 #define EYE_HEIGHT      1.6f
