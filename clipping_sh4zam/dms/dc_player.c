@@ -35,62 +35,53 @@ void dc_player_init(DCPlayer* p) {
  * ================================================================ */
 
 static void player_physics(DCPlayer* p, float dx, float dz, ColWorld* col) {
-    /* Desired position */
-    shz_vec3_t desired = shz_vec3_init(
-        p->pos.x + dx,
-        p->pos.y,
-        p->pos.z + dz
-    );
-
-    /* Collide & slide, substep if moving fast */
+    /* Collide & slide in substeps, with per-step ground resolution */
     float move_dist_sq = dx * dx + dz * dz;
-    shz_vec3_t resolved;
+    shz_vec3_t resolved = p->pos;
 
     float half_radius = p->radius * 0.5f;
     float half_radius_sq = half_radius * half_radius;
 
+    int steps = 1;
     if (move_dist_sq > half_radius_sq) {
         float move_dist = shz_sqrtf_fsrra(move_dist_sq);
-        int steps = (int)(move_dist / half_radius) + 1;
+        steps = (int)(move_dist / half_radius) + 1;
         if (steps > 8) steps = 8;
-
-        float inv_steps = 1.0f / (float)steps;
-        float sub_dx = dx * inv_steps;
-        float sub_dz = dz * inv_steps;
-
-        resolved = p->pos;
-        for (int s = 0; s < steps; s++) {
-            shz_vec3_t sub_target = shz_vec3_init(
-                resolved.x + sub_dx,
-                resolved.y,
-                resolved.z + sub_dz
-            );
-            resolved = col_move(col, resolved, sub_target, p->radius);
-        }
-    } else {
-        resolved = col_move(col, p->pos, desired, p->radius);
     }
 
-    /* Step height check */
-    float max_ground = col ? (resolved.y - col->min_y + 1.0f) : 50.0f;
-    ColGroundHit gh = col_ground(col, resolved, max_ground);
-    float feet_y = resolved.y - p->eye_height;
+    float inv_steps = 1.0f / (float)steps;
+    float sub_dx = dx * inv_steps;
+    float sub_dz = dz * inv_steps;
 
-    if (gh.hit) {
-        float step_up = gh.y - feet_y;
+    for (int s = 0; s < steps; s++) {
+        shz_vec3_t prev = resolved;
+        shz_vec3_t sub_target = shz_vec3_init(
+            resolved.x + sub_dx,
+            resolved.y,
+            resolved.z + sub_dz
+        );
+        resolved = col_move(col, resolved, sub_target, p->radius);
 
-        if (step_up > p->max_step && step_up < p->eye_height) {
-            resolved.x = p->pos.x;
-            resolved.z = p->pos.z;
+        /* Step height check per substep */
+        float mg = col ? (resolved.y - col->min_y + 1.0f) : 50.0f;
+        ColGroundHit sgh = col_ground(col, resolved, mg);
+        float sf = resolved.y - p->eye_height;
 
-            max_ground = col ? (p->pos.y - col->min_y + 1.0f) : 50.0f;
-            gh = col_ground(col,
-                shz_vec3_init(p->pos.x, p->pos.y, p->pos.z), max_ground);
-            feet_y = p->pos.y - p->eye_height;
+        if (sgh.hit) {
+            float su = sgh.y - sf;
+            if (su > 0.0f && su <= p->max_step) {
+                resolved.y = sgh.y + p->eye_height;
+            } else if (su > p->max_step && su < p->eye_height) {
+                resolved = prev;
+                break;
+            }
         }
     }
 
     /* Gravity / ground snap */
+    float max_ground = col ? (resolved.y - col->min_y + 1.0f) : 50.0f;
+    ColGroundHit gh = col_ground(col, resolved, max_ground);
+    float feet_y = resolved.y - p->eye_height;
     if (!gh.hit || feet_y > gh.y + p->ground_snap) {
         p->vy -= p->gravity;
         resolved.y += p->vy;

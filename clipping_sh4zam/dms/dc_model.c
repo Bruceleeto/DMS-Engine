@@ -412,6 +412,15 @@ static void draw_mesh(DMSMesh* mesh, DMSModel* model,
         br  = mesh->bound_radius;
     }
 
+    /* Rotate bounding sphere center to match model yaw */
+    if (yaw != 0.0f) {
+        shz_sincos_t sc = shz_sincosf(yaw);
+        float rx = bcx * sc.cos - bcz * sc.sin;
+        float rz = bcx * sc.sin + bcz * sc.cos;
+        bcx = rx;
+        bcz = rz;
+    }
+
     shz_vec3_t wc = shz_vec3_init(
         pos.x + bcx * scale,
         pos.y + bcy * scale,

@@ -24,6 +24,10 @@ static float dms_scale = 1.0f;
 static DMSModel* robot_model = NULL;
 static float robot_scale = 1.0f;
 
+static DMSModel* dude_model = NULL;
+static shz_vec3_t dude_pos;
+static float dude_scale = 1.0f;
+
 /* ========== PROFILING ========== */
 
 typedef struct {
@@ -121,6 +125,19 @@ int main(int argc, char* argv[]) {
         dc_model_load_textures(robot_model, "/pc/robot");
     robot_scale = 1.0f;
 
+    /* Load dude NPC */
+    dude_model = dc_model_load("/pc/dude/dude.dms");
+    if (dude_model)
+        dc_model_load_textures(dude_model, "/pc/dude");
+    dude_pos = shz_vec3_init(5.0f, 0.0f, 5.0f);
+    /* Drop to ground */
+    if (col_world) {
+        ColGroundHit dgh = col_ground(col_world,
+            shz_vec3_init(dude_pos.x, col_world->max_y + 10.0f, dude_pos.z), 200.0f);
+        if (dgh.hit)
+            dude_pos.y = dgh.y;
+    }
+
     char fps_str[32];
     snprintf(fps_str, sizeof(fps_str), "FPS: --");
 
@@ -149,6 +166,7 @@ int main(int argc, char* argv[]) {
 
             dc_model_set_anim(robot_model, 12);  /* sn_run_loop */
             dc_model_animate(robot_model, is_moving ? dt * 3.0f : 0.0f);
+            dc_model_animate(dude_model, dt);
         }
         prof.anim_ns += perf_cntr_timer_ns() - t0;
 
@@ -182,23 +200,25 @@ int main(int argc, char* argv[]) {
         t0 = perf_cntr_timer_ns();
         dc_model_reset_stats();
 
+        float robot_yaw = -(player.yaw + player.model_yaw_offset);
+
         /* Pass 1: Opaque */
         dc_list_begin(PVR_LIST_OP_POLY);
         dc_model_draw_list(dms_model, dms_pos, dms_scale, &camera, PVR_LIST_OP_POLY);
-        dc_model_draw_list_rotated(robot_model, robot_pos, robot_scale,
-                                   -(player.yaw + player.model_yaw_offset), &camera, PVR_LIST_OP_POLY);
+        dc_model_draw_list_rotated(robot_model, robot_pos, robot_scale, robot_yaw, &camera, PVR_LIST_OP_POLY);
+        dc_model_draw_list(dude_model, dude_pos, dude_scale, &camera, PVR_LIST_OP_POLY);
 
         /* Pass 2: Transparent */
         dc_list_begin(PVR_LIST_TR_POLY);
         dc_model_draw_list(dms_model, dms_pos, dms_scale, &camera, PVR_LIST_TR_POLY);
-        dc_model_draw_list_rotated(robot_model, robot_pos, robot_scale,
-                                   -(player.yaw + player.model_yaw_offset), &camera, PVR_LIST_TR_POLY);
+        dc_model_draw_list_rotated(robot_model, robot_pos, robot_scale, robot_yaw, &camera, PVR_LIST_TR_POLY);
+        dc_model_draw_list(dude_model, dude_pos, dude_scale, &camera, PVR_LIST_TR_POLY);
 
         /* Pass 3: Punch-through + HUD */
         dc_list_begin(PVR_LIST_PT_POLY);
         dc_model_draw_list(dms_model, dms_pos, dms_scale, &camera, PVR_LIST_PT_POLY);
-        dc_model_draw_list_rotated(robot_model, robot_pos, robot_scale,
-                                   -(player.yaw + player.model_yaw_offset), &camera, PVR_LIST_PT_POLY);
+        dc_model_draw_list_rotated(robot_model, robot_pos, robot_scale, robot_yaw, &camera, PVR_LIST_PT_POLY);
+        dc_model_draw_list(dude_model, dude_pos, dude_scale, &camera, PVR_LIST_PT_POLY);
 
         dc_draw_text(fps_str, 10, 10, 16, DC_COLOR_GREEN);
 
@@ -226,6 +246,7 @@ int main(int argc, char* argv[]) {
             prof_print_and_reset();
     }
 
+    dc_model_free(dude_model);
     dc_model_free(robot_model);
     dc_model_free(dms_model);
     col_free(col_world);
