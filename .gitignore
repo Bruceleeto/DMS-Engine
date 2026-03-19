@@ -1,5 +1,9 @@
 *.o
 *.a
+*.dms
+*.elf
+
 converter/strippy
 clipping_sh4zam/pc/
 clipping_sh4zam/test.elf
+Sonic/pc/dude/dude.dms
