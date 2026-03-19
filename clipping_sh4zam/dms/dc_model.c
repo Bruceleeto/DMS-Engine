@@ -828,9 +828,7 @@ DMSModel* dc_model_load(const char* filename) {
         if (mesh->vertex_count > max_verts)
             max_verts = mesh->vertex_count;
 
-        printf("DMS: Mesh %lu: %lu verts, tex=%ld\n",
-               (unsigned long)m, (unsigned long)mesh->vertex_count,
-               (long)mesh->texture_id);
+        (void)0;
     }
 
     /* ---- Cache max bind radius for animated bounds ---- */
@@ -886,7 +884,6 @@ DMSModel* dc_model_load(const char* filename) {
             pvr_poly_cxt_t cxt;
 
             int alpha_mode   = mesh->material_flags & 0x3;
-            int double_sided = (mesh->material_flags >> 2) & 0x1;
             int tex_filter   = (mesh->material_flags >> 9) & 0x1;
 
             int pvr_list;
@@ -894,27 +891,16 @@ DMSModel* dc_model_load(const char* filename) {
             else if (alpha_mode == 1) pvr_list = PVR_LIST_PT_POLY;
             else                      pvr_list = PVR_LIST_TR_POLY;
 
-            const char* list_name = (pvr_list == PVR_LIST_OP_POLY) ? "OP" :
-                                    (pvr_list == PVR_LIST_PT_POLY) ? "PT" : "TR";
-
             int tid = mesh->texture_id;
-            printf("  Mesh %lu: matflags=0x%04lx alpha=%d tid=%d list=%s ds=%d color=0x%08lx\n",
-                   (unsigned long)m, (unsigned long)mesh->material_flags, alpha_mode, tid, list_name, double_sided,
-                   (unsigned long)mesh->material_color);
 
             if (tid >= 0 && tid < (int)tex_count && model->textures[tid].ptr) {
                 dttex_info_t* tex = &model->textures[tid];
-                printf("    -> TEXTURED %ux%u pvrfmt=0x%x ptr=%p\n",
-                       tex->width, tex->height, (unsigned)tex->pvrformat, tex->ptr);
                 pvr_poly_cxt_txr(&cxt, pvr_list,
                                  tex->pvrformat,
                                  tex->width, tex->height,
                                  tex->ptr,
                                  tex_filter ? PVR_FILTER_NONE : PVR_FILTER_BILINEAR);
             } else {
-                printf("    -> UNTEXTURED (tid=%d tex_count=%lu ptr=%p)\n",
-                       tid, (unsigned long)tex_count,
-                       (tid >= 0 && tid < (int)tex_count) ? model->textures[tid].ptr : NULL);
                 pvr_poly_cxt_col(&cxt, pvr_list);
             }
 
@@ -924,14 +910,9 @@ DMSModel* dc_model_load(const char* filename) {
                 cxt.txr.env = PVR_TXRENV_MODULATEALPHA;
                 cxt.blend.src = PVR_BLEND_SRCALPHA;
                 cxt.blend.dst = PVR_BLEND_INVSRCALPHA;
-                printf("    -> BLEND: srcalpha/invsrcalpha, env=MODULATEALPHA\n");
             }
 
             pvr_poly_compile(&mesh->header, &cxt);
-
-            /* Print first vertex color for debugging */
-            if (mesh->vertex_count > 0)
-                printf("    -> v[0].argb=0x%08lx\n", (unsigned long)mesh->vertices[0].argb);
         }
     }
 
