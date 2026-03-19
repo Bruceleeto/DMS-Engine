@@ -394,9 +394,10 @@ static void render_skinned(const DMSVertex* src, int count,
  * Mesh dispatch (per-mesh frustum cull + path selection)
  * ================================================================ */
 
-static void draw_mesh(DMSMesh* mesh, DMSModel* model,
-                      shz_vec3_t pos, float scale, float yaw,
-                      const DCCamera* cam, pvr_dr_state_t* dr) {
+/* Returns 1 if the mesh was drawn, 0 if culled. */
+static int draw_mesh(DMSMesh* mesh, DMSModel* model,
+                     shz_vec3_t pos, float scale, float yaw,
+                     const DCCamera* cam, pvr_dr_state_t* dr) {
     float bcx, bcy, bcz, br;
     int is_animated = (model->skeleton != NULL);
 
@@ -431,10 +432,20 @@ static void draw_mesh(DMSMesh* mesh, DMSModel* model,
     /* Frustum cull */
     if (dc_frustum_cull_sphere(cam, wc, wr) < 0) {
         g_stats.meshes_culled++;
-        return;
+        return 0;
+    }
+
+    if (is_animated) {
+        /* Animated: if near-plane intersects, cull entirely */
+        if (dc_frustum_near_intersect(cam, wc, wr)) {
+            g_stats.meshes_culled++;
+            return 0;
+        }
     }
 
     g_stats.meshes_drawn++;
+
+    shz_sq_memcpy32_1(pvr_dr_target(*dr), &mesh->header);
 
     float rx = pos.x - cam->pos.x;
     float ry = pos.y - cam->pos.y;
@@ -443,13 +454,6 @@ static void draw_mesh(DMSMesh* mesh, DMSModel* model,
     const shz_mat4x4_t* pv = dc_camera_get_pv(cam);
 
     if (is_animated) {
-        /* Animated: if near-plane intersects, cull entirely */
-        if (dc_frustum_near_intersect(cam, wc, wr)) {
-            g_stats.meshes_culled++;
-            g_stats.meshes_drawn--;
-            return;
-        }
-
         /* Build MVP with Z negation baked into scale */
         shz_xmtrx_load_4x4((shz_mat4x4_t*)pv);
         shz_xmtrx_translate(rx, ry, -rz);
@@ -479,6 +483,7 @@ static void draw_mesh(DMSMesh* mesh, DMSModel* model,
             render_fast(mesh->vertices, mesh->vertex_count, dr);
         }
     }
+    return 1;
 }
 
 /* ================================================================
@@ -513,10 +518,11 @@ void dc_model_draw_rotated(DMSModel* model, shz_vec3_t pos, float scale,
 
         pvr_dr_state_t* dr = dc_dr_state();
         if (mesh->texture_id != current_tex) {
-            current_tex = mesh->texture_id;
-            shz_sq_memcpy32_1(pvr_dr_target(*dr), &mesh->header);
+            if (draw_mesh(mesh, model, pos, scale, yaw, cam, dr))
+                current_tex = mesh->texture_id;
+        } else {
+            draw_mesh(mesh, model, pos, scale, yaw, cam, dr);
         }
-        draw_mesh(mesh, model, pos, scale, yaw, cam, dr);
     }
 }
 
@@ -544,10 +550,11 @@ void dc_model_draw_list_rotated(DMSModel* model, shz_vec3_t pos, float scale,
         dc_list_begin(target_list);
         pvr_dr_state_t* dr = dc_dr_state();
         if (mesh->texture_id != current_tex) {
-            current_tex = mesh->texture_id;
-            shz_sq_memcpy32_1(pvr_dr_target(*dr), &mesh->header);
+            if (draw_mesh(mesh, model, pos, scale, yaw, cam, dr))
+                current_tex = mesh->texture_id;
+        } else {
+            draw_mesh(mesh, model, pos, scale, yaw, cam, dr);
         }
-        draw_mesh(mesh, model, pos, scale, yaw, cam, dr);
     }
 }
 
