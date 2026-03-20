@@ -314,8 +314,7 @@ static void render_skinned(const DMSVertex* src, int count,
     {
         uint8_t bone_id = src[0].pad;
         if (bone_id != last_bone) {
-            shz_xmtrx_load_4x4(mvp);
-            shz_xmtrx_apply_4x4(&sk->bones[bone_id].skinMatrix);
+            shz_xmtrx_load_apply_4x4(mvp, &sk->bones[bone_id].skinMatrix);
             last_bone = bone_id;
         }
     }
@@ -340,8 +339,7 @@ static void render_skinned(const DMSVertex* src, int count,
         uint8_t bone_id = src[i].pad;
 
         if (bone_id != last_bone) {
-            shz_xmtrx_load_4x4(mvp);
-            shz_xmtrx_apply_4x4(&sk->bones[bone_id].skinMatrix);
+            shz_xmtrx_load_apply_4x4(mvp, &sk->bones[bone_id].skinMatrix);
             last_bone = bone_id;
         }
 
@@ -445,7 +443,7 @@ static int draw_mesh(DMSMesh* mesh, DMSModel* model,
 
     g_stats.meshes_drawn++;
 
-    shz_sq_memcpy32_1(pvr_dr_target(*dr), &mesh->header);
+    shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &mesh->header);
 
     float rx = pos.x - cam->pos.x;
     float ry = pos.y - cam->pos.y;
@@ -576,7 +574,7 @@ static void update_skeleton(DMSSkeleton* sk, float delta_time) {
         sk->currentTime += anim->duration;
 
     /* Compute interpolation frame + alpha */
-    float progress = sk->currentTime / anim->duration;
+    float progress = sk->currentTime * shz_invf_fsrra(anim->duration);
     float frame_f  = progress * (float)(anim->frameCount - 1);
     int   frame    = (int)frame_f;
     int   next     = frame + 1;
@@ -586,6 +584,7 @@ static void update_skeleton(DMSSkeleton* sk, float delta_time) {
     /* Interpolate each bone's local pose and build world matrices */
     for (int i = 0; i < sk->boneCount; i++) {
         DMSBone* bone = &sk->bones[i];
+
         DMSTransform* curr = &anim->framePoses[frame * sk->boneCount + i];
         DMSTransform* nxt  = &anim->framePoses[next  * sk->boneCount + i];
 
@@ -600,21 +599,15 @@ static void update_skeleton(DMSSkeleton* sk, float delta_time) {
                              bone->localPose.scale.y,
                              bone->localPose.scale.z);
         shz_xmtrx_apply_rotation_quat(bone->localPose.rotation);
-        shz_xmtrx_apply_translation(bone->localPose.translation.x,
-                                    bone->localPose.translation.y,
-                                    bone->localPose.translation.z);
+        shz_xmtrx_set_translation(bone->localPose.translation.x,
+                                  bone->localPose.translation.y,
+                                  bone->localPose.translation.z);
 
         if (bone->parent >= 0) {
             shz_xmtrx_apply_reverse_4x4(&sk->bones[bone->parent].worldPose);
         }
 
         shz_xmtrx_store_4x4(&bone->worldPose);
-    }
-
-    /* Compute skin matrices: worldPose * inverseBindMatrix */
-    for (int i = 0; i < sk->boneCount; i++) {
-        DMSBone* bone = &sk->bones[i];
-        shz_xmtrx_load_4x4(&bone->worldPose);
         shz_xmtrx_apply_4x4(&bone->inverseBindMatrix);
         shz_xmtrx_store_4x4(&bone->skinMatrix);
     }

@@ -124,7 +124,7 @@ static float lerp_angle(float from, float to, float t) {
 /* ================================================================
  * FPS mode
  * ================================================================ */
-
+SHZ_NO_FAST_MATH
 static void update_fps(DCPlayer* p, DCCamera* cam,
                        const DCInput* inp, ColWorld* col, float dt) {
     /* Look: left stick */
@@ -169,7 +169,7 @@ static void update_fps(DCPlayer* p, DCCamera* cam,
 /* ================================================================
  * Third-person mode
  * ================================================================ */
-
+SHZ_NO_FAST_MATH
 static void update_third(DCPlayer* p, DCCamera* cam,
                          const DCInput* inp, ColWorld* col, float dt) {
     /*
@@ -238,7 +238,7 @@ static void update_third(DCPlayer* p, DCCamera* cam,
 /* ================================================================
  * Noclip mode
  * ================================================================ */
-
+SHZ_NO_FAST_MATH
 static void update_noclip(DCPlayer* p, DCCamera* cam,
                           const DCInput* inp, float dt) {
     cam->yaw   += inp->stick_x * p->look_speed * dt;
