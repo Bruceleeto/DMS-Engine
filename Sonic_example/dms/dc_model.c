@@ -458,7 +458,7 @@ static int draw_mesh(DMSMesh* mesh, DMSModel* model,
         if (yaw != 0.0f) shz_xmtrx_apply_rotation_y(yaw);
         shz_xmtrx_apply_scale(scale, scale, -scale);
 
-        shz_mat4x4_t mvp;
+        alignas(32) shz_mat4x4_t mvp;
         shz_xmtrx_store_4x4(&mvp);
 
         g_stats.verts_xformed += mesh->vertex_count;
@@ -608,8 +608,7 @@ static void update_skeleton(DMSSkeleton* sk, float delta_time) {
         }
 
         shz_xmtrx_store_4x4(&bone->worldPose);
-        shz_xmtrx_apply_4x4(&bone->inverseBindMatrix);
-        shz_xmtrx_store_4x4(&bone->skinMatrix);
+        shz_xmtrx_apply_store_4x4(&bone->skinMatrix, &bone->inverseBindMatrix);
     }
 }
 
