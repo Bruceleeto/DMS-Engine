@@ -1,6 +1,6 @@
 TARGET = test.elf
-OBJS = main.o dms/dc_engine.o dms/dc_input.o dms/dc_camera.o dms/dc_model.o \
-       dms/dc_player.o dms/dc_draw2d.o dms/dc_debug.o dms/collision.o
+OBJS = main.o ../dms/dc_engine.o ../dms/dc_input.o ../dms/dc_camera.o ../dms/dc_model.o \
+       ../dms/dc_player.o ../dms/dc_draw2d.o ../dms/dc_debug.o ../dms/collision.o
 
 # Where assets go - change to romdisk/ for rd, etc.
 OUTPUT_DIR = pc
@@ -13,7 +13,7 @@ CONVERTER_DIR = ../converter
 STRIPPY = $(CONVERTER_DIR)/strippy
 STRIPPY_FLAGS = $(if $(filter 1,$(BAKE)),-bake,)
 
-CFLAGS += -std=gnu2x -O3  \
+CFLAGS += -std=gnu2x -O3 -I.. \
           -fomit-frame-pointer -flto -fbuiltin -ffast-math -ffp-contract=fast -mfsrra -mfsca \
           -fmerge-all-constants -funroll-loops -fno-PIC -fipa-pta \
           -ftree-vectorize -I$(KOS_BASE)/utils
