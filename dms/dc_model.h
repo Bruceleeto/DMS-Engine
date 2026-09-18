@@ -62,6 +62,7 @@ typedef struct {
     uint32_t meshes_culled;
     uint32_t verts_xformed;
     uint32_t verts_clipped;
+    uint32_t tris_drawn;
 } DCModelStats;
 
 /* Reset counters to zero. */

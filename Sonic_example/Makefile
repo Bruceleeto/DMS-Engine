@@ -1,9 +1,11 @@
 TARGET = test.elf
 OBJS = main.o ../dms/dc_engine.o ../dms/dc_input.o ../dms/dc_camera.o ../dms/dc_model.o \
-       ../dms/dc_player.o ../dms/dc_draw2d.o ../dms/dc_debug.o ../dms/collision.o
+       ../dms/dc_player.o ../dms/dc_draw2d.o ../dms/dc_debug.o ../dms/collision.o \
+       romdisk.o
 
-# Where assets go - change to romdisk/ for rd, etc.
-OUTPUT_DIR = pc
+# Converted assets go here and get baked into the romdisk (mounted at /rd)
+OUTPUT_DIR = romdisk
+KOS_ROMDISK_DIR = $(OUTPUT_DIR)
 
 # Set BAKE=1 to bake vertex lighting (AO, shadows)
 BAKE = 1
@@ -28,26 +30,27 @@ $(STRIPPY):
 	$(MAKE) -C $(CONVERTER_DIR)
 
 # make assets - convert all .glb in assets/ -> .dms + .dt in OUTPUT_DIR
-assets: $(STRIPPY)
-	@mkdir -p $(OUTPUT_DIR)
-	@for glb in assets/*/*.glb; do \
-		if [ -f "$$glb" ]; then \
-			dir=$$(basename $$(dirname "$$glb")); \
-			base=$$(basename "$$glb" .glb); \
-			mkdir -p $(OUTPUT_DIR)/$$dir; \
-			echo "=== Converting $$glb $(if $(filter 1,$(BAKE)),(BAKED),) ==="; \
-			cp "$$glb" $(OUTPUT_DIR)/$$dir/; \
-			cd $(OUTPUT_DIR)/$$dir && $(abspath $(STRIPPY)) $(STRIPPY_FLAGS) "$$base.glb" && rm -f "$$base.glb" && cd ../..; \
-		fi; \
-	done
+GLBS = $(wildcard assets/*/*.glb)
+DMS  = $(patsubst assets/%.glb,$(OUTPUT_DIR)/%.dms,$(GLBS))
+
+assets: $(DMS)
+
+$(OUTPUT_DIR)/%.dms: assets/%.glb | $(STRIPPY)
+	@mkdir -p $(@D)
+	@echo "=== Converting $< $(if $(filter 1,$(BAKE)),(BAKED),) ==="
+	cp $< $(@D)/
+	cd $(@D) && $(abspath $(STRIPPY)) $(STRIPPY_FLAGS) $(notdir $<) && rm -f $(notdir $<)
+
+# Rebuild the romdisk image whenever a converted asset changes
+romdisk.img: $(DMS)
 
 include $(KOS_BASE)/Makefile.rules
 
 clean: rm-elf
-	-rm -f $(OBJS)
+	-rm -f $(OBJS) romdisk.img
 
 assets-clean:
-	-rm -f $(OUTPUT_DIR)/*.dms $(OUTPUT_DIR)/*.dt
+	-rm -rf $(OUTPUT_DIR) romdisk.img romdisk.o
 
 rm-elf:
 	-rm -f $(TARGET)

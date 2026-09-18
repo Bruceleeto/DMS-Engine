@@ -86,6 +86,7 @@ typedef struct {
     float    bound_radius;
     uint32_t material_flags;        /* v5: packed material bits */
     float    alpha_cutoff;          /* v5: for CUTOUT alpha mode */
+    uint32_t tri_count;             /* triangles across all strips (computed at load) */
     DMSVertex *vertices;            /* bind-pose / static verts */
     DMSVertex *animated_vertices;   /* skinned output (NULL if static) */
     pvr_poly_hdr_t header __attribute__((aligned(32)));

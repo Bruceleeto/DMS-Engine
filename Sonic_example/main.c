@@ -40,6 +40,7 @@ typedef struct {
     uint32_t world_meshes_culled;
     uint32_t world_verts_xformed;
     uint32_t world_verts_clipped;
+    uint32_t tris_drawn;
 
     uint32_t samples;
 } FrameProfile;
@@ -63,6 +64,10 @@ static void prof_print_and_reset(void) {
     uint32_t culled = prof.world_meshes_culled / prof.samples;
     uint32_t xform  = prof.world_verts_xformed / prof.samples;
     uint32_t clip   = prof.world_verts_clipped / prof.samples;
+
+    float secs = (float)prof.frame_total_ns / 1e9f;
+    printf("PPS: %.0f polys/sec (%lu tris/frame)\n",
+           (float)prof.tris_drawn / secs, (unsigned long)(prof.tris_drawn / prof.samples));
 
     snprintf(prof_lines[0], sizeof(prof_lines[0]), "FRAME: %.2f ms", total_ms);
     snprintf(prof_lines[1], sizeof(prof_lines[1]), "ANIM: %.0f us", anim_us);
@@ -92,9 +97,9 @@ int main(int argc, char* argv[]) {
     player.cam_mode = DC_CAM_THIRD;
 
     /* Load world */
-    dms_model = dc_model_load("/pc/world/test.dms");
+    dms_model = dc_model_load("/rd/world/test.dms");
     if (dms_model)
-        dc_model_load_textures(dms_model, "/pc/world");
+        dc_model_load_textures(dms_model, "/rd/world");
     dms_pos = shz_vec3_init(0.0f, 0.0f, 0.0f);
     dms_scale = 1.0f;
 
@@ -120,15 +125,15 @@ int main(int argc, char* argv[]) {
     }
 
     /* Load robot (player character model) */
-    robot_model = dc_model_load("/pc/robot/robot.dms");
+    robot_model = dc_model_load("/rd/robot/robot.dms");
     if (robot_model)
-        dc_model_load_textures(robot_model, "/pc/robot");
+        dc_model_load_textures(robot_model, "/rd/robot");
     robot_scale = 1.0f;
 
     /* Load dude NPC */
-    dude_model = dc_model_load("/pc/dude/dude.dms");
+    dude_model = dc_model_load("/rd/dude/dude.dms");
     if (dude_model)
-        dc_model_load_textures(dude_model, "/pc/dude");
+        dc_model_load_textures(dude_model, "/rd/dude");
     dude_pos = shz_vec3_init(5.0f, 0.0f, 5.0f);
     /* Drop to ground */
     if (col_world) {
@@ -234,6 +239,7 @@ int main(int argc, char* argv[]) {
         prof.world_meshes_culled += ms->meshes_culled;
         prof.world_verts_xformed += ms->verts_xformed;
         prof.world_verts_clipped += ms->verts_clipped;
+        prof.tris_drawn          += ms->tris_drawn;
 
         prof.render_ns += perf_cntr_timer_ns() - t0;
 

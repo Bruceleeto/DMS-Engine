@@ -442,6 +442,7 @@ static int draw_mesh(DMSMesh* mesh, DMSModel* model,
     }
 
     g_stats.meshes_drawn++;
+    g_stats.tris_drawn += mesh->tri_count;
 
     shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &mesh->header);
 
@@ -816,6 +817,16 @@ DMSModel* dc_model_load(const char* filename) {
         mesh->vertices = memalign(32, mesh->vertex_count * sizeof(DMSVertex));
         fread(mesh->vertices, sizeof(DMSVertex), mesh->vertex_count, f);
         mesh->animated_vertices = NULL;
+
+        /* Count triangles: each strip of n verts contributes n-2 */
+        mesh->tri_count = 0;
+        for (uint32_t v = 0, strip_len = 0; v < mesh->vertex_count; v++) {
+            strip_len++;
+            if (mesh->vertices[v].flags == PVR_CMD_VERTEX_EOL) {
+                if (strip_len >= 3) mesh->tri_count += strip_len - 2;
+                strip_len = 0;
+            }
+        }
 
         if (mesh->vertex_count > max_verts)
             max_verts = mesh->vertex_count;
