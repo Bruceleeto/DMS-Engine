@@ -90,8 +90,10 @@ void dc_camera_update(DCCamera* cam) {
     float aspect = SCR_W / SCR_H;
 
     /* Build projection_view matrix into XMTRX, then store */
-    shz_xmtrx_init_identity();
-    shz_xmtrx_apply_permutation_wxyz();
+    /* Not init_identity + apply_permutation_wxyz: sh4zam's SH4 apply version
+     * "zeroes" fr2 with fmul by 0, so leftover Inf/NaN in fr2 poisons the
+     * screen-y row with NaN and everything drawn vanishes. */
+    shz_xmtrx_init_permutation_wxyz();
     shz_xmtrx_apply_screen(SCR_W, SCR_H);
     shz_xmtrx_apply_perspective(fov_rad, aspect, NEAR_Z);
     shz_xmtrx_apply_rotation_x(cam->pitch);
@@ -177,7 +179,7 @@ void dc_camera_look_at(DCCamera* cam, shz_vec3_t target) {
     float xz_dist = shz_sqrtf_fsrra(dx * dx + dz * dz);
 
     cam->yaw   = shz_atanf(dx / (dz + 0.0001f));
-    cam->pitch = shz_atanf(dy / (xz_dist + 0.0001f));
+    cam->pitch = -shz_atanf(dy / (xz_dist + 0.0001f));   /* positive pitch looks down */
 
     /* Fix quadrant for atan */
     if (dz < 0.0f) cam->yaw += SHZ_F_PI;
