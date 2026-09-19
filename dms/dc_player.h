@@ -30,14 +30,14 @@ typedef struct {
     float height;           /* full character height (1.8) */
     float eye_height;       /* camera height in FPS (1.6) */
     float radius;           /* collision radius (0.3) */
-    float gravity;          /* 0.15 */
+    float gravity;          /* 0.01 */
     float ground_snap;      /* 0.5 */
     float max_step;         /* 0.35 */
     float move_speed;       /* 0.1 */
     float sprint_speed;     /* 0.3 */
     float look_speed;       /* 2.0 */
     float pitch_limit;      /* PI * 0.45 */
-    float jump_force;       /* 0.25 */
+    float jump_force;       /* 0.15 */
 
     /* 3rd-person tuning */
     float cam_distance;     /* distance behind player (4.0) */

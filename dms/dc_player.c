@@ -13,14 +13,14 @@ void dc_player_init(DCPlayer* p) {
     p->height       = 1.8f;
     p->eye_height   = 1.6f;
     p->radius       = 0.3f;
-    p->gravity      = 0.15f;
+    p->gravity      = 0.01f;   /* per frame^2: ~36 units/s^2 at 60fps */
     p->ground_snap  = 0.5f;
     p->max_step     = 0.35f;
     p->move_speed   = 1.0f;
     p->sprint_speed = 0.3f;
     p->look_speed   = 2.0f;
     p->pitch_limit  = DC_PITCH_LIMIT_DEFAULT;
-    p->jump_force   = 0.25f;
+    p->jump_force   = 0.15f;   /* ~1.1 units high, ~0.5s in the air */
 
     p->cam_distance  = 5.0f;
     p->cam_height    = 2.0f;
@@ -78,11 +78,11 @@ static void player_physics(DCPlayer* p, float dx, float dz, ColWorld* col) {
         }
     }
 
-    /* Gravity / ground snap */
+    /* Gravity / ground snap. Moving up (a jump) is never snapped back down. */
     float max_ground = col ? (resolved.y - col->min_y + 1.0f) : 50.0f;
     ColGroundHit gh = col_ground(col, resolved, max_ground);
     float feet_y = resolved.y - p->eye_height;
-    if (!gh.hit || feet_y > gh.y + p->ground_snap) {
+    if (!gh.hit || p->vy > 0.0f || feet_y > gh.y + p->ground_snap) {
         p->vy -= p->gravity;
         resolved.y += p->vy;
 
