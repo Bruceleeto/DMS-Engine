@@ -86,16 +86,16 @@ typedef struct {
     uint32_t material_color;
     float    bound_cx, bound_cy, bound_cz;
     float    bound_radius;
-    uint32_t material_flags;        /* v5: packed material bits */
-    float    alpha_cutoff;          /* v5: for CUTOUT alpha mode */
+    uint32_t material_flags;        /* packed material bits */
+    float    alpha_cutoff;          /* for CUTOUT alpha mode */
     uint32_t tri_count;             /* triangles across all strips (computed at load) */
-    uint32_t block;                 /* v6: block this mesh belongs to */
+    uint32_t block;                 /* block this mesh belongs to */
     DMSVertex *vertices;            /* bind-pose / static verts */
     DMSVertex *animated_vertices;   /* skinned output (NULL if static) */
     pvr_poly_hdr_t header __attribute__((aligned(32)));
 } DMSMesh;
 
-/* v6: static levels are cut into blocks by location; one sphere culls
+/* static levels are cut into blocks by location; one sphere culls
  * every mesh in the block */
 typedef struct {
     float cx, cy, cz, radius;
@@ -103,11 +103,11 @@ typedef struct {
 
 typedef struct {
     uint32_t    mesh_count;
-    uint32_t    opaque_count;       /* v5: meshes [0..opaque-1] → OP list */
-    uint32_t    cutout_count;       /* v5: meshes [opaque..+cutout-1] → PT list */
-    uint32_t    transparent_count;  /* v5: remaining → TR list */
+    uint32_t    opaque_count;       /* meshes [0..opaque-1] → OP list */
+    uint32_t    cutout_count;       /* meshes [opaque..+cutout-1] → PT list */
+    uint32_t    transparent_count;  /* remaining → TR list */
     DMSMesh    *meshes;
-    uint32_t    block_count;        /* v6, 0 for older files and animated models */
+    uint32_t    block_count;        /* 0 for animated models */
     DMSBlock   *blocks;
     dttex_info_t *textures;
     int          texture_count;

@@ -21,6 +21,15 @@ static DMSModel* dms_model = NULL;
 static shz_vec3_t dms_pos;
 static float dms_scale = 1.0f;
 
+/* Player character (skinned, animated) */
+static DMSModel* char_model = NULL;
+static float char_scale = 1.0f;
+
+/* Animation indices, in the order they are in model.glb */
+#define ANIM_ATTACK 0
+#define ANIM_STAND  12
+#define ANIM_WALK   14
+
 /* ========== PROFILING ========== */
 
 typedef struct {
@@ -101,7 +110,10 @@ int main(int argc, char* argv[]) {
 
     dc_camera_init(&camera);
     dc_player_init(&player);
-    player.cam_mode = DC_CAM_FPS;
+    player.cam_mode = DC_CAM_THIRD;
+    player.move_speed = 0.08f;   /* walking pace for the character (per frame) */
+    player.cam_distance = 3.0f;  /* closer so the character fills more of the screen */
+    player.cam_height = 1.7f;
 
     /* Load world */
     dms_model = dc_model_load("/pc/world/test.dms");
@@ -119,8 +131,28 @@ int main(int argc, char* argv[]) {
             spawn.y = gh.y + player.eye_height;
         player.pos = spawn;
 
-        /* First person: camera sits at the player's eyes */
-        camera.pos = spawn;
+        /* Third person: camera starts behind the player */
+        shz_sincos_t sc = shz_sincosf(player.yaw);
+        float feet = spawn.y - player.eye_height;
+        camera.pos = shz_vec3_init(spawn.x - sc.sin * player.cam_distance,
+                                   feet + player.cam_height,
+                                   spawn.z - sc.cos * player.cam_distance);
+    }
+
+    /* Load character, scaled so it matches the player's collision height */
+    char_model = dc_model_load("/pc/char/model.dms");
+    if (char_model) {
+        float lo = 1e30f, hi = -1e30f;
+        for (uint32_t m = 0; m < char_model->mesh_count; m++) {
+            const DMSMesh* mesh = &char_model->meshes[m];
+            for (uint32_t v = 0; v < mesh->vertex_count; v++) {
+                float y = mesh->vertices[v].y;
+                if (y < lo) lo = y;
+                if (y > hi) hi = y;
+            }
+        }
+        if (hi > lo) char_scale = player.height / (hi - lo);
+        printf("Character height %.2f, scale %.3f\n", hi - lo, char_scale);
     }
 
     printf("VRAM free after loading: %luKB\n", (unsigned long)(pvr_mem_available() / 1024));
@@ -136,6 +168,24 @@ int main(int argc, char* argv[]) {
         const DCInput* inp = dc_input_get(0);
 
         uint64_t t0;
+
+        /* ---- Animation: walk when moving, attack on X, else stand ---- */
+        t0 = perf_cntr_timer_ns();
+        if (char_model) {
+            bool moving = false;
+            if (inp) {
+                moving = inp->stick_x * inp->stick_x + inp->stick_y * inp->stick_y > 0.02f ||
+                         dc_input_held(inp, CONT_DPAD_UP) || dc_input_held(inp, CONT_DPAD_DOWN) ||
+                         dc_input_held(inp, CONT_DPAD_LEFT) || dc_input_held(inp, CONT_DPAD_RIGHT);
+            }
+            int anim = ANIM_STAND;
+            if (inp && dc_input_held(inp, CONT_X)) anim = ANIM_ATTACK;
+            else if (moving) anim = ANIM_WALK;
+            if (dc_model_get_anim(char_model) != anim)
+                dc_model_set_anim(char_model, anim);
+            dc_model_animate(char_model, dt);
+        }
+        prof.anim_ns += perf_cntr_timer_ns() - t0;
 
         /* ---- Input ---- */
         t0 = perf_cntr_timer_ns();
@@ -156,6 +206,10 @@ int main(int argc, char* argv[]) {
         /* ---- FPS string ---- */
         snprintf(fps_str, sizeof(fps_str), "FPS: %.1f", dc_fps());
 
+        /* ---- Character sits at the player's feet ---- */
+        shz_vec3_t char_pos = shz_vec3_init(player.pos.x, player.pos.y - player.eye_height, player.pos.z);
+        float char_yaw = -(player.yaw + player.model_yaw_offset);
+
         /* ---- Rendering (by PVR list: OP -> TR -> PT) ---- */
         t0 = perf_cntr_timer_ns();
         dc_model_reset_stats();
@@ -163,14 +217,17 @@ int main(int argc, char* argv[]) {
         /* Pass 1: Opaque */
         dc_list_begin(PVR_LIST_OP_POLY);
         dc_model_draw_list(dms_model, dms_pos, dms_scale, &camera, PVR_LIST_OP_POLY);
+        dc_model_draw_list_rotated(char_model, char_pos, char_scale, char_yaw, &camera, PVR_LIST_OP_POLY);
 
         /* Pass 2: Transparent */
         dc_list_begin(PVR_LIST_TR_POLY);
         dc_model_draw_list(dms_model, dms_pos, dms_scale, &camera, PVR_LIST_TR_POLY);
+        dc_model_draw_list_rotated(char_model, char_pos, char_scale, char_yaw, &camera, PVR_LIST_TR_POLY);
 
         /* Pass 3: Punch-through + HUD */
         dc_list_begin(PVR_LIST_PT_POLY);
         dc_model_draw_list(dms_model, dms_pos, dms_scale, &camera, PVR_LIST_PT_POLY);
+        dc_model_draw_list_rotated(char_model, char_pos, char_scale, char_yaw, &camera, PVR_LIST_PT_POLY);
 
         dc_draw_text(fps_str, 10, 10, 16, DC_COLOR_GREEN);
 
@@ -199,6 +256,7 @@ int main(int argc, char* argv[]) {
             prof_print_and_reset();
     }
 
+    dc_model_free(char_model);
     dc_model_free(dms_model);
     col_free(col_world);
     dc_shutdown();
