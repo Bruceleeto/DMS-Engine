@@ -9,7 +9,7 @@
 #define SCR_W   640.0f
 #define SCR_H   480.0f
 #define NEAR_Z  0.1f
-#define FAR_Z   200.0f
+#define FAR_Z   1000.0f   /* cull distance only (no far clip); lower it to trade view distance for speed */
 
 /* ---- Player constants ---- */
 #define EYE_HEIGHT      1.6f
@@ -18,13 +18,15 @@
 #define GROUND_SNAP     0.5f
 #define MAX_STEP_HEIGHT 0.35f
 
-/* ---- Outcode flags ---- */
+/* ---- Outcode flags: bit n = clip plane n in plane_dist (plane 1 unused) ---- */
 #define OC_NEAR   0x01
-#define OC_FAR    0x02
 #define OC_LEFT   0x04
 #define OC_RIGHT  0x08
-#define OC_BOTTOM 0x10
-#define OC_TOP    0x20
+#define OC_TOP    0x10
+#define OC_BOTTOM 0x20
+
+/* ---- .dms file magic ---- */
+#define DMS_MAGIC   0x54534D44u   /* "DMST" */
 
 /* ================================================================
  * Animation / Skeleton structures
@@ -87,10 +89,17 @@ typedef struct {
     uint32_t material_flags;        /* v5: packed material bits */
     float    alpha_cutoff;          /* v5: for CUTOUT alpha mode */
     uint32_t tri_count;             /* triangles across all strips (computed at load) */
+    uint32_t block;                 /* v6: block this mesh belongs to */
     DMSVertex *vertices;            /* bind-pose / static verts */
     DMSVertex *animated_vertices;   /* skinned output (NULL if static) */
     pvr_poly_hdr_t header __attribute__((aligned(32)));
 } DMSMesh;
+
+/* v6: static levels are cut into blocks by location; one sphere culls
+ * every mesh in the block */
+typedef struct {
+    float cx, cy, cz, radius;
+} DMSBlock;
 
 typedef struct {
     uint32_t    mesh_count;
@@ -98,6 +107,8 @@ typedef struct {
     uint32_t    cutout_count;       /* v5: meshes [opaque..+cutout-1] → PT list */
     uint32_t    transparent_count;  /* v5: remaining → TR list */
     DMSMesh    *meshes;
+    uint32_t    block_count;        /* v6, 0 for older files and animated models */
+    DMSBlock   *blocks;
     dttex_info_t *textures;
     int          texture_count;
     DMSSkeleton *skeleton;

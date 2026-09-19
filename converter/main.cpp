@@ -1,10 +1,16 @@
 #include "main.h"
 #define CGLTF_IMPLEMENTATION
 #include "include/cgltf.h"
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_PNG
+#define STBI_ONLY_JPEG
+#include "include/stb_image.h"
 #include <algorithm>
 #include <numeric>
 #include <random>
 #include <omp.h>
+#include <set>
+#include <functional>
 
 // Transform data
 typedef struct Transform {
@@ -67,6 +73,7 @@ typedef struct {
   float alphaCutoff;      // for CUTOUT mode (default 0.5)
   int doubleSided;        // 0=single-sided, 1=double-sided
   int wrapU, wrapV;       // raw glTF sampler values (10497=REPEAT, 33071=CLAMP, 33648=MIRROR)
+  int blockId;            // static levels: which block (by location) this mesh is in
 
 } Mesh;
 
@@ -74,6 +81,7 @@ typedef struct {
   Mesh *meshes;
   int meshCount;
   Skeleton *skeleton;
+  int blockCount;         // 0 = no blocks (animated models)
 } Model;
 
 typedef struct {
@@ -503,34 +511,43 @@ static int RunPvrtex(const char *inPath, const char *outPath) {
     return system(cmd);
 }
 
-/* Check if a cgltf image is a PNG with an alpha channel (RGBA or gray+alpha).
+/* Look at a cgltf image's alpha pixels, like pvrtex -f auto does:
+ * 0 = fully opaque, 1 = on/off alpha (cutout), 2 = soft alpha (blend).
+ * A few soft pixels on an otherwise on/off texture are just antialiased
+ * cutout edges (foliage, fences), so they still count as cutout.
  * Works for both embedded (buffer_view) and external images. */
-static bool CgltfImageHasAlpha(cgltf_image *img, const char *inputDir) {
-    uint8_t hdr[26];
+static int CgltfImageAlphaKind(cgltf_image *img, const char *inputDir) {
+    static std::map<cgltf_image *, int> cache;
+    auto it = cache.find(img);
+    if (it != cache.end()) return it->second;
+
+    int w, h, n;
+    unsigned char *px = NULL;
 
     if (img->buffer_view) {
-        const uint8_t *p = (const uint8_t *)img->buffer_view->buffer->data
+        const stbi_uc *p = (const stbi_uc *)img->buffer_view->buffer->data
                            + img->buffer_view->offset;
-        if (img->buffer_view->size < 26) return false;
-        memcpy(hdr, p, 26);
+        px = stbi_load_from_memory(p, (int)img->buffer_view->size, &w, &h, &n, 4);
     } else if (img->uri && strncmp(img->uri, "data:", 5) != 0) {
         char path[512];
         snprintf(path, sizeof(path), "%s/%s", inputDir, img->uri);
-        FILE *f = fopen(path, "rb");
-        if (!f) return false;
-        size_t n = fread(hdr, 1, 26, f);
-        fclose(f);
-        if (n < 26) return false;
-    } else {
-        return false;
+        px = stbi_load(path, &w, &h, &n, 4);
     }
 
-    /* PNG signature check, then color type at IHDR offset 25:
-     * 4 = grayscale+alpha, 6 = RGBA */
-    if (hdr[0] == 0x89 && hdr[1] == 'P' && hdr[2] == 'N' && hdr[3] == 'G')
-        return (hdr[25] == 4 || hdr[25] == 6);
-
-    return false; /* JPEG never has alpha */
+    int kind = 0;
+    if (px) {
+        size_t clear = 0, soft = 0;
+        for (size_t i = 0, count = (size_t)w * h; i < count; i++) {
+            unsigned char a = px[i * 4 + 3];
+            if (a == 0) clear++;
+            else if (a != 255) soft++;
+        }
+        stbi_image_free(px);
+        if (soft * 4 > clear + soft) kind = 2;   /* over 25% of see-through pixels are soft */
+        else if (clear + soft > 0) kind = 1;
+    }
+    cache[img] = kind;
+    return kind;
 }
 
 void ExtractAndConvertTextures(cgltf_data *data, const char *inputFilename) {
@@ -602,6 +619,559 @@ void ExtractAndConvertTextures(cgltf_data *data, const char *inputFilename) {
         }
     }
     printf("=== Texture Extraction Complete ===\n\n");
+}
+
+// A mesh placed in the scene by a node. The same cgltf_mesh can appear many
+// times (Blender linked duplicates); each placement becomes its own copy.
+struct MeshInstance {
+  cgltf_node *node;
+  cgltf_mesh *mesh;
+  float world[16]; // column-major, from cgltf_node_transform_world
+  bool bake;       // false for skinned nodes and identity transforms
+  int bone;        // rigid part: every vertex follows this bone (-1 = none)
+};
+
+static bool IsIdentity(const float *m) {
+  for (int i = 0; i < 16; i++) {
+    float expect = (i % 5 == 0) ? 1.0f : 0.0f;
+    if (fabsf(m[i] - expect) > 1e-6f)
+      return false;
+  }
+  return true;
+}
+
+static bool NodeInScene(const cgltf_node *node, const cgltf_scene *scene) {
+  if (!scene)
+    return true;
+  while (node->parent)
+    node = node->parent;
+  for (size_t i = 0; i < scene->nodes_count; i++) {
+    if (scene->nodes[i] == node)
+      return true;
+  }
+  return false;
+}
+
+// Walk nodes in file order so exports that already have applied transforms
+// come out identical to the old mesh-list path.
+static std::vector<MeshInstance> CollectMeshInstances(cgltf_data *data) {
+  std::vector<MeshInstance> instances;
+  const cgltf_scene *scene = data->scene;
+  if (!scene && data->scenes_count > 0)
+    scene = &data->scenes[0];
+
+  for (size_t n = 0; n < data->nodes_count; n++) {
+    cgltf_node *node = &data->nodes[n];
+    if (!node->mesh || !NodeInScene(node, scene))
+      continue;
+
+    MeshInstance inst;
+    inst.node = node;
+    inst.mesh = node->mesh;
+    cgltf_node_transform_world(node, inst.world);
+    // glTF: a skinned mesh's own node transform is ignored, joints drive it
+    inst.bake = !node->skin && !IsIdentity(inst.world);
+    inst.bone = -1;
+    instances.push_back(inst);
+  }
+
+  // No nodes reference meshes: fall back to the raw mesh list
+  if (instances.empty()) {
+    for (size_t m = 0; m < data->meshes_count; m++) {
+      MeshInstance inst = {NULL, &data->meshes[m], {0}, false, -1};
+      instances.push_back(inst);
+    }
+  }
+  return instances;
+}
+
+/* ================================================================
+ * Rigid parts: props parented to bones, and objects animated without
+ * an armature. Both become bones the runtime already knows how to
+ * play: every vertex of the part follows one bone with full weight.
+ * ================================================================ */
+
+// Column-major 4x4 helpers (same layout as cgltf_node_transform_world)
+static void Mat4Identity(float *m) {
+  for (int i = 0; i < 16; i++)
+    m[i] = (i % 5 == 0) ? 1.0f : 0.0f;
+}
+
+static void Mat4Mul(const float *a, const float *b, float *out) {
+  float r[16];
+  for (int c = 0; c < 4; c++) {
+    for (int row = 0; row < 4; row++) {
+      float s = 0.0f;
+      for (int k = 0; k < 4; k++)
+        s += a[k * 4 + row] * b[c * 4 + k];
+      r[c * 4 + row] = s;
+    }
+  }
+  memcpy(out, r, sizeof(r));
+}
+
+static bool Mat4Invert(const float *m, float *out) {
+  float inv[16];
+  inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] +
+           m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+  inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] -
+           m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+  inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] +
+           m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+  inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] -
+            m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+  inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] -
+           m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+  inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] +
+           m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+  inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] -
+           m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+  inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] +
+            m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+  inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] +
+           m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+  inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] -
+           m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+  inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] +
+            m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+  inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] -
+            m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+  inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] -
+           m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+  inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] +
+           m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+  inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] -
+            m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+  inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] +
+            m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+
+  float det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+  if (fabsf(det) < 1e-12f) {
+    Mat4Identity(out);
+    return false;
+  }
+  for (int i = 0; i < 16; i++)
+    out[i] = inv[i] / det;
+  return true;
+}
+
+// T * R * S, the order the runtime builds bone matrices in
+static void Mat4FromTransform(const Transform &t, float *m) {
+  float x = t.rotation.x, y = t.rotation.y, z = t.rotation.z, w = t.rotation.w;
+  float r[9] = {1 - 2 * (y * y + z * z), 2 * (x * y + w * z),     2 * (x * z - w * y),
+                2 * (x * y - w * z),     1 - 2 * (x * x + z * z), 2 * (y * z + w * x),
+                2 * (x * z + w * y),     2 * (y * z - w * x),     1 - 2 * (x * x + y * y)};
+  float s[3] = {t.scale.x, t.scale.y, t.scale.z};
+  for (int c = 0; c < 3; c++) {
+    for (int row = 0; row < 3; row++)
+      m[c * 4 + row] = r[c * 3 + row] * s[c];
+    m[c * 4 + 3] = 0.0f;
+  }
+  m[12] = t.translation.x;
+  m[13] = t.translation.y;
+  m[14] = t.translation.z;
+  m[15] = 1.0f;
+}
+
+static Matrix MatrixFromMat4(const float *m) {
+  return (Matrix){m[0], m[4], m[8],  m[12], m[1], m[5], m[9],  m[13],
+                  m[2], m[6], m[10], m[14], m[3], m[7], m[11], m[15]};
+}
+
+// Scale from column lengths (raymath's MatrixDecompose uses rows)
+static Transform TransformFromMat4(const float *m) {
+  Transform t;
+  t.translation = (Vector3){m[12], m[13], m[14]};
+  float sx = sqrtf(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
+  float sy = sqrtf(m[4] * m[4] + m[5] * m[5] + m[6] * m[6]);
+  float sz = sqrtf(m[8] * m[8] + m[9] * m[9] + m[10] * m[10]);
+  float det = m[0] * (m[5] * m[10] - m[6] * m[9]) -
+              m[4] * (m[1] * m[10] - m[2] * m[9]) +
+              m[8] * (m[1] * m[6] - m[2] * m[5]);
+  if (det < 0.0f)
+    sx = -sx;
+  t.scale = (Vector3){sx, sy, sz};
+
+  if (fabsf(sx) < 1e-8f || sy < 1e-8f || sz < 1e-8f) {
+    t.rotation = QuaternionIdentity();
+    return t;
+  }
+  float r[16];
+  memcpy(r, m, sizeof(r));
+  for (int i = 0; i < 3; i++) {
+    r[i] /= sx;
+    r[4 + i] /= sy;
+    r[8 + i] /= sz;
+  }
+  r[12] = r[13] = r[14] = 0.0f;
+  t.rotation = QuaternionNormalize(QuaternionFromMatrix(MatrixFromMat4(r)));
+  return t;
+}
+
+static void ReadAnimKey(const cgltf_animation_sampler *s, size_t key,
+                        float *out, int n) {
+  // Cubic spline stores in-tangent, value, out-tangent per key
+  size_t idx = (s->interpolation == cgltf_interpolation_type_cubic_spline)
+                   ? key * 3 + 1
+                   : key;
+  cgltf_accessor_read_float(s->output, idx, out, n);
+}
+
+// Local TRS of a node at a given time: rest pose overridden by its channels
+static Transform SampleNodeLocal(const cgltf_animation *anim,
+                                 const cgltf_node *node, float time) {
+  Transform pose = GetNodeTransform(node);
+
+  for (size_t c = 0; c < anim->channels_count; c++) {
+    const cgltf_animation_channel *ch = &anim->channels[c];
+    if (ch->target_node != node)
+      continue;
+    const cgltf_animation_sampler *s = ch->sampler;
+    size_t n = s->input->count;
+    if (n == 0)
+      continue;
+
+    size_t k0 = 0, k1 = 0;
+    float alpha = 0.0f;
+    float tFirst, tLast;
+    cgltf_accessor_read_float(s->input, 0, &tFirst, 1);
+    cgltf_accessor_read_float(s->input, n - 1, &tLast, 1);
+    if (time >= tLast) {
+      k0 = k1 = n - 1;
+    } else if (time > tFirst) {
+      for (size_t k = 0; k + 1 < n; k++) {
+        float a, b;
+        cgltf_accessor_read_float(s->input, k, &a, 1);
+        cgltf_accessor_read_float(s->input, k + 1, &b, 1);
+        if (time >= a && time <= b) {
+          k0 = k;
+          k1 = k + 1;
+          alpha = (b > a) ? (time - a) / (b - a) : 0.0f;
+          break;
+        }
+      }
+    }
+    if (s->interpolation == cgltf_interpolation_type_step)
+      alpha = 0.0f;
+
+    switch (ch->target_path) {
+    case cgltf_animation_path_type_translation: {
+      Vector3 a, b;
+      ReadAnimKey(s, k0, &a.x, 3);
+      ReadAnimKey(s, k1, &b.x, 3);
+      pose.translation = Vector3Lerp(a, b, alpha);
+    } break;
+    case cgltf_animation_path_type_rotation: {
+      Quaternion a, b;
+      ReadAnimKey(s, k0, &a.x, 4);
+      ReadAnimKey(s, k1, &b.x, 4);
+      pose.rotation = QuaternionNormalize(QuaternionSlerp(a, b, alpha));
+    } break;
+    case cgltf_animation_path_type_scale: {
+      Vector3 a, b;
+      ReadAnimKey(s, k0, &a.x, 3);
+      ReadAnimKey(s, k1, &b.x, 3);
+      pose.scale = Vector3Lerp(a, b, alpha);
+    } break;
+    default:
+      break;
+    }
+  }
+  return pose;
+}
+
+static float AnimationDuration(const cgltf_animation *anim) {
+  float duration = 0.0f;
+  for (size_t c = 0; c < anim->channels_count; c++) {
+    const cgltf_accessor *input = anim->channels[c].sampler->input;
+    if (input->count == 0)
+      continue;
+    float last;
+    cgltf_accessor_read_float(input, input->count - 1, &last, 1);
+    if (last > duration)
+      duration = last;
+  }
+  return duration;
+}
+
+struct RigidBone {
+  cgltf_node *node; // NULL for the shared static bone
+  float offset[16]; // parent bone space -> this node's parent space
+};
+
+// Give every non-skinned mesh of an animated model a bone to follow:
+//  - parented (at any depth) to an armature joint -> that joint
+//  - under a node moved by the animation -> a new bone for that node
+//  - otherwise -> one shared bone that never moves
+// Vertices are moved into the space the chosen bone's inverse bind matrix
+// expects, so the runtime's bone * IBM * vertex lands them in place.
+static void SetupRigidParts(cgltf_data *data, cgltf_skin *skin,
+                            std::vector<MeshInstance> &instances) {
+  // Nodes moved directly by animation (armature joints are handled already)
+  std::set<const cgltf_node *> animated;
+  for (size_t a = 0; a < data->animations_count; a++) {
+    const cgltf_animation *anim = &data->animations[a];
+    for (size_t c = 0; c < anim->channels_count; c++) {
+      const cgltf_animation_channel *ch = &anim->channels[c];
+      if (!ch->target_node || ch->target_path == cgltf_animation_path_type_weights)
+        continue;
+      if (GetNodeBoneIndex(ch->target_node, skin) < 0)
+        animated.insert(ch->target_node);
+    }
+  }
+
+  // Nearest node at or above n that moves: a joint or an animated node
+  auto anchorOf = [&](cgltf_node *n) -> cgltf_node * {
+    for (; n; n = n->parent) {
+      if (GetNodeBoneIndex(n, skin) >= 0 || animated.count(n))
+        return n;
+    }
+    return NULL;
+  };
+
+  bool anyRigid = false, anyMoving = false;
+  for (const MeshInstance &inst : instances) {
+    if (!inst.node || inst.node->skin)
+      continue;
+    anyRigid = true;
+    if (anchorOf(inst.node))
+      anyMoving = true;
+  }
+  // Static files stay static; skinned-only files need nothing extra
+  if (!anyRigid || (!skin && !anyMoving))
+    return;
+
+  // Space the runtime skeleton lives in. The converter bakes only the
+  // armature's scale into root bones, so its rotation/translation are dropped:
+  // F = armatureScale * inverse(armatureWorld). Identity without an armature.
+  float F[16];
+  Mat4Identity(F);
+  if (skin) {
+    cgltf_node *armature = skin->skeleton;
+    if (!armature && skin->joints_count > 0 && skin->joints[0]->parent)
+      armature = skin->joints[0]->parent;
+    if (armature) {
+      float A[16], invA[16], S[16];
+      cgltf_node_transform_world(armature, A);
+      Mat4Invert(A, invA);
+      Mat4Identity(S);
+      S[0] = sqrtf(A[0] * A[0] + A[1] * A[1] + A[2] * A[2]);
+      S[5] = sqrtf(A[4] * A[4] + A[5] * A[5] + A[6] * A[6]);
+      S[10] = sqrtf(A[8] * A[8] + A[9] * A[9] + A[10] * A[10]);
+      Mat4Mul(S, invA, F);
+    }
+  }
+
+  int firstNew = skeleton.boneCount;
+  std::vector<Bone> newBones;
+  std::vector<RigidBone> rigid;
+  std::map<const cgltf_node *, int> boneOfNode;
+  int staticBone = -1;
+
+  std::function<int(cgltf_node *)> boneFor = [&](cgltf_node *a) -> int {
+    int joint = GetNodeBoneIndex(a, skin);
+    if (joint >= 0)
+      return joint;
+    auto it = boneOfNode.find(a);
+    if (it != boneOfNode.end())
+      return it->second;
+
+    // Parent bone first so it gets the lower index (runtime needs that)
+    cgltf_node *p = a->parent ? anchorOf(a->parent) : NULL;
+    int parentBone = p ? boneFor(p) : -1;
+
+    float parentWorld[16], world[16];
+    Mat4Identity(parentWorld);
+    if (a->parent)
+      cgltf_node_transform_world(a->parent, parentWorld);
+    cgltf_node_transform_world(a, world);
+
+    RigidBone rb;
+    rb.node = a;
+    if (p) {
+      float pw[16], invPw[16];
+      cgltf_node_transform_world(p, pw);
+      Mat4Invert(pw, invPw);
+      Mat4Mul(invPw, parentWorld, rb.offset);
+    } else {
+      Mat4Mul(F, parentWorld, rb.offset);
+    }
+
+    Bone b = {};
+    if (a->name)
+      strncpy(b.name, a->name, sizeof(b.name) - 1);
+    else
+      snprintf(b.name, sizeof(b.name), "node_%d", (int)(a - data->nodes));
+    b.parent = parentBone;
+    float local[16], m[16];
+    Mat4FromTransform(GetNodeTransform(a), local);
+    Mat4Mul(rb.offset, local, m);
+    b.bindPose = TransformFromMat4(m);
+    b.localPose = b.bindPose;
+    float bindWorld[16], ibm[16];
+    Mat4Mul(F, world, bindWorld);
+    Mat4Invert(bindWorld, ibm);
+    b.inverseBindMatrix = MatrixFromMat4(ibm);
+
+    int idx = firstNew + (int)newBones.size();
+    newBones.push_back(b);
+    rigid.push_back(rb);
+    boneOfNode[a] = idx;
+    return idx;
+  };
+
+  int attached = 0, moving = 0, fixed = 0;
+  for (MeshInstance &inst : instances) {
+    if (!inst.node || inst.node->skin)
+      continue;
+
+    float G[16], X[16];
+    cgltf_node_transform_world(inst.node, G);
+    cgltf_node *anchor = anchorOf(inst.node);
+    int joint = anchor ? GetNodeBoneIndex(anchor, skin) : -1;
+
+    if (joint >= 0) {
+      // Prop on a bone: undo that joint's bind so bone * IBM * p = F * G * v
+      float jw[16], invJw[16], ibm[16], invIbm[16], t[16];
+      cgltf_node_transform_world(anchor, jw);
+      Mat4Invert(jw, invJw);
+      Mat4Identity(ibm);
+      if (skin->inverse_bind_matrices)
+        cgltf_accessor_read_float(skin->inverse_bind_matrices, joint, ibm, 16);
+      Mat4Invert(ibm, invIbm);
+      Mat4Mul(invJw, G, t);
+      Mat4Mul(invIbm, t, X);
+      inst.bone = joint;
+      attached++;
+    } else {
+      if (anchor) {
+        inst.bone = boneFor(anchor);
+        moving++;
+      } else {
+        if (staticBone < 0) {
+          Bone b = {};
+          strncpy(b.name, "static", sizeof(b.name) - 1);
+          b.parent = -1;
+          b.bindPose = (Transform){{0, 0, 0}, QuaternionIdentity(), {1, 1, 1}};
+          b.localPose = b.bindPose;
+          b.inverseBindMatrix = MatrixIdentity();
+          staticBone = firstNew + (int)newBones.size();
+          newBones.push_back(b);
+          RigidBone rb;
+          rb.node = NULL;
+          Mat4Identity(rb.offset);
+          rigid.push_back(rb);
+        }
+        inst.bone = staticBone;
+        fixed++;
+      }
+      Mat4Mul(F, G, X);
+    }
+    memcpy(inst.world, X, sizeof(X));
+    inst.bake = !IsIdentity(X);
+  }
+
+  int total = firstNew + (int)newBones.size();
+  printf("Rigid parts: %d on bones, %d animated, %d static (%d new bones, %d total)\n",
+         attached, moving, fixed, (int)newBones.size(), total);
+  if (total > 256)
+    printf("WARNING: %d bones exceeds the 256 a vertex can address\n", total);
+  if (newBones.empty())
+    return;
+
+  skeleton.bones = (Bone *)realloc(skeleton.bones, total * sizeof(Bone));
+  memcpy(&skeleton.bones[firstNew], newBones.data(), newBones.size() * sizeof(Bone));
+
+  // No armature: build the animation list from the file
+  if (!skin && data->animations_count > 0) {
+    skeleton.animCount = (int)data->animations_count;
+    skeleton.animations = (Animation *)calloc(skeleton.animCount, sizeof(Animation));
+    for (int i = 0; i < skeleton.animCount; i++) {
+      Animation *dst = &skeleton.animations[i];
+      if (data->animations[i].name)
+        strncpy(dst->name, data->animations[i].name, sizeof(dst->name) - 1);
+      else
+        snprintf(dst->name, sizeof(dst->name), "anim_%d", i);
+      dst->duration = AnimationDuration(&data->animations[i]);
+      dst->frameCount = (int)(dst->duration * 30.0f) + 1;
+      dst->boneCount = 0;
+      dst->framePoses = NULL;
+    }
+  }
+
+  // Widen every animation's pose table with the new bones
+  for (int i = 0; i < skeleton.animCount; i++) {
+    Animation *anim = &skeleton.animations[i];
+    const cgltf_animation *src = &data->animations[i];
+    Transform *oldPoses = (Transform *)anim->framePoses;
+    Transform *poses =
+        (Transform *)calloc((size_t)anim->frameCount * total, sizeof(Transform));
+
+    for (int f = 0; f < anim->frameCount; f++) {
+      Transform *row = &poses[(size_t)f * total];
+      if (oldPoses)
+        memcpy(row, &oldPoses[(size_t)f * anim->boneCount],
+               anim->boneCount * sizeof(Transform));
+
+      float time = f * (1.0f / 30.0f);
+      for (size_t b = 0; b < rigid.size(); b++) {
+        if (!rigid[b].node) {
+          row[firstNew + b] = skeleton.bones[firstNew + b].bindPose;
+          continue;
+        }
+        float local[16], m[16];
+        Mat4FromTransform(SampleNodeLocal(src, rigid[b].node, time), local);
+        Mat4Mul(rigid[b].offset, local, m);
+        row[firstNew + b] = TransformFromMat4(m);
+      }
+    }
+    free(oldPoses);
+    anim->framePoses = (Transform **)poses;
+    anim->boneCount = total;
+  }
+
+  skeleton.boneCount = total;
+}
+
+// Move a primitive's vertices into world space so levels no longer need
+// "apply transforms" in Blender.
+static void BakeNodeTransform(Mesh *mesh, const float *m) {
+  // Normal matrix = cofactor of the 3x3 part (inverse-transpose up to scale)
+  float c[9] = {
+      m[5] * m[10] - m[6] * m[9], m[6] * m[8] - m[4] * m[10], m[4] * m[9] - m[5] * m[8],
+      m[2] * m[9] - m[1] * m[10], m[0] * m[10] - m[2] * m[8], m[1] * m[8] - m[0] * m[9],
+      m[1] * m[6] - m[2] * m[5],  m[2] * m[4] - m[0] * m[6],  m[0] * m[5] - m[1] * m[4]};
+  float det = m[0] * c[0] + m[1] * c[1] + m[2] * c[2];
+  float sign = det < 0.0f ? -1.0f : 1.0f;
+
+  for (int i = 0; i < mesh->vertexCount; i++) {
+    Vertex *v = &mesh->vertices[i];
+    float x = v->x, y = v->y, z = v->z;
+    v->x = m[0] * x + m[4] * y + m[8] * z + m[12];
+    v->y = m[1] * x + m[5] * y + m[9] * z + m[13];
+    v->z = m[2] * x + m[6] * y + m[10] * z + m[14];
+
+    float nx = v->nx / 127.0f, ny = v->ny / 127.0f, nz = v->nz / 127.0f;
+    float tx = (c[0] * nx + c[3] * ny + c[6] * nz) * sign;
+    float ty = (c[1] * nx + c[4] * ny + c[7] * nz) * sign;
+    float tz = (c[2] * nx + c[5] * ny + c[8] * nz) * sign;
+    float len = sqrtf(tx * tx + ty * ty + tz * tz);
+    if (len > 1e-8f) {
+      v->nx = (int8_t)(tx / len * 127.0f);
+      v->ny = (int8_t)(ty / len * 127.0f);
+      v->nz = (int8_t)(tz / len * 127.0f);
+    }
+
+    Vertex *o = &mesh->originalVertices[i];
+    o->x = v->x; o->y = v->y; o->z = v->z;
+    o->nx = v->nx; o->ny = v->ny; o->nz = v->nz;
+  }
+
+  // Mirrored (negative scale) transforms flip the winding
+  if (det < 0.0f) {
+    for (int i = 0; i + 2 < mesh->indexCount; i += 3)
+      std::swap(mesh->indices[i + 1], mesh->indices[i + 2]);
+  }
 }
 
 bool LoadGLTF(const char *filename) {
@@ -769,8 +1339,10 @@ bool LoadGLTF(const char *filename) {
             dstAnim->frameCount * skeleton.boneCount, sizeof(Transform));
         for (int frame = 0; frame < dstAnim->frameCount; frame++) {
           for (int bone = 0; bone < skeleton.boneCount; bone++) {
+            // Raw node pose: armature scale is baked into roots below, and
+            // bindPose already has it (would double it for unkeyed roots)
             poses[frame * skeleton.boneCount + bone] =
-                skeleton.bones[bone].bindPose;
+                GetNodeTransform(skin->joints[bone]);
           }
         }
 
@@ -858,11 +1430,6 @@ bool LoadGLTF(const char *filename) {
           }
         }
 
-        int reducedFrames =
-            reduceKeyframes(poses, dstAnim->frameCount, dstAnim->boneCount);
-        printf("Animation '%s': Reduced from %d to %d frames\n", dstAnim->name,
-               dstAnim->frameCount, reducedFrames);
-        dstAnim->frameCount = reducedFrames;
         dstAnim->framePoses = (Transform **)poses;
       }
     }
@@ -890,20 +1457,38 @@ bool LoadGLTF(const char *filename) {
   model.meshes = NULL;
   model.skeleton = &skeleton;
 
-  // Count total primitives across all meshes
-  if (data->meshes_count > 0) {
+  std::vector<MeshInstance> instances = CollectMeshInstances(data);
+  SetupRigidParts(data, skin, instances);
+
+  // Reduce once every bone (joints and rigid parts) has its poses
+  for (int i = 0; i < skeleton.animCount; i++) {
+    Animation *anim = &skeleton.animations[i];
+    int reducedFrames = reduceKeyframes((Transform *)anim->framePoses,
+                                        anim->frameCount, anim->boneCount);
+    printf("Animation '%s': Reduced from %d to %d frames\n", anim->name,
+           anim->frameCount, reducedFrames);
+    anim->frameCount = reducedFrames;
+  }
+
+  // Count total primitives across all placed meshes
+  if (!instances.empty()) {
     int totalPrimitives = 0;
-    for (size_t m = 0; m < data->meshes_count; m++) {
-      totalPrimitives += (int)data->meshes[m].primitives_count;
+    int bakedCount = 0;
+    for (const MeshInstance &inst : instances) {
+      totalPrimitives += (int)inst.mesh->primitives_count;
+      if (inst.bake)
+        bakedCount++;
     }
+    printf("Scene: %zu mesh instances (%d with node transforms baked)\n",
+           instances.size(), bakedCount);
 
     model.meshCount = totalPrimitives;
     model.meshes = (Mesh *)calloc(model.meshCount, sizeof(Mesh));
 
     int meshIndex = 0;
 
-    for (size_t m = 0; m < data->meshes_count; m++) {
-      cgltf_mesh *srcMesh = &data->meshes[m];
+    for (size_t m = 0; m < instances.size(); m++) {
+      cgltf_mesh *srcMesh = instances[m].mesh;
 
       // Each primitive becomes its own mesh
       for (size_t p = 0; p < srcMesh->primitives_count; p++) {
@@ -970,8 +1555,9 @@ bool LoadGLTF(const char *filename) {
                 textureNames[dstMesh->textureId] = img->name;
               }
 
-              /* Auto-promote OPAQUE to CUTOUT if the texture actually
-                 has an alpha channel (common in game rips / bad exports). */
+              /* Auto-promote OPAQUE if the texture's pixels actually use
+                 alpha (common in game rips / bad exports): on/off alpha is
+                 a cutout, soft alpha needs blending. */
               if (dstMesh->alphaMode == 0) {
                 char srcDir[256] = ".";
                 strncpy(srcDir, filename, sizeof(srcDir) - 1);
@@ -979,10 +1565,15 @@ bool LoadGLTF(const char *filename) {
                 if (!sl) sl = strrchr(srcDir, '\\');
                 if (sl) *sl = '\0'; else strcpy(srcDir, ".");
 
-                if (CgltfImageHasAlpha(img, srcDir)) {
-                  printf("Mesh %d: texture has alpha channel, promoting OPAQUE -> CUTOUT\n",
+                int kind = CgltfImageAlphaKind(img, srcDir);
+                if (kind == 1) {
+                  printf("Mesh %d: texture has on/off alpha, promoting OPAQUE -> CUTOUT\n",
                          meshIndex);
                   dstMesh->alphaMode = 1;
+                } else if (kind == 2) {
+                  printf("Mesh %d: texture has soft alpha, promoting OPAQUE -> TRANSPARENT\n",
+                         meshIndex);
+                  dstMesh->alphaMode = 2;
                 }
               }
             }
@@ -1123,6 +1714,19 @@ bool LoadGLTF(const char *filename) {
         dstMesh->vertexCount = totalVertices;
         dstMesh->indexCount = totalIndices;
 
+        if (instances[m].bake)
+          BakeNodeTransform(dstMesh, instances[m].world);
+
+        // Rigid part: the whole primitive follows one bone
+        if (instances[m].bone >= 0) {
+          for (int v = 0; v < totalVertices; v++) {
+            dstMesh->vertices[v].boneId = (uint8_t)instances[m].bone;
+            dstMesh->vertices[v].boneWeight = 1.0f;
+            dstMesh->originalVertices[v].boneId = (uint8_t)instances[m].bone;
+            dstMesh->originalVertices[v].boneWeight = 1.0f;
+          }
+        }
+
         printf("Loaded mesh %d with %d vertices and %d indices\n", meshIndex,
                dstMesh->vertexCount, dstMesh->indexCount);
 
@@ -1187,6 +1791,161 @@ void WeldVertices(Mesh *mesh, float threshold = 0.001f) {
          mesh->vertexCount, (int)remapTable.size() - mesh->vertexCount);
 }
 
+// Static levels are cut into blocks by location, the way SA2 lays out its
+// levels: how the scene was split into objects doesn't matter. Each block
+// holds one mesh per material, and the runtime culls a whole block with one
+// sphere test. Triangles are grouped by their centre, never cut, so the level
+// looks identical.
+#define BLOCK_MAX_SIZE 64.0f // world units; FAR_Z is 200
+
+struct BlockTri {
+  int mesh;
+  int tri;
+  Vector3 centre;
+  float size;             // longest side of the triangle's bounding box
+};
+
+static void SplitBlock(std::vector<BlockTri> &tris, size_t begin, size_t end,
+                       std::vector<std::pair<size_t, size_t>> &out) {
+  Vector3 lo = tris[begin].centre, hi = lo;
+  float biggestTri = 0.0f;
+  for (size_t i = begin; i < end; i++) {
+    lo = Vector3Min(lo, tris[i].centre);
+    hi = Vector3Max(hi, tris[i].centre);
+    biggestTri = std::max(biggestTri, tris[i].size);
+  }
+  Vector3 ext = Vector3Subtract(hi, lo);
+  int axis = (ext.x >= ext.y && ext.x >= ext.z) ? 0 : (ext.y >= ext.z ? 1 : 2);
+  float size = axis == 0 ? ext.x : axis == 1 ? ext.y : ext.z;
+  // A block can't get smaller than its triangles, so past that point
+  // splitting only adds blocks
+  if (size <= std::max(BLOCK_MAX_SIZE, biggestTri)) {
+    out.push_back({begin, end});
+    return;
+  }
+  float mid = axis == 0 ? (lo.x + hi.x) * 0.5f
+            : axis == 1 ? (lo.y + hi.y) * 0.5f : (lo.z + hi.z) * 0.5f;
+  auto key = [axis](const BlockTri &t) {
+    return axis == 0 ? t.centre.x : axis == 1 ? t.centre.y : t.centre.z;
+  };
+  auto split = std::partition(tris.begin() + begin, tris.begin() + end,
+                              [&](const BlockTri &t) { return key(t) < mid; });
+  size_t m = split - tris.begin();
+  if (m == begin || m == end) {
+    out.push_back({begin, end});
+    return;
+  }
+  SplitBlock(tris, begin, m, out);
+  SplitBlock(tris, m, end, out);
+}
+
+// Meshes with the same material are merged inside a block
+static bool SameMaterial(const Mesh &a, const Mesh &b) {
+  return a.textureId == b.textureId && a.materialColor == b.materialColor &&
+         a.alphaMode == b.alphaMode && a.alphaCutoff == b.alphaCutoff &&
+         a.doubleSided == b.doubleSided && a.wrapU == b.wrapU &&
+         a.wrapV == b.wrapV;
+}
+
+void BuildBlocks(Model *m) {
+  // Material of each source mesh = first earlier mesh with the same material
+  std::vector<int> material(m->meshCount);
+  int materialCount = 0;
+  for (int i = 0; i < m->meshCount; i++) {
+    material[i] = i;
+    for (int j = 0; j < i; j++) {
+      if (material[j] == j && SameMaterial(m->meshes[i], m->meshes[j])) {
+        material[i] = j;
+        break;
+      }
+    }
+    if (material[i] == i) materialCount++;
+  }
+
+  std::vector<BlockTri> tris;
+  for (int i = 0; i < m->meshCount; i++) {
+    const Mesh *mesh = &m->meshes[i];
+    for (int t = 0; t < mesh->indexCount / 3; t++) {
+      const Vertex &a = mesh->vertices[mesh->indices[t * 3]];
+      const Vertex &b = mesh->vertices[mesh->indices[t * 3 + 1]];
+      const Vertex &c = mesh->vertices[mesh->indices[t * 3 + 2]];
+      Vector3 lo = Vector3Min(Vector3Min({a.x, a.y, a.z}, {b.x, b.y, b.z}), {c.x, c.y, c.z});
+      Vector3 hi = Vector3Max(Vector3Max({a.x, a.y, a.z}, {b.x, b.y, b.z}), {c.x, c.y, c.z});
+      Vector3 ext = Vector3Subtract(hi, lo);
+      tris.push_back({i, t,
+                      {(a.x + b.x + c.x) / 3.0f, (a.y + b.y + c.y) / 3.0f,
+                       (a.z + b.z + c.z) / 3.0f},
+                      std::max(ext.x, std::max(ext.y, ext.z))});
+    }
+  }
+  if (tris.empty()) return;
+
+  std::vector<std::pair<size_t, size_t>> blocks;
+  SplitBlock(tris, 0, tris.size(), blocks);
+
+  std::vector<Mesh> result;
+  for (size_t b = 0; b < blocks.size(); b++) {
+    // Triangles of this block, grouped by material
+    std::map<int, std::vector<const BlockTri *>> byMaterial;
+    for (size_t i = blocks[b].first; i < blocks[b].second; i++)
+      byMaterial[material[tris[i].mesh]].push_back(&tris[i]);
+
+    for (auto &group : byMaterial) {
+      Mesh c = m->meshes[group.first];
+      std::map<std::pair<int, unsigned int>, int> remap;
+      std::vector<Vertex> verts;
+      c.indexCount = (int)group.second.size() * 3;
+      c.indices = (unsigned int *)calloc(c.indexCount, sizeof(unsigned int));
+      for (size_t t = 0; t < group.second.size(); t++) {
+        const BlockTri *bt = group.second[t];
+        const Mesh *src = &m->meshes[bt->mesh];
+        for (int k = 0; k < 3; k++) {
+          unsigned int old = src->indices[bt->tri * 3 + k];
+          auto key = std::make_pair(bt->mesh, old);
+          auto it = remap.find(key);
+          if (it == remap.end()) {
+            it = remap.emplace(key, (int)verts.size()).first;
+            verts.push_back(src->vertices[old]);
+          }
+          c.indices[t * 3 + k] = it->second;
+        }
+      }
+      c.vertexCount = (int)verts.size();
+      c.vertices = (Vertex *)calloc(c.vertexCount, sizeof(Vertex));
+      c.originalVertices = (Vertex *)calloc(c.vertexCount, sizeof(Vertex));
+      c.animatedVertices = (Vertex *)calloc(c.vertexCount, sizeof(Vertex));
+      memcpy(c.vertices, verts.data(), sizeof(Vertex) * c.vertexCount);
+      memcpy(c.originalVertices, verts.data(), sizeof(Vertex) * c.vertexCount);
+      c.stripLengths = NULL;
+      c.stripCount = 0;
+      c.looseIndexCount = 0;
+      c.blockId = (int)b;
+      result.push_back(c);
+    }
+  }
+
+  int inTris = (int)tris.size(), outTris = 0;
+  for (const Mesh &mesh : result)
+    outTris += mesh.indexCount / 3;
+
+  printf("Blocks: %d meshes (%d materials) -> %zu blocks, %zu meshes, %d tris in, %d tris out%s\n",
+         m->meshCount, materialCount, blocks.size(), result.size(), inTris, outTris,
+         outTris == inTris ? "" : "  ERROR: TRIANGLE COUNT CHANGED");
+
+  for (int i = 0; i < m->meshCount; i++) {
+    free(m->meshes[i].vertices);
+    free(m->meshes[i].originalVertices);
+    free(m->meshes[i].animatedVertices);
+    free(m->meshes[i].indices);
+    free(m->meshes[i].stripLengths);
+  }
+  free(m->meshes);
+  m->meshCount = (int)result.size();
+  m->meshes = (Mesh *)calloc(m->meshCount, sizeof(Mesh));
+  memcpy(m->meshes, result.data(), sizeof(Mesh) * m->meshCount);
+  m->blockCount = (int)blocks.size();
+}
+
 void SortVerticesByBoneId(MeshTriStrips &tristrips) {
   if (tristrips.vertices.empty())
     return;
@@ -1234,6 +1993,7 @@ void CreateTristrippedModel(const Model *sourceModel, Model *destModel) {
   // Copy skeleton pointer and allocate new mesh array
   destModel->skeleton = sourceModel->skeleton;
   destModel->meshCount = sourceModel->meshCount;
+  destModel->blockCount = sourceModel->blockCount;
   destModel->meshes = (Mesh *)calloc(destModel->meshCount, sizeof(Mesh));
 
   // Process each mesh from the source model
@@ -1247,6 +2007,7 @@ void CreateTristrippedModel(const Model *sourceModel, Model *destModel) {
     dstMesh->doubleSided = srcMesh->doubleSided;
     dstMesh->wrapU = srcMesh->wrapU;
     dstMesh->wrapV = srcMesh->wrapV;
+    dstMesh->blockId = srcMesh->blockId;
 
     printf("Processing mesh %d of %d...\n", m + 1, sourceModel->meshCount);
     printf("Source mesh has %d vertices and %d indices\n", srcMesh->vertexCount,
@@ -1371,6 +2132,10 @@ int main(int argc, char *argv[]) {
     WeldVertices(&model.meshes[i]);
   }
   printf("=== Vertex Welding Complete ===\n\n");
+
+  // Animated models are culled as a whole, so only static ones get blocks
+  if (skeleton.boneCount == 0)
+    BuildBlocks(&model);
 
   CreateTristrippedModel(&model, &tristrippedModel);
 
@@ -1955,16 +2720,20 @@ void ExportTristrippedModel(const Model *model, const char *filename,
 
   // Header
   uint32_t magic = 0x54534D44;
-  uint32_t version = 5; // Version 5: material flags per mesh
   uint32_t meshCount = model->meshCount;
   uint32_t boneCount = model->skeleton ? model->skeleton->boneCount : 0;
   bool isAnimated = (boneCount > 0);
+  uint32_t blockCount = isAnimated ? 0 : model->blockCount;
 
-  // Build sort order: OPAQUE first, then CUTOUT, then TRANSPARENT
+  // Build sort order: OPAQUE first, then CUTOUT, then TRANSPARENT. Inside a
+  // list, meshes of one block sit together so the runtime culls them in one go.
   std::vector<int> meshOrder(meshCount);
   std::iota(meshOrder.begin(), meshOrder.end(), 0);
   std::stable_sort(meshOrder.begin(), meshOrder.end(), [&](int a, int b) {
-    return model->meshes[a].alphaMode < model->meshes[b].alphaMode;
+    const Mesh &ma = model->meshes[a], &mb = model->meshes[b];
+    if (ma.alphaMode != mb.alphaMode) return ma.alphaMode < mb.alphaMode;
+    if (blockCount && ma.blockId != mb.blockId) return ma.blockId < mb.blockId;
+    return blockCount && ma.textureId < mb.textureId;
   });
 
   uint32_t opaque_count = 0, cutout_count = 0, transparent_count = 0;
@@ -1979,7 +2748,6 @@ void ExportTristrippedModel(const Model *model, const char *filename,
          opaque_count, cutout_count, transparent_count);
 
   fwrite(&magic, sizeof(uint32_t), 1, file);
-  fwrite(&version, sizeof(uint32_t), 1, file);
   fwrite(&meshCount, sizeof(uint32_t), 1, file);
   fwrite(&boneCount, sizeof(uint32_t), 1, file);
   fwrite(&opaque_count, sizeof(uint32_t), 1, file);
@@ -2025,6 +2793,40 @@ void ExportTristrippedModel(const Model *model, const char *filename,
   } else {
     uint32_t animCount = 0;
     fwrite(&animCount, sizeof(uint32_t), 1, file);
+  }
+
+  // Block table, one bounding sphere per block (empty for skinned models)
+  fwrite(&blockCount, sizeof(uint32_t), 1, file);
+  if (blockCount) {
+    std::vector<Vector3> lo(blockCount, {1e30f, 1e30f, 1e30f});
+    std::vector<Vector3> hi(blockCount, {-1e30f, -1e30f, -1e30f});
+    for (uint32_t m = 0; m < meshCount; m++) {
+      const Mesh *mesh = &model->meshes[m];
+      for (int i = 0; i < mesh->vertexCount; i++) {
+        Vector3 p = {mesh->vertices[i].x, mesh->vertices[i].y, mesh->vertices[i].z};
+        lo[mesh->blockId] = Vector3Min(lo[mesh->blockId], p);
+        hi[mesh->blockId] = Vector3Max(hi[mesh->blockId], p);
+      }
+    }
+    std::vector<float> radius(blockCount, 0.0f);
+    std::vector<Vector3> centre(blockCount);
+    for (uint32_t b = 0; b < blockCount; b++)
+      centre[b] = Vector3Scale(Vector3Add(lo[b], hi[b]), 0.5f);
+    for (uint32_t m = 0; m < meshCount; m++) {
+      const Mesh *mesh = &model->meshes[m];
+      for (int i = 0; i < mesh->vertexCount; i++) {
+        Vector3 p = {mesh->vertices[i].x, mesh->vertices[i].y, mesh->vertices[i].z};
+        radius[mesh->blockId] = std::max(radius[mesh->blockId],
+                                         Vector3Distance(p, centre[mesh->blockId]));
+      }
+    }
+    float maxRadius = 0.0f;
+    for (uint32_t b = 0; b < blockCount; b++) {
+      fwrite(&centre[b], sizeof(float), 3, file);
+      fwrite(&radius[b], sizeof(float), 1, file);
+      maxRadius = std::max(maxRadius, radius[b]);
+    }
+    printf("Writing %u blocks, largest radius %.1f\n", blockCount, maxRadius);
   }
 
   // Write mesh data
@@ -2095,7 +2897,7 @@ void ExportTristrippedModel(const Model *model, const char *filename,
     fwrite(&bsCz, sizeof(float), 1, file);
     fwrite(&bsRadius, sizeof(float), 1, file);
 
-    // Pack material flags (v5)
+    // Pack material flags
     // bits 0-1:  alpha_mode (0=OPAQUE, 1=CUTOUT, 2=TRANSPARENT)
     // bit  2:    double_sided
     // bits 3-4:  blend_mode (0=src_alpha, 1=additive) — default 0
@@ -2118,6 +2920,8 @@ void ExportTristrippedModel(const Model *model, const char *filename,
     float alphaCutoff = mesh->alphaCutoff;
     fwrite(&material_flags, sizeof(uint32_t), 1, file);
     fwrite(&alphaCutoff, sizeof(float), 1, file);
+    uint32_t block = blockCount ? mesh->blockId : 0;
+    fwrite(&block, sizeof(uint32_t), 1, file);
 
     const char *alphaNames[] = {"OPAQUE", "CUTOUT", "TRANSPARENT"};
     printf("    Material: alpha=%s flags=0x%08X cutoff=%.2f\n",
@@ -2194,7 +2998,7 @@ void ExportTristrippedModel(const Model *model, const char *filename,
     }
   }
 
-  // ---- Embed textures (v5) ----
+  // ---- Embed textures ----
   // Derive output directory from filename
   char outputDir[256] = ".";
   strncpy(outputDir, filename, sizeof(outputDir) - 1);

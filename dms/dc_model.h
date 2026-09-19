@@ -11,9 +11,6 @@
 /* Load DMS model from file. Returns NULL on failure. */
 DMSModel* dc_model_load(const char* filename);
 
-/* Load external textures for v4 models. No-op for v5 (embedded). */
-void dc_model_load_textures(DMSModel* model, const char* base_path);
-
 /* Free model and VRAM textures. */
 void dc_model_free(DMSModel* model);
 
@@ -21,7 +18,7 @@ void dc_model_free(DMSModel* model);
  * Drawing
  * ================================================================ */
 
-/* Draw all meshes of a model. Requires an active PVR list (dc_list_begin).
+/* Draw all meshes of a model (opens each PVR list it needs).
  * Handles frustum culling, near-plane clipping, and skinned rendering. */
 void dc_model_draw(DMSModel* model, shz_vec3_t pos, float scale,
                    const DCCamera* cam);
@@ -63,6 +60,7 @@ typedef struct {
     uint32_t verts_xformed;
     uint32_t verts_clipped;
     uint32_t tris_drawn;
+    uint32_t meshes_vtxfull;   /* skipped: PVR vertex buffer nearly full */
 } DCModelStats;
 
 /* Reset counters to zero. */

@@ -1,11 +1,10 @@
 TARGET = test.elf
 OBJS = main.o ../dms/dc_engine.o ../dms/dc_input.o ../dms/dc_camera.o ../dms/dc_model.o \
-       ../dms/dc_player.o ../dms/dc_draw2d.o ../dms/dc_debug.o ../dms/collision.o \
-       romdisk.o
+       ../dms/dc_player.o ../dms/dc_draw2d.o ../dms/dc_debug.o ../dms/collision.o
 
-# Converted assets go here and get baked into the romdisk (mounted at /rd)
-OUTPUT_DIR = romdisk
-KOS_ROMDISK_DIR = $(OUTPUT_DIR)
+# Converted assets go here and are read over dcload at /pc (run dc-tool with -c pc).
+# The level is too big for a romdisk: it would sit in RAM twice.
+OUTPUT_DIR = pc
 
 # Set BAKE=1 to bake vertex lighting (AO, shadows)
 BAKE = 1
@@ -41,16 +40,13 @@ $(OUTPUT_DIR)/%.dms: assets/%.glb | $(STRIPPY)
 	cp $< $(@D)/
 	cd $(@D) && $(abspath $(STRIPPY)) $(STRIPPY_FLAGS) $(notdir $<) && rm -f $(notdir $<)
 
-# Rebuild the romdisk image whenever a converted asset changes
-romdisk.img: $(DMS)
-
 include $(KOS_BASE)/Makefile.rules
 
 clean: rm-elf
-	-rm -f $(OBJS) romdisk.img
+	-rm -f $(OBJS)
 
 assets-clean:
-	-rm -rf $(OUTPUT_DIR) romdisk.img romdisk.o
+	-rm -rf $(OUTPUT_DIR)
 
 rm-elf:
 	-rm -f $(TARGET)

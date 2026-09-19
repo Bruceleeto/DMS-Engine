@@ -252,7 +252,8 @@ static void update_noclip(DCPlayer* p, DCCamera* cam,
     float right_x =  sc.cos;
     float right_z = -sc.sin;
 
-    float speed = 20.0f;
+    float speed   = 60.0f;   /* d-pad, units/sec */
+    float v_speed = 120.0f;  /* triggers (up/down), units/sec */
     float mx = 0.0f, mz = 0.0f;
 
     if (inp->buttons & CONT_DPAD_UP)    { mx += fwd_x;   mz += fwd_z; }
@@ -263,7 +264,7 @@ static void update_noclip(DCPlayer* p, DCCamera* cam,
     float my = inp->rtrig - inp->ltrig;
 
     cam->pos.x += mx * speed * dt;
-    cam->pos.y += my * speed * dt;
+    cam->pos.y += my * v_speed * dt;
     cam->pos.z += mz * speed * dt;
 
     p->yaw = cam->yaw;

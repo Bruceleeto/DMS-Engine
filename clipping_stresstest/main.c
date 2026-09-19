@@ -21,13 +21,6 @@ static DMSModel* dms_model = NULL;
 static shz_vec3_t dms_pos;
 static float dms_scale = 1.0f;
 
-static DMSModel* robot_model = NULL;
-static float robot_scale = 1.0f;
-
-static DMSModel* dude_model = NULL;
-static shz_vec3_t dude_pos;
-static float dude_scale = 1.0f;
-
 /* ========== PROFILING ========== */
 
 typedef struct {
@@ -65,9 +58,22 @@ static void prof_print_and_reset(void) {
     uint32_t xform  = prof.world_verts_xformed / prof.samples;
     uint32_t clip   = prof.world_verts_clipped / prof.samples;
 
-    float secs = (float)prof.frame_total_ns / 1e9f;
-    printf("PPS: %.0f polys/sec (%lu tris/frame)\n",
-           (float)prof.tris_drawn / secs, (unsigned long)(prof.tris_drawn / prof.samples));
+    /* Wall-clock interval since the last report, so vsync waits are counted */
+    static uint64_t last_report_ms = 0;
+    uint64_t now_ms = timer_ms_gettime64();
+    if (last_report_ms) {
+        float secs = (float)(now_ms - last_report_ms) / 1000.0f;
+        pvr_stats_t ps;
+        pvr_get_stats(&ps);
+        printf("FPS: %.1f  PPS: %.0f polys/sec (%lu tris/frame)  "
+               "vtxbuf %luKB (max %luKB)  render %.2fms\n",
+               n / secs, (float)prof.tris_drawn / secs,
+               (unsigned long)(prof.tris_drawn / prof.samples),
+               (unsigned long)(ps.vtx_buffer_used / 1024),
+               (unsigned long)(ps.vtx_buffer_used_max / 1024),
+               (float)ps.rnd_last_time / 1e6f);
+    }
+    last_report_ms = now_ms;
 
     snprintf(prof_lines[0], sizeof(prof_lines[0]), "FRAME: %.2f ms", total_ms);
     snprintf(prof_lines[1], sizeof(prof_lines[1]), "ANIM: %.0f us", anim_us);
@@ -88,23 +94,22 @@ static bool check_exit(void) {
 }
 
 int main(int argc, char* argv[]) {
-    dc_init((DCInitParams){0});
+    /* Vertex buffer is double-buffered by KOS, so this costs 2x in VRAM */
+    dc_init((DCInitParams){ .vram_size = 2300 * 1024 });
     dc_draw2d_init();
     dc_debug_init();
 
     dc_camera_init(&camera);
     dc_player_init(&player);
-    player.cam_mode = DC_CAM_THIRD;
+    player.cam_mode = DC_CAM_NOCLIP;
 
     /* Load world */
-    dms_model = dc_model_load("/rd/world/test.dms");
-    if (dms_model)
-        dc_model_load_textures(dms_model, "/rd/world");
+    dms_model = dc_model_load("/pc/world/test.dms");
     dms_pos = shz_vec3_init(0.0f, 0.0f, 0.0f);
     dms_scale = 1.0f;
 
     if (dms_model && !dms_model->skeleton)
-        col_world = col_build(dms_model, dms_pos, dms_scale, 4.0f);
+        col_world = col_build(dms_model, dms_pos, dms_scale);
 
     /* Spawn player on ground at origin */
     {
@@ -124,24 +129,7 @@ int main(int argc, char* argv[]) {
         );
     }
 
-    /* Load robot (player character model) */
-    robot_model = dc_model_load("/rd/robot/robot.dms");
-    if (robot_model)
-        dc_model_load_textures(robot_model, "/rd/robot");
-    robot_scale = 1.0f;
-
-    /* Load dude NPC */
-    dude_model = dc_model_load("/rd/dude/dude.dms");
-    if (dude_model)
-        dc_model_load_textures(dude_model, "/rd/dude");
-    dude_pos = shz_vec3_init(5.0f, 0.0f, 5.0f);
-    /* Drop to ground */
-    if (col_world) {
-        ColGroundHit dgh = col_ground(col_world,
-            shz_vec3_init(dude_pos.x, col_world->max_y + 10.0f, dude_pos.z), 200.0f);
-        if (dgh.hit)
-            dude_pos.y = dgh.y;
-    }
+    printf("VRAM free after loading: %luKB\n", (unsigned long)(pvr_mem_available() / 1024));
 
     char fps_str[32];
     snprintf(fps_str, sizeof(fps_str), "FPS: --");
@@ -153,27 +141,7 @@ int main(int argc, char* argv[]) {
         float dt = dc_delta_time();
         const DCInput* inp = dc_input_get(0);
 
-        /* ---- Animation: run when moving, freeze when idle ---- */
-        uint64_t t0 = perf_cntr_timer_ns();
-        {
-            bool is_moving = false;
-            if (inp) {
-                float sx = inp->stick_x;
-                float sy = inp->stick_y;
-                is_moving = (sx * sx + sy * sy > 0.02f);
-                if (!is_moving) {
-                    is_moving = dc_input_held(inp, CONT_DPAD_UP) ||
-                                dc_input_held(inp, CONT_DPAD_DOWN) ||
-                                dc_input_held(inp, CONT_DPAD_LEFT) ||
-                                dc_input_held(inp, CONT_DPAD_RIGHT);
-                }
-            }
-
-            dc_model_set_anim(robot_model, 12);  /* sn_run_loop */
-            dc_model_animate(robot_model, is_moving ? dt * 3.0f : 0.0f);
-            dc_model_animate(dude_model, dt);
-        }
-        prof.anim_ns += perf_cntr_timer_ns() - t0;
+        uint64_t t0;
 
         /* ---- Input ---- */
         t0 = perf_cntr_timer_ns();
@@ -194,36 +162,21 @@ int main(int argc, char* argv[]) {
         /* ---- FPS string ---- */
         snprintf(fps_str, sizeof(fps_str), "FPS: %.1f", dc_fps());
 
-        /* ---- Robot position: at player feet ---- */
-        shz_vec3_t robot_pos = shz_vec3_init(
-            player.pos.x,
-            player.pos.y - player.eye_height,
-            player.pos.z
-        );
-
         /* ---- Rendering (by PVR list: OP -> TR -> PT) ---- */
         t0 = perf_cntr_timer_ns();
         dc_model_reset_stats();
 
-        float robot_yaw = -(player.yaw + player.model_yaw_offset);
-
         /* Pass 1: Opaque */
         dc_list_begin(PVR_LIST_OP_POLY);
         dc_model_draw_list(dms_model, dms_pos, dms_scale, &camera, PVR_LIST_OP_POLY);
-        dc_model_draw_list_rotated(robot_model, robot_pos, robot_scale, robot_yaw, &camera, PVR_LIST_OP_POLY);
-        dc_model_draw_list(dude_model, dude_pos, dude_scale, &camera, PVR_LIST_OP_POLY);
 
         /* Pass 2: Transparent */
         dc_list_begin(PVR_LIST_TR_POLY);
         dc_model_draw_list(dms_model, dms_pos, dms_scale, &camera, PVR_LIST_TR_POLY);
-        dc_model_draw_list_rotated(robot_model, robot_pos, robot_scale, robot_yaw, &camera, PVR_LIST_TR_POLY);
-        dc_model_draw_list(dude_model, dude_pos, dude_scale, &camera, PVR_LIST_TR_POLY);
 
         /* Pass 3: Punch-through + HUD */
         dc_list_begin(PVR_LIST_PT_POLY);
         dc_model_draw_list(dms_model, dms_pos, dms_scale, &camera, PVR_LIST_PT_POLY);
-        dc_model_draw_list_rotated(robot_model, robot_pos, robot_scale, robot_yaw, &camera, PVR_LIST_PT_POLY);
-        dc_model_draw_list(dude_model, dude_pos, dude_scale, &camera, PVR_LIST_PT_POLY);
 
         dc_draw_text(fps_str, 10, 10, 16, DC_COLOR_GREEN);
 
@@ -252,8 +205,6 @@ int main(int argc, char* argv[]) {
             prof_print_and_reset();
     }
 
-    dc_model_free(dude_model);
-    dc_model_free(robot_model);
     dc_model_free(dms_model);
     col_free(col_world);
     dc_shutdown();

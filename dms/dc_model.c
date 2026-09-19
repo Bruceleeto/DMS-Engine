@@ -20,13 +20,49 @@ static pvr_dr_state_t* g_dr;   /* set by render_clipped for submit_vert */
 static DCModelStats g_stats;
 
 /* ================================================================
+ * Vertex buffer guard
+ *
+ * If the PVR vertex buffer overflows, the TA writes over other VRAM and
+ * the GPU hangs. Before each mesh, read the TA's live write position and
+ * skip the mesh if it might not fit. Drawing resumes by itself as soon as
+ * there is room again (the next frame, or a smaller mesh).
+ * ================================================================ */
+
+#define VTXBUF_MARGIN (32 * 1024)   /* TA lag, background poly, HUD after models */
+
+static void vtxbuf_warn(void) {
+    static int warned = 0;
+    if (!warned) {
+        warned = 1;
+        printf("DMS: PVR vertex buffer full (%luKB), skipping meshes so it doesn't hang. "
+               "Raise DCInitParams.vram_size or draw less.\n",
+               (unsigned long)((PVR_GET(PVR_TA_VERTBUF_END) - PVR_GET(PVR_TA_VERTBUF_START)) / 1024));
+    }
+}
+
+/* Bytes left in the vertex buffer after the safety margin */
+static inline int32_t vtxbuf_left(void) {
+    return (int32_t)(PVR_GET(PVR_TA_VERTBUF_END) - PVR_GET(PVR_TA_VERTBUF_POS)) - VTXBUF_MARGIN;
+}
+
+/* Clipped meshes are mostly plain strips, so both paths are estimated at
+ * 32 bytes/vertex; render_clipped separately guards its per-triangle output. */
+static int vtxbuf_full(const DMSMesh* mesh) {
+    if ((int32_t)(32 + mesh->vertex_count * 32) <= vtxbuf_left()) return 0;
+    vtxbuf_warn();
+    g_stats.meshes_vtxfull++;
+    return 1;
+}
+
+/* ================================================================
  * Clipping utilities
  * ================================================================ */
 
 static inline uint32_t compute_outcode(const ClipVertex* v) {
     uint32_t oc = 0;
-    if (v->z < -v->w)            oc |= OC_NEAR;
-    if (v->z >  v->w)            oc |= OC_FAR;
+    /* Clip-space z is a constant here (the PVR only needs 1/w), so the
+     * near plane is w = NEAR_Z. No far clip: the block/sphere cull handles it. */
+    if (v->w < NEAR_Z)           oc |= OC_NEAR;
     if (v->x < 0.0f)             oc |= OC_LEFT;
     if (v->x > SCR_W * v->w)     oc |= OC_RIGHT;
     if (v->y < 0.0f)             oc |= OC_TOP;
@@ -36,8 +72,7 @@ static inline uint32_t compute_outcode(const ClipVertex* v) {
 
 static inline float plane_dist(const ClipVertex* v, int plane) {
     switch (plane) {
-        case 0: return v->w + v->z;
-        case 1: return v->w - v->z;
+        case 0: return v->w - NEAR_Z;
         case 2: return v->x;
         case 3: return SCR_W * v->w - v->x;
         case 4: return v->y;
@@ -259,6 +294,9 @@ static void render_clipped(const DMSVertex* src, int count,
             } else {
                 if (in_strip) in_strip = 0;
 
+                /* Up to 7 tris (21 verts) per clipped triangle */
+                if (vtxbuf_left() < 21 * 32) { vtxbuf_warn(); continue; }
+
                 ClipVertex* t0 = (j & 1) ? &v[j-1] : &v[j-2];
                 ClipVertex* t1 = (j & 1) ? &v[j-2] : &v[j-1];
                 ClipVertex* t2 = &v[j];
@@ -267,6 +305,11 @@ static void render_clipped(const DMSVertex* src, int count,
                 clip_ping[1] = *t1;
                 clip_ping[2] = *t2;
                 int n = 3;
+
+                /* Side outcodes of verts behind the camera are meaningless and
+                 * near-clip points can land anywhere: trim against every edge. */
+                if (or_codes & OC_NEAR)
+                    or_codes |= OC_LEFT | OC_RIGHT | OC_TOP | OC_BOTTOM;
 
                 ClipVertex* src_buf = clip_ping;
                 ClipVertex* dst_buf = clip_pong;
@@ -392,24 +435,13 @@ static void render_skinned(const DMSVertex* src, int count,
  * Mesh dispatch (per-mesh frustum cull + path selection)
  * ================================================================ */
 
-/* Returns 1 if the mesh was drawn, 0 if culled. */
-static int draw_mesh(DMSMesh* mesh, DMSModel* model,
-                     shz_vec3_t pos, float scale, float yaw,
-                     const DCCamera* cam, pvr_dr_state_t* dr) {
-    float bcx, bcy, bcz, br;
-    int is_animated = (model->skeleton != NULL);
-
-    if (is_animated) {
-        bcx = model->anim_bound_cx;
-        bcy = model->anim_bound_cy;
-        bcz = model->anim_bound_cz;
-        br  = model->anim_bound_radius;
-    } else {
-        bcx = mesh->bound_cx;
-        bcy = mesh->bound_cy;
-        bcz = mesh->bound_cz;
-        br  = mesh->bound_radius;
-    }
+/* Skinned mesh: cull the whole animated bound, then skin + submit.
+ * Returns 1 if the mesh was drawn, 0 if culled. */
+static int draw_skinned_mesh(DMSMesh* mesh, DMSModel* model,
+                             shz_vec3_t pos, float scale, float yaw,
+                             const DCCamera* cam, pvr_dr_state_t* dr) {
+    float bcx = model->anim_bound_cx;
+    float bcz = model->anim_bound_cz;
 
     /* Rotate bounding sphere center to match model yaw */
     if (yaw != 0.0f) {
@@ -420,68 +452,37 @@ static int draw_mesh(DMSMesh* mesh, DMSModel* model,
         bcz = rz;
     }
 
-    shz_vec3_t wc = shz_vec3_init(
-        pos.x + bcx * scale,
-        pos.y + bcy * scale,
-        pos.z + bcz * scale
-    );
-    float wr = br * scale;
+    shz_vec3_t wc = shz_vec3_init(pos.x + bcx * scale,
+                                  pos.y + model->anim_bound_cy * scale,
+                                  pos.z + bcz * scale);
+    float wr = model->anim_bound_radius * scale;
 
-    /* Frustum cull */
-    if (dc_frustum_cull_sphere(cam, wc, wr) < 0) {
+    /* Skinned meshes have no clip path: cull if off-screen or crossing near */
+    if (dc_frustum_cull_sphere(cam, wc, wr) < 0 ||
+        dc_frustum_near_intersect(cam, wc, wr)) {
         g_stats.meshes_culled++;
         return 0;
     }
 
-    if (is_animated) {
-        /* Animated: if near-plane intersects, cull entirely */
-        if (dc_frustum_near_intersect(cam, wc, wr)) {
-            g_stats.meshes_culled++;
-            return 0;
-        }
-    }
+    if (vtxbuf_full(mesh))
+        return 0;
 
     g_stats.meshes_drawn++;
     g_stats.tris_drawn += mesh->tri_count;
 
     shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &mesh->header);
 
-    float rx = pos.x - cam->pos.x;
-    float ry = pos.y - cam->pos.y;
-    float rz = pos.z - cam->pos.z;
+    /* Build MVP with Z negation baked into scale */
+    shz_xmtrx_load_4x4((shz_mat4x4_t*)dc_camera_get_pv(cam));
+    shz_xmtrx_translate(pos.x - cam->pos.x, pos.y - cam->pos.y, -(pos.z - cam->pos.z));
+    if (yaw != 0.0f) shz_xmtrx_apply_rotation_y(yaw);
+    shz_xmtrx_apply_scale(scale, scale, -scale);
 
-    const shz_mat4x4_t* pv = dc_camera_get_pv(cam);
+    alignas(32) shz_mat4x4_t mvp;
+    shz_xmtrx_store_4x4(&mvp);
 
-    if (is_animated) {
-        /* Build MVP with Z negation baked into scale */
-        shz_xmtrx_load_4x4((shz_mat4x4_t*)pv);
-        shz_xmtrx_translate(rx, ry, -rz);
-        if (yaw != 0.0f) shz_xmtrx_apply_rotation_y(yaw);
-        shz_xmtrx_apply_scale(scale, scale, -scale);
-
-        alignas(32) shz_mat4x4_t mvp;
-        shz_xmtrx_store_4x4(&mvp);
-
-        g_stats.verts_xformed += mesh->vertex_count;
-        render_skinned(mesh->vertices, mesh->vertex_count,
-                       model->skeleton, &mvp, dr);
-    } else {
-        /* Static: fast or clipped path */
-        int needs_clip = dc_frustum_near_intersect(cam, wc, wr);
-
-        shz_xmtrx_load_4x4((shz_mat4x4_t*)pv);
-        shz_xmtrx_translate(rx, ry, -rz);
-        if (yaw != 0.0f) shz_xmtrx_apply_rotation_y(yaw);
-        shz_xmtrx_apply_scale(scale, scale, scale);
-
-        if (needs_clip) {
-            g_stats.verts_clipped += mesh->vertex_count;
-            render_clipped(mesh->vertices, mesh->vertex_count, dr);
-        } else {
-            g_stats.verts_xformed += mesh->vertex_count;
-            render_fast(mesh->vertices, mesh->vertex_count, dr);
-        }
-    }
+    g_stats.verts_xformed += mesh->vertex_count;
+    render_skinned(mesh->vertices, mesh->vertex_count, model->skeleton, &mvp, dr);
     return 1;
 }
 
@@ -494,35 +495,105 @@ void dc_model_draw(DMSModel* model, shz_vec3_t pos, float scale,
     dc_model_draw_rotated(model, pos, scale, 0.0f, cam);
 }
 
-void dc_model_draw_rotated(DMSModel* model, shz_vec3_t pos, float scale,
-                           float yaw, const DCCamera* cam) {
-    if (!model || model->mesh_count == 0) return;
+/* Static model with blocks: one sphere test per block, one matrix per call,
+ * and the header is only resent when the material changes. */
+static void draw_blocks_list(DMSModel* model, shz_vec3_t pos, float scale,
+                             float yaw, const DCCamera* cam, int target_list) {
+    shz_sincos_t sc = shz_sincosf(yaw);
+    const shz_mat4x4_t* pv = dc_camera_get_pv(cam);
+    alignas(32) shz_mat4x4_t mvp;
+    shz_xmtrx_load_4x4((shz_mat4x4_t*)pv);
+    shz_xmtrx_translate(pos.x - cam->pos.x, pos.y - cam->pos.y, -(pos.z - cam->pos.z));
+    if (yaw != 0.0f) shz_xmtrx_apply_rotation_y(yaw);
+    shz_xmtrx_apply_scale(scale, scale, scale);
+    shz_xmtrx_store_4x4(&mvp);
 
-    int32_t current_tex = -2;
-    int current_list = -1;
+    uint32_t cur_block = UINT32_MAX;
+    int state = 0;                       /* 0 culled, 1 fast, 2 near-clip */
+    const pvr_poly_hdr_t* last_hdr = NULL;
+    pvr_dr_state_t* dr = NULL;
 
     for (uint32_t m = 0; m < model->mesh_count; m++) {
         DMSMesh* mesh = &model->meshes[m];
         int alpha_mode = mesh->material_flags & 0x3;
-        int pvr_list;
-        if (alpha_mode == 0)      pvr_list = PVR_LIST_OP_POLY;
-        else if (alpha_mode == 1) pvr_list = PVR_LIST_PT_POLY;
-        else                      pvr_list = PVR_LIST_TR_POLY;
+        int pvr_list = alpha_mode == 0 ? PVR_LIST_OP_POLY
+                     : alpha_mode == 1 ? PVR_LIST_PT_POLY : PVR_LIST_TR_POLY;
+        if (pvr_list != target_list) continue;
 
-        if (pvr_list != current_list) {
-            dc_list_begin(pvr_list);
-            current_list = pvr_list;
-            current_tex = -2;  /* force header resubmit on list switch */
+        if (mesh->block != cur_block) {
+            cur_block = mesh->block;
+            const DMSBlock* b = &model->blocks[cur_block];
+            float bx = b->cx, bz = b->cz;
+            if (yaw != 0.0f) {
+                bx = b->cx * sc.cos - b->cz * sc.sin;
+                bz = b->cx * sc.sin + b->cz * sc.cos;
+            }
+            shz_vec3_t wc = shz_vec3_init(pos.x + bx * scale, pos.y + b->cy * scale,
+                                          pos.z + bz * scale);
+            float wr = b->radius * scale;
+            if (dc_frustum_cull_sphere(cam, wc, wr) < 0) state = 0;
+            else state = dc_frustum_near_intersect(cam, wc, wr) ? 2 : 1;
         }
 
-        pvr_dr_state_t* dr = dc_dr_state();
-        if (mesh->texture_id != current_tex) {
-            if (draw_mesh(mesh, model, pos, scale, yaw, cam, dr))
-                current_tex = mesh->texture_id;
+        if (!state) {
+            g_stats.meshes_culled++;
+            continue;
+        }
+
+        if (vtxbuf_full(mesh)) continue;
+
+        if (!dr) {
+            dc_list_begin(target_list);
+            dr = dc_dr_state();
+        }
+
+        g_stats.meshes_drawn++;
+        g_stats.tris_drawn += mesh->tri_count;
+
+        if (!last_hdr || memcmp(last_hdr, &mesh->header, sizeof(pvr_poly_hdr_t))) {
+            shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &mesh->header);
+            last_hdr = &mesh->header;
+        }
+
+        shz_xmtrx_load_4x4(&mvp);
+        if (state == 2) {
+            g_stats.verts_clipped += mesh->vertex_count;
+            render_clipped(mesh->vertices, mesh->vertex_count, dr);
         } else {
-            draw_mesh(mesh, model, pos, scale, yaw, cam, dr);
+            g_stats.verts_xformed += mesh->vertex_count;
+            render_fast(mesh->vertices, mesh->vertex_count, dr);
         }
     }
+}
+
+/* Skinned models: one mesh at a time */
+static void draw_skinned_list(DMSModel* model, shz_vec3_t pos, float scale,
+                              float yaw, const DCCamera* cam, int target_list) {
+    pvr_dr_state_t* dr = NULL;
+
+    for (uint32_t m = 0; m < model->mesh_count; m++) {
+        DMSMesh* mesh = &model->meshes[m];
+        int alpha_mode = mesh->material_flags & 0x3;
+        int pvr_list = alpha_mode == 0 ? PVR_LIST_OP_POLY
+                     : alpha_mode == 1 ? PVR_LIST_PT_POLY : PVR_LIST_TR_POLY;
+        if (pvr_list != target_list) continue;
+
+        if (!dr) {
+            dc_list_begin(target_list);
+            dr = dc_dr_state();
+        }
+        draw_skinned_mesh(mesh, model, pos, scale, yaw, cam, dr);
+    }
+}
+
+void dc_model_draw_list_rotated(DMSModel* model, shz_vec3_t pos, float scale,
+                                float yaw, const DCCamera* cam, int target_list) {
+    if (!model || model->mesh_count == 0) return;
+
+    if (model->skeleton)
+        draw_skinned_list(model, pos, scale, yaw, cam, target_list);
+    else
+        draw_blocks_list(model, pos, scale, yaw, cam, target_list);
 }
 
 void dc_model_draw_list(DMSModel* model, shz_vec3_t pos, float scale,
@@ -530,31 +601,11 @@ void dc_model_draw_list(DMSModel* model, shz_vec3_t pos, float scale,
     dc_model_draw_list_rotated(model, pos, scale, 0.0f, cam, target_list);
 }
 
-void dc_model_draw_list_rotated(DMSModel* model, shz_vec3_t pos, float scale,
-                                float yaw, const DCCamera* cam, int target_list) {
-    if (!model || model->mesh_count == 0) return;
-
-    int32_t current_tex = -2;
-
-    for (uint32_t m = 0; m < model->mesh_count; m++) {
-        DMSMesh* mesh = &model->meshes[m];
-        int alpha_mode = mesh->material_flags & 0x3;
-        int pvr_list;
-        if (alpha_mode == 0)      pvr_list = PVR_LIST_OP_POLY;
-        else if (alpha_mode == 1) pvr_list = PVR_LIST_PT_POLY;
-        else                      pvr_list = PVR_LIST_TR_POLY;
-
-        if (pvr_list != target_list) continue;
-
-        dc_list_begin(target_list);
-        pvr_dr_state_t* dr = dc_dr_state();
-        if (mesh->texture_id != current_tex) {
-            if (draw_mesh(mesh, model, pos, scale, yaw, cam, dr))
-                current_tex = mesh->texture_id;
-        } else {
-            draw_mesh(mesh, model, pos, scale, yaw, cam, dr);
-        }
-    }
+void dc_model_draw_rotated(DMSModel* model, shz_vec3_t pos, float scale,
+                           float yaw, const DCCamera* cam) {
+    dc_model_draw_list_rotated(model, pos, scale, yaw, cam, PVR_LIST_OP_POLY);
+    dc_model_draw_list_rotated(model, pos, scale, yaw, cam, PVR_LIST_PT_POLY);
+    dc_model_draw_list_rotated(model, pos, scale, yaw, cam, PVR_LIST_TR_POLY);
 }
 
 /* ================================================================
@@ -681,15 +732,12 @@ DMSModel* dc_model_load(const char* filename) {
         return NULL;
     }
 
-    uint32_t magic, version, mesh_count, bone_count;
+    uint32_t magic, mesh_count, bone_count;
     fread(&magic, 4, 1, f);
-    fread(&version, 4, 1, f);
     fread(&mesh_count, 4, 1, f);
     fread(&bone_count, 4, 1, f);
 
-    if (magic != 0x54534D44) { printf("DMS: Invalid magic\n"); fclose(f); return NULL; }
-    if (version != 4 && version != 5) { printf("DMS: Unsupported version %lu\n", (unsigned long)version); fclose(f); return NULL; }
-    if (version == 4) { printf("DMS: v4 detected, re-export recommended for material flags\n"); }
+    if (magic != DMS_MAGIC) { printf("DMS: %s is not a .dms file\n", filename); fclose(f); return NULL; }
 
     int is_animated = (bone_count > 0);
 
@@ -697,19 +745,13 @@ DMSModel* dc_model_load(const char* filename) {
     memset(model, 0, sizeof(DMSModel));
     model->mesh_count = mesh_count;
 
-    if (version >= 5) {
-        fread(&model->opaque_count, 4, 1, f);
-        fread(&model->cutout_count, 4, 1, f);
-        fread(&model->transparent_count, 4, 1, f);
-        printf("DMS v5: %lu opaque, %lu cutout, %lu transparent\n",
-               (unsigned long)model->opaque_count,
-               (unsigned long)model->cutout_count,
-               (unsigned long)model->transparent_count);
-    } else {
-        model->opaque_count = mesh_count;
-        model->cutout_count = 0;
-        model->transparent_count = 0;
-    }
+    fread(&model->opaque_count, 4, 1, f);
+    fread(&model->cutout_count, 4, 1, f);
+    fread(&model->transparent_count, 4, 1, f);
+    printf("DMS: %lu opaque, %lu cutout, %lu transparent\n",
+           (unsigned long)model->opaque_count,
+           (unsigned long)model->cutout_count,
+           (unsigned long)model->transparent_count);
 
     model->meshes = memalign(32, mesh_count * sizeof(DMSMesh));
     memset(model->meshes, 0, mesh_count * sizeof(DMSMesh));
@@ -792,6 +834,17 @@ DMSModel* dc_model_load(const char* filename) {
         fread(&anim_count, 4, 1, f);
     }
 
+    /* ---- Block table (static models only) ---- */
+    fread(&model->block_count, 4, 1, f);
+    model->blocks = malloc(model->block_count * sizeof(DMSBlock));
+    fread(model->blocks, sizeof(DMSBlock), model->block_count, f);
+    if (!is_animated) printf("DMS: %lu blocks\n", (unsigned long)model->block_count);
+    if (!is_animated && model->block_count == 0) {
+        printf("DMS: %s has no blocks\n", filename);
+        free(model->blocks); free(model->meshes); free(model); fclose(f);
+        return NULL;
+    }
+
     /* ---- Load meshes ---- */
     uint32_t max_verts = 0;
 
@@ -806,13 +859,9 @@ DMSModel* dc_model_load(const char* filename) {
         fread(&mesh->bound_cz, 4, 1, f);
         fread(&mesh->bound_radius, 4, 1, f);
 
-        if (version >= 5) {
-            fread(&mesh->material_flags, 4, 1, f);
-            fread(&mesh->alpha_cutoff, sizeof(float), 1, f);
-        } else {
-            mesh->material_flags = 0;
-            mesh->alpha_cutoff = 0.5f;
-        }
+        fread(&mesh->material_flags, 4, 1, f);
+        fread(&mesh->alpha_cutoff, sizeof(float), 1, f);
+        fread(&mesh->block, 4, 1, f);
 
         mesh->vertices = memalign(32, mesh->vertex_count * sizeof(DMSVertex));
         fread(mesh->vertices, sizeof(DMSVertex), mesh->vertex_count, f);
@@ -830,8 +879,6 @@ DMSModel* dc_model_load(const char* filename) {
 
         if (mesh->vertex_count > max_verts)
             max_verts = mesh->vertex_count;
-
-        (void)0;
     }
 
     /* ---- Cache max bind radius for animated bounds ---- */
@@ -848,105 +895,40 @@ DMSModel* dc_model_load(const char* filename) {
         g_clip_buffer_size = max_verts;
     }
 
-    /* ---- v5: Load embedded textures & compile PVR headers ---- */
-    if (version >= 5) {
-        uint32_t tex_count;
-        fread(&tex_count, 4, 1, f);
-        printf("DMS: %lu embedded textures\n", (unsigned long)tex_count);
+    /* ---- Embedded textures & PVR headers ---- */
+    uint32_t tex_count;
+    fread(&tex_count, 4, 1, f);
+    printf("DMS: %lu embedded textures\n", (unsigned long)tex_count);
 
-        model->texture_count = tex_count;
-        if (tex_count > 0) {
-            struct { uint32_t offset; uint32_t size; } *tex_table;
-            tex_table = malloc(tex_count * 8);
-            fread(tex_table, 8, tex_count, f);
+    model->texture_count = tex_count;
+    if (tex_count > 0) {
+        struct { uint32_t offset; uint32_t size; } *tex_table;
+        tex_table = malloc(tex_count * 8);
+        fread(tex_table, 8, tex_count, f);
 
-            model->textures = calloc(tex_count, sizeof(dttex_info_t));
+        model->textures = calloc(tex_count, sizeof(dttex_info_t));
 
-            for (uint32_t i = 0; i < tex_count; i++) {
-                if (tex_table[i].size == 0) continue;
+        for (uint32_t i = 0; i < tex_count; i++) {
+            if (tex_table[i].size == 0) continue;
 
-                void *buf = malloc(tex_table[i].size);
-                fseek(f, tex_table[i].offset, SEEK_SET);
-                fread(buf, 1, tex_table[i].size, f);
+            void *buf = malloc(tex_table[i].size);
+            fseek(f, tex_table[i].offset, SEEK_SET);
+            fread(buf, 1, tex_table[i].size, f);
 
-                pvrtex_load_from_buffer(buf, tex_table[i].size, &model->textures[i]);
-                free(buf);
+            pvrtex_load_from_buffer(buf, tex_table[i].size, &model->textures[i]);
+            free(buf);
 
-                printf("  Tex %lu: %ux%u, %lu bytes\n",
-                       (unsigned long)i,
-                       model->textures[i].width,
-                       model->textures[i].height,
-                       (unsigned long)tex_table[i].size);
-            }
-            free(tex_table);
+            printf("  Tex %lu: %ux%u, %lu bytes\n",
+                   (unsigned long)i,
+                   model->textures[i].width,
+                   model->textures[i].height,
+                   (unsigned long)tex_table[i].size);
         }
-
-        /* Compile PVR headers using material_flags */
-        for (uint32_t m = 0; m < mesh_count; m++) {
-            DMSMesh* mesh = &model->meshes[m];
-            pvr_poly_cxt_t cxt;
-
-            int alpha_mode   = mesh->material_flags & 0x3;
-            int tex_filter   = (mesh->material_flags >> 9) & 0x1;
-
-            int pvr_list;
-            if (alpha_mode == 0)      pvr_list = PVR_LIST_OP_POLY;
-            else if (alpha_mode == 1) pvr_list = PVR_LIST_PT_POLY;
-            else                      pvr_list = PVR_LIST_TR_POLY;
-
-            int tid = mesh->texture_id;
-
-            if (tid >= 0 && tid < (int)tex_count && model->textures[tid].ptr) {
-                dttex_info_t* tex = &model->textures[tid];
-                pvr_poly_cxt_txr(&cxt, pvr_list,
-                                 tex->pvrformat,
-                                 tex->width, tex->height,
-                                 tex->ptr,
-                                 tex_filter ? PVR_FILTER_NONE : PVR_FILTER_BILINEAR);
-            } else {
-                pvr_poly_cxt_col(&cxt, pvr_list);
-            }
-
-            cxt.gen.culling = PVR_CULLING_NONE;
-
-            if (alpha_mode == 2) {
-                cxt.txr.env = PVR_TXRENV_MODULATEALPHA;
-                cxt.blend.src = PVR_BLEND_SRCALPHA;
-                cxt.blend.dst = PVR_BLEND_INVSRCALPHA;
-            }
-
-            pvr_poly_compile(&mesh->header, &cxt);
-        }
+        free(tex_table);
     }
 
-    fclose(f);
-    return model;
-}
-
-void dc_model_load_textures(DMSModel* model, const char* base_path) {
-    if (!model) return;
-
-    /* v5 files have embedded textures — already loaded */
-    if (model->textures) return;
-
-    int max_id = -1;
-    for (int m = 0; m < (int)model->mesh_count; m++) {
-        if (model->meshes[m].texture_id > max_id)
-            max_id = model->meshes[m].texture_id;
-    }
-
-    model->texture_count = (max_id >= 0) ? (max_id + 1) : 0;
-    if (model->texture_count > 0) {
-        model->textures = calloc(model->texture_count, sizeof(dttex_info_t));
-
-        for (int i = 0; i < model->texture_count; i++) {
-            char path[256];
-            snprintf(path, sizeof(path), "%s/texture_%d.dt", base_path, i);
-            pvrtex_load(path, &model->textures[i]);
-        }
-    }
-
-    for (int m = 0; m < (int)model->mesh_count; m++) {
+    /* Compile PVR headers using material_flags */
+    for (uint32_t m = 0; m < mesh_count; m++) {
         DMSMesh* mesh = &model->meshes[m];
         pvr_poly_cxt_t cxt;
 
@@ -959,7 +941,8 @@ void dc_model_load_textures(DMSModel* model, const char* base_path) {
         else                      pvr_list = PVR_LIST_TR_POLY;
 
         int tid = mesh->texture_id;
-        if (tid >= 0 && tid < model->texture_count && model->textures[tid].ptr) {
+
+        if (tid >= 0 && tid < (int)tex_count && model->textures[tid].ptr) {
             dttex_info_t* tex = &model->textures[tid];
             pvr_poly_cxt_txr(&cxt, pvr_list,
                              tex->pvrformat,
@@ -980,6 +963,9 @@ void dc_model_load_textures(DMSModel* model, const char* base_path) {
 
         pvr_poly_compile(&mesh->header, &cxt);
     }
+
+    fclose(f);
+    return model;
 }
 
 /* ================================================================
@@ -995,6 +981,7 @@ void dc_model_free(DMSModel* model) {
             free(model->meshes[m].animated_vertices);
     }
     free(model->meshes);
+    free(model->blocks);
 
     if (model->textures) {
         for (int i = 0; i < model->texture_count; i++)
