@@ -1825,6 +1825,23 @@ void WeldVertices(Mesh *mesh, float threshold = 0.001f) {
 #ifndef CHUNK_MIN_TRIS
 #define CHUNK_MIN_TRIS 32
 #endif
+// Same idea one level up: a block with this many triangles or fewer is not
+// split by size. A sparse level cut purely by size ends up as hundreds of
+// blocks x materials holding a handful of triangles each, and a mesh costs
+// about as much as 10 vertices before it draws anything.
+#ifndef BLOCK_MIN_TRIS
+#define BLOCK_MIN_TRIS 256
+#endif
+// Triangle caps: a block / chunk already small enough in world
+// units is still split while it holds more than this. Models come at any
+// scale, and one modelled small would otherwise end up as a single block of
+// 600-triangle meshes that all cross the near plane.
+#ifndef BLOCK_MAX_TRIS
+#define BLOCK_MAX_TRIS 4096
+#endif
+#ifndef CHUNK_MAX_TRIS
+#define CHUNK_MAX_TRIS 256
+#endif
 
 struct BlockTri {
   int mesh;
@@ -1835,7 +1852,7 @@ struct BlockTri {
 
 static void SplitBlock(std::vector<BlockTri> &tris, size_t begin, size_t end,
                        std::vector<std::pair<size_t, size_t>> &out, float maxSize,
-                       size_t minTris = 0) {
+                       size_t minTris = 0, size_t maxTris = 0) {
   if (end - begin <= minTris) {
     out.push_back({begin, end});
     return;
@@ -1850,26 +1867,32 @@ static void SplitBlock(std::vector<BlockTri> &tris, size_t begin, size_t end,
   Vector3 ext = Vector3Subtract(hi, lo);
   int axis = (ext.x >= ext.y && ext.x >= ext.z) ? 0 : (ext.y >= ext.z ? 1 : 2);
   float size = axis == 0 ? ext.x : axis == 1 ? ext.y : ext.z;
-  // A block can't get smaller than its triangles, so past that point
-  // splitting only adds blocks
-  if (size <= std::max(maxSize, biggestTri)) {
-    out.push_back({begin, end});
-    return;
-  }
-  float mid = axis == 0 ? (lo.x + hi.x) * 0.5f
-            : axis == 1 ? (lo.y + hi.y) * 0.5f : (lo.z + hi.z) * 0.5f;
   auto key = [axis](const BlockTri &t) {
     return axis == 0 ? t.centre.x : axis == 1 ? t.centre.y : t.centre.z;
   };
-  auto split = std::partition(tris.begin() + begin, tris.begin() + end,
-                              [&](const BlockTri &t) { return key(t) < mid; });
-  size_t m = split - tris.begin();
+  size_t m = begin;
+  // A block can't get smaller than its triangles, so past that point
+  // splitting by size only adds blocks
+  if (size > std::max(maxSize, biggestTri)) {
+    float mid = axis == 0 ? (lo.x + hi.x) * 0.5f
+              : axis == 1 ? (lo.y + hi.y) * 0.5f : (lo.z + hi.z) * 0.5f;
+    auto split = std::partition(tris.begin() + begin, tris.begin() + end,
+                                [&](const BlockTri &t) { return key(t) < mid; });
+    m = split - tris.begin();
+  }
+  // Small enough in units but still too many triangles (a level modelled at
+  // a tiny scale): cut at the median so both halves hold the same amount
+  if ((m == begin || m == end) && maxTris && end - begin > maxTris && size > 0.0f) {
+    m = begin + (end - begin) / 2;
+    std::nth_element(tris.begin() + begin, tris.begin() + m, tris.begin() + end,
+                     [&](const BlockTri &x, const BlockTri &y) { return key(x) < key(y); });
+  }
   if (m == begin || m == end) {
     out.push_back({begin, end});
     return;
   }
-  SplitBlock(tris, begin, m, out, maxSize, minTris);
-  SplitBlock(tris, m, end, out, maxSize, minTris);
+  SplitBlock(tris, begin, m, out, maxSize, minTris, maxTris);
+  SplitBlock(tris, m, end, out, maxSize, minTris, maxTris);
 }
 
 // Meshes with the same material are merged inside a block
@@ -1914,7 +1937,7 @@ void BuildBlocks(Model *m) {
   if (tris.empty()) return;
 
   std::vector<std::pair<size_t, size_t>> blocks;
-  SplitBlock(tris, 0, tris.size(), blocks, BLOCK_MAX_SIZE);
+  SplitBlock(tris, 0, tris.size(), blocks, BLOCK_MAX_SIZE, BLOCK_MIN_TRIS, BLOCK_MAX_TRIS);
 
   std::vector<Mesh> result;
   for (size_t b = 0; b < blocks.size(); b++) {
@@ -1939,7 +1962,7 @@ void BuildBlocks(Model *m) {
       for (float tier = CHUNK_MAX_SIZE; first < gt.size(); tier *= 2.0f) {
         size_t end = first;
         while (end < gt.size() && gt[end].size <= tier) end++;
-        if (end > first) SplitBlock(gt, first, end, chunks, tier, CHUNK_MIN_TRIS);
+        if (end > first) SplitBlock(gt, first, end, chunks, tier, CHUNK_MIN_TRIS, CHUNK_MAX_TRIS);
         first = end;
       }
       for (auto &chunk : chunks) {
