@@ -64,6 +64,7 @@ typedef struct {
   unsigned int *stripLengths; // Array of strip lengths
   int stripCount;             // Number of strips
   int looseIndexCount;        // Number of indices in loose triangles
+  int prestripped;            // BuildBlocks already made the strips
   int vertexCount;
   int indexCount;
   int textureId;
@@ -1843,17 +1844,24 @@ void WeldVertices(Mesh *mesh, float threshold = 0.001f) {
 #define CHUNK_MAX_TRIS 256
 #endif
 
+#ifndef STRIP_MAX_TRIS
+#define STRIP_MAX_TRIS 32   // longer strips are cut so chunk spheres stay tight
+#endif
+
 struct BlockTri {
   int mesh;
   int tri;
   Vector3 centre;
   float size;             // longest side of the triangle's bounding box
+  int weight;             // triangles this entry stands for
 };
 
 static void SplitBlock(std::vector<BlockTri> &tris, size_t begin, size_t end,
                        std::vector<std::pair<size_t, size_t>> &out, float maxSize,
                        size_t minTris = 0, size_t maxTris = 0) {
-  if (end - begin <= minTris) {
+  size_t count = 0;
+  for (size_t i = begin; i < end; i++) count += tris[i].weight;
+  if (count <= minTris || end - begin < 2) {
     out.push_back({begin, end});
     return;
   }
@@ -1882,10 +1890,12 @@ static void SplitBlock(std::vector<BlockTri> &tris, size_t begin, size_t end,
   }
   // Small enough in units but still too many triangles (a level modelled at
   // a tiny scale): cut at the median so both halves hold the same amount
-  if ((m == begin || m == end) && maxTris && end - begin > maxTris && size > 0.0f) {
-    m = begin + (end - begin) / 2;
-    std::nth_element(tris.begin() + begin, tris.begin() + m, tris.begin() + end,
-                     [&](const BlockTri &x, const BlockTri &y) { return key(x) < key(y); });
+  if ((m == begin || m == end) && maxTris && count > maxTris && size > 0.0f) {
+    std::sort(tris.begin() + begin, tris.begin() + end,
+              [&](const BlockTri &x, const BlockTri &y) { return key(x) < key(y); });
+    size_t acc = 0;
+    for (m = begin; m < end - 1 && acc * 2 < count; m++) acc += tris[m].weight;
+    if (m == begin) m = begin + 1;
   }
   if (m == begin || m == end) {
     out.push_back({begin, end});
@@ -1893,6 +1903,45 @@ static void SplitBlock(std::vector<BlockTri> &tris, size_t begin, size_t end,
   }
   SplitBlock(tris, begin, m, out, maxSize, minTris, maxTris);
   SplitBlock(tris, m, end, out, maxSize, minTris, maxTris);
+}
+
+
+static void UnitBounds(const std::vector<Vertex> &v, const std::vector<uint32_t> &s,
+                       Vector3 *lo, Vector3 *hi, float *biggestTri) {
+  *lo = {v[s[0]].x, v[s[0]].y, v[s[0]].z};
+  *hi = *lo;
+  *biggestTri = 0.0f;
+  for (size_t i = 0; i < s.size(); i++) {
+    Vector3 p = {v[s[i]].x, v[s[i]].y, v[s[i]].z};
+    *lo = Vector3Min(*lo, p);
+    *hi = Vector3Max(*hi, p);
+    if (i >= 2) {
+      Vector3 a = {v[s[i - 1]].x, v[s[i - 1]].y, v[s[i - 1]].z};
+      Vector3 c = {v[s[i - 2]].x, v[s[i - 2]].y, v[s[i - 2]].z};
+      Vector3 e = Vector3Subtract(Vector3Max(Vector3Max(p, a), c), Vector3Min(Vector3Min(p, a), c));
+      *biggestTri = std::max(*biggestTri, std::max(e.x, std::max(e.y, e.z)));
+    }
+  }
+}
+
+// A strip too long for one chunk is cut in the middle (2 extra verts a cut);
+// cuts land on an even triangle so the winding carries over
+static void CutStrip(const std::vector<Vertex> &v, const std::vector<uint32_t> &s,
+                     std::vector<std::vector<uint32_t>> &out) {
+  size_t n = s.size() - 2;
+  Vector3 lo, hi;
+  float biggest;
+  UnitBounds(v, s, &lo, &hi, &biggest);
+  Vector3 ext = Vector3Subtract(hi, lo);
+  float size = std::max(ext.x, std::max(ext.y, ext.z));
+  if (n < 4 || (n <= STRIP_MAX_TRIS && size <= std::max(CHUNK_MAX_SIZE, 2.0f * biggest))) {
+    out.push_back(s);
+    return;
+  }
+  size_t k = (n / 2) & ~(size_t)1;
+  if (k < 2) k = 2;
+  CutStrip(v, std::vector<uint32_t>(s.begin(), s.begin() + k + 2), out);
+  CutStrip(v, std::vector<uint32_t>(s.begin() + k, s.end()), out);
 }
 
 // Meshes with the same material are merged inside a block
@@ -1931,7 +1980,7 @@ void BuildBlocks(Model *m) {
       tris.push_back({i, t,
                       {(a.x + b.x + c.x) / 3.0f, (a.y + b.y + c.y) / 3.0f,
                        (a.z + b.z + c.z) / 3.0f},
-                      std::max(ext.x, std::max(ext.y, ext.z))});
+                      std::max(ext.x, std::max(ext.y, ext.z)), 1});
     }
   }
   if (tris.empty()) return;
@@ -1947,53 +1996,103 @@ void BuildBlocks(Model *m) {
       byMaterial[material[tris[i].mesh]].push_back(tris[i]);
 
     for (auto &group : byMaterial) {
-      // Triangles are chunked in size tiers (CHUNK_MAX_SIZE, x2, x4...) with
-      // the chunk size following the tier. Otherwise one huge triangle stops
-      // the split and drags everything around it into its oversized sphere.
       std::vector<BlockTri> &gt = group.second;
-      std::sort(gt.begin(), gt.end(),
-                [](const BlockTri &x, const BlockTri &y) { return x.size < y.size; });
-      std::vector<std::pair<size_t, size_t>> chunks;
-      size_t first = 0;
-      if (gt.size() <= CHUNK_MIN_TRIS) {
-        chunks.push_back({0, gt.size()});
-        first = gt.size();
-      }
-      for (float tier = CHUNK_MAX_SIZE; first < gt.size(); tier *= 2.0f) {
-        size_t end = first;
-        while (end < gt.size() && gt[end].size <= tier) end++;
-        if (end > first) SplitBlock(gt, first, end, chunks, tier, CHUNK_MIN_TRIS, CHUNK_MAX_TRIS);
-        first = end;
-      }
-      for (auto &chunk : chunks) {
-        Mesh c = m->meshes[group.first];
+      // Strip the whole group first, then sort finished strips into chunks
+      Mesh g = m->meshes[group.first];
+      {
         std::map<std::pair<int, unsigned int>, int> remap;
         std::vector<Vertex> verts;
-        c.indexCount = (int)(chunk.second - chunk.first) * 3;
-        c.indices = (unsigned int *)calloc(c.indexCount, sizeof(unsigned int));
-        for (size_t t = 0; t < chunk.second - chunk.first; t++) {
-          const BlockTri *bt = &group.second[chunk.first + t];
-          const Mesh *src = &m->meshes[bt->mesh];
+        g.indexCount = (int)gt.size() * 3;
+        g.indices = (unsigned int *)calloc(g.indexCount, sizeof(unsigned int));
+        for (size_t t = 0; t < gt.size(); t++) {
+          const Mesh *src = &m->meshes[gt[t].mesh];
           for (int k = 0; k < 3; k++) {
-            unsigned int old = src->indices[bt->tri * 3 + k];
-            auto key = std::make_pair(bt->mesh, old);
+            unsigned int old = src->indices[gt[t].tri * 3 + k];
+            auto key = std::make_pair(gt[t].mesh, old);
             auto it = remap.find(key);
             if (it == remap.end()) {
               it = remap.emplace(key, (int)verts.size()).first;
               verts.push_back(src->vertices[old]);
             }
-            c.indices[t * 3 + k] = it->second;
+            g.indices[t * 3 + k] = it->second;
           }
         }
+        g.vertexCount = (int)verts.size();
+        g.vertices = (Vertex *)calloc(g.vertexCount, sizeof(Vertex));
+        memcpy(g.vertices, verts.data(), sizeof(Vertex) * g.vertexCount);
+      }
+      MeshTriStrips ts = ExtractTriStrips(&g);
+      free(g.vertices);
+      free(g.indices);
+
+      std::vector<std::vector<uint32_t>> units;
+      size_t stripUnits = 0;
+      for (auto &st : ts.strips) CutStrip(ts.vertices, st.indices, units);
+      stripUnits = units.size();
+      for (size_t i = 0; i + 2 < ts.looseTriangles.size(); i += 3)
+        units.push_back({ts.looseTriangles[i], ts.looseTriangles[i + 1], ts.looseTriangles[i + 2]});
+
+      std::vector<BlockTri> ut;
+      size_t groupTris = 0;
+      for (size_t u = 0; u < units.size(); u++) {
+        Vector3 lo, hi;
+        float biggest;
+        UnitBounds(ts.vertices, units[u], &lo, &hi, &biggest);
+        Vector3 ext = Vector3Subtract(hi, lo);
+        int w = (int)units[u].size() - 2;
+        ut.push_back({(int)u, (int)(u < stripUnits), Vector3Scale(Vector3Add(lo, hi), 0.5f),
+                      std::max(ext.x, std::max(ext.y, ext.z)), w});
+        groupTris += w;
+      }
+      std::sort(ut.begin(), ut.end(),
+                [](const BlockTri &x, const BlockTri &y) { return x.size < y.size; });
+      std::vector<std::pair<size_t, size_t>> chunks;
+      size_t first = 0;
+      if (groupTris <= CHUNK_MIN_TRIS) {
+        chunks.push_back({0, ut.size()});
+        first = ut.size();
+      }
+      for (float tier = CHUNK_MAX_SIZE; first < ut.size(); tier *= 2.0f) {
+        size_t end = first;
+        while (end < ut.size() && ut[end].size <= tier) end++;
+        if (end > first) SplitBlock(ut, first, end, chunks, tier, CHUNK_MIN_TRIS, CHUNK_MAX_TRIS);
+        first = end;
+      }
+      for (auto &chunk : chunks) {
+        Mesh c = m->meshes[group.first];
+        std::map<uint32_t, int> remap;
+        std::vector<Vertex> verts;
+        std::vector<unsigned int> idx, lens;
+        auto add = [&](uint32_t old) {
+          auto it = remap.find(old);
+          if (it == remap.end()) {
+            it = remap.emplace(old, (int)verts.size()).first;
+            verts.push_back(ts.vertices[old]);
+          }
+          idx.push_back(it->second);
+        };
+        for (int pass = 1; pass >= 0; pass--)   // strips first, loose after
+          for (size_t i = chunk.first; i < chunk.second; i++) {
+            if (ut[i].tri != pass) continue;
+            if (pass) lens.push_back((unsigned int)units[ut[i].mesh].size());
+            for (uint32_t v : units[ut[i].mesh]) add(v);
+          }
+        size_t stripIdx = 0;
+        for (unsigned int l : lens) stripIdx += l;
         c.vertexCount = (int)verts.size();
         c.vertices = (Vertex *)calloc(c.vertexCount, sizeof(Vertex));
         c.originalVertices = (Vertex *)calloc(c.vertexCount, sizeof(Vertex));
         c.animatedVertices = (Vertex *)calloc(c.vertexCount, sizeof(Vertex));
         memcpy(c.vertices, verts.data(), sizeof(Vertex) * c.vertexCount);
         memcpy(c.originalVertices, verts.data(), sizeof(Vertex) * c.vertexCount);
-        c.stripLengths = NULL;
-        c.stripCount = 0;
-        c.looseIndexCount = 0;
+        c.indexCount = (int)idx.size();
+        c.indices = (unsigned int *)calloc(c.indexCount, sizeof(unsigned int));
+        memcpy(c.indices, idx.data(), sizeof(unsigned int) * idx.size());
+        c.stripCount = (int)lens.size();
+        c.stripLengths = (unsigned int *)calloc(lens.size() + 1, sizeof(unsigned int));
+        memcpy(c.stripLengths, lens.data(), sizeof(unsigned int) * lens.size());
+        c.looseIndexCount = (int)(idx.size() - stripIdx);
+        c.prestripped = 1;
         c.blockId = (int)b;
         result.push_back(c);
       }
@@ -2001,8 +2100,10 @@ void BuildBlocks(Model *m) {
   }
 
   int inTris = (int)tris.size(), outTris = 0;
-  for (const Mesh &mesh : result)
-    outTris += mesh.indexCount / 3;
+  for (const Mesh &mesh : result) {
+    outTris += mesh.looseIndexCount / 3;
+    for (int i = 0; i < mesh.stripCount; i++) outTris += mesh.stripLengths[i] - 2;
+  }
 
   printf("Blocks: %d meshes (%d materials) -> %zu blocks, %zu meshes, %d tris in, %d tris out%s\n",
          m->meshCount, materialCount, blocks.size(), result.size(), inTris, outTris,
@@ -2085,6 +2186,21 @@ void CreateTristrippedModel(const Model *sourceModel, Model *destModel) {
     dstMesh->wrapV = srcMesh->wrapV;
     dstMesh->blockId = srcMesh->blockId;
     dstMesh->collisionOnly = srcMesh->collisionOnly;
+
+    if (srcMesh->prestripped) {
+      dstMesh->vertexCount = srcMesh->vertexCount;
+      dstMesh->vertices = (Vertex *)calloc(dstMesh->vertexCount, sizeof(Vertex));
+      dstMesh->animatedVertices = (Vertex *)calloc(dstMesh->vertexCount, sizeof(Vertex));
+      memcpy(dstMesh->vertices, srcMesh->vertices, dstMesh->vertexCount * sizeof(Vertex));
+      dstMesh->indexCount = srcMesh->indexCount;
+      dstMesh->indices = (unsigned int *)calloc(dstMesh->indexCount, sizeof(unsigned int));
+      memcpy(dstMesh->indices, srcMesh->indices, dstMesh->indexCount * sizeof(unsigned int));
+      dstMesh->stripCount = srcMesh->stripCount;
+      dstMesh->stripLengths = (unsigned int *)calloc(dstMesh->stripCount + 1, sizeof(unsigned int));
+      memcpy(dstMesh->stripLengths, srcMesh->stripLengths, dstMesh->stripCount * sizeof(unsigned int));
+      dstMesh->looseIndexCount = srcMesh->looseIndexCount;
+      continue;
+    }
 
     printf("Processing mesh %d of %d...\n", m + 1, sourceModel->meshCount);
     printf("Source mesh has %d vertices and %d indices\n", srcMesh->vertexCount,
