@@ -20,9 +20,14 @@ static DCModelStats g_stats;
  * Vertex buffer guard
  *
  * If the PVR vertex buffer overflows, the TA writes over other VRAM and
- * the GPU hangs. Before each mesh, read the TA's live write position and
- * skip the mesh if it might not fit. Drawing resumes by itself as soon as
- * there is room again (the next frame, or a smaller mesh).
+ * the GPU hangs, so a mesh that might not fit is skipped. Drawing resumes
+ * by itself as soon as there is room again (the next frame, or a smaller
+ * mesh).
+ *
+ * Reading the TA's write position is slow (~0.5us a register, it was half
+ * the cost of drawing a small mesh), so it is read once per model draw call
+ * and the bytes sent after that are counted here instead. The count can only
+ * run ahead of the TA, never behind it.
  * ================================================================ */
 
 #define VTXBUF_MARGIN (32 * 1024)   /* TA lag, background poly, HUD after models */
@@ -38,14 +43,23 @@ static void vtxbuf_warn(void) {
 }
 
 /* Bytes left in the vertex buffer after the safety margin */
-static inline int32_t vtxbuf_left(void) {
-    return (int32_t)(PVR_GET(PVR_TA_VERTBUF_END) - PVR_GET(PVR_TA_VERTBUF_POS)) - VTXBUF_MARGIN;
+static int32_t g_vtx_left;
+
+/* Re-read the real position (the HUD, other code and the last frame all
+ * moved it); both registers, KOS swaps buffers every frame */
+static inline void vtxbuf_sync(void) {
+    g_vtx_left = (int32_t)(PVR_GET(PVR_TA_VERTBUF_END) - PVR_GET(PVR_TA_VERTBUF_POS)) - VTXBUF_MARGIN;
 }
 
 /* Clipped meshes are mostly plain strips, so both paths are estimated at
- * 32 bytes/vertex; render_clipped separately guards its per-triangle output. */
-static int vtxbuf_full(const DMSMesh* mesh) {
-    if ((int32_t)(32 + mesh->vertex_count * 32) <= vtxbuf_left()) return 0;
+ * 32 bytes/vertex to get in. A clipped mesh then counts what it really
+ * sends (render_clipped) and guards its per-triangle output. */
+static inline int vtxbuf_full(const DMSMesh* mesh, int clip) {
+    int32_t need = (int32_t)(32 + mesh->vertex_count * 32);
+    if (SHZ_LIKELY(need <= g_vtx_left)) {
+        g_vtx_left -= clip ? 32 : need;
+        return 0;
+    }
     vtxbuf_warn();
     g_stats.meshes_vtxfull++;
     return 1;
@@ -103,6 +117,7 @@ static int clip_tri_near(const ClipVertex* const in[3], ClipVertex* out) {
 }
 
 static inline void submit_vert(ClipVertex* v, uint32_t flags) {
+    g_vtx_left -= 32;
     float inv_w = shz_invf_fsrra(v->w);
     pvr_vertex_t* pv = pvr_dr_target(*g_dr);
     pv->flags = flags;
@@ -218,6 +233,7 @@ static void render_clipped(const DMSVertex* src, int count,
 
     /* All verts inside frustum: fast submit from clip buffer */
     if (combined_or == 0) {
+        g_vtx_left -= count * 32;
         for (int i = 0; i < count; i++) {
             ClipVertex* cv = &g_clip_buffer[i];
             float inv_w = shz_invf_fsrra(cv->w);
@@ -278,7 +294,7 @@ static void render_clipped(const DMSVertex* src, int count,
                 if (in_strip) in_strip = 0;
 
                 /* Up to 4 verts per clipped triangle */
-                if (vtxbuf_left() < 4 * 32) { vtxbuf_warn(); continue; }
+                if (g_vtx_left < 4 * 32) { vtxbuf_warn(); continue; }
 
                 const ClipVertex* tri[3] = {
                     (j & 1) ? &v[j-1] : &v[j-2],
@@ -433,7 +449,7 @@ static int draw_skinned_mesh(DMSMesh* mesh, DMSModel* model,
         return 0;
     }
 
-    if (vtxbuf_full(mesh))
+    if (vtxbuf_full(mesh, 0))
         return 0;
 
     g_stats.meshes_drawn++;
@@ -478,6 +494,7 @@ static inline int sphere_visible(const WorldFrustum* fr, shz_vec3_t c, float r, 
 }
 
 enum { XM_OTHER, XM_PLANES, XM_MVP };   /* what XMTRX holds right now */
+
 #define DRAW_BATCH 64
 
 /* Static model with blocks: one sphere test per block run (a culled block's
@@ -559,7 +576,7 @@ static void draw_blocks_list(DMSModel* model, shz_vec3_t pos, float scale,
             /* Draw the survivors */
             for (int i = 0; i < n; i++) {
                 DMSMesh* mesh = &model->meshes[batch[i] & 0x7fffffffu];
-                if (vtxbuf_full(mesh)) continue;
+                if (vtxbuf_full(mesh, batch[i] >> 31)) continue;
 
                 if (!dr) {
                     dc_list_begin(target_list);
@@ -617,6 +634,7 @@ void dc_model_draw_list_rotated(DMSModel* model, shz_vec3_t pos, float scale,
                                 float yaw, const DCCamera* cam, int target_list) {
     if (!model || model->mesh_count == 0) return;
 
+    vtxbuf_sync();
     if (model->skeleton)
         draw_skinned_list(model, pos, scale, yaw, cam, target_list);
     else
