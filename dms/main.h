@@ -18,12 +18,8 @@
 #define GROUND_SNAP     0.5f
 #define MAX_STEP_HEIGHT 0.35f
 
-/* ---- Outcode flags: bit n = clip plane n in plane_dist (plane 1 unused) ---- */
+/* ---- Outcode flag: vertex is behind the near plane ---- */
 #define OC_NEAR   0x01
-#define OC_LEFT   0x04
-#define OC_RIGHT  0x08
-#define OC_TOP    0x10
-#define OC_BOTTOM 0x20
 
 /* ---- .dms file magic ---- */
 #define DMS_MAGIC   0x54534D44u   /* "DMST" */

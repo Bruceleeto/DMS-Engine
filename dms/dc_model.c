@@ -12,9 +12,6 @@
 static ClipVertex* g_clip_buffer = NULL;
 static uint32_t    g_clip_buffer_size = 0;
 
-static ClipVertex clip_ping[10];
-static ClipVertex clip_pong[10];
-
 static pvr_dr_state_t* g_dr;   /* set by render_clipped for submit_vert */
 
 static DCModelStats g_stats;
@@ -58,27 +55,13 @@ static int vtxbuf_full(const DMSMesh* mesh) {
  * Clipping utilities
  * ================================================================ */
 
+/* Only the near plane is clipped: the TA bins by screen bounding box and
+ * drops whatever lands outside the tile area, so triangles may hang off the
+ * screen edges. What it can't take is w <= 0. Clip-space z is a constant here
+ * (the PVR only needs 1/w), so the near plane is w = NEAR_Z. No far clip: the
+ * block/sphere cull handles it. */
 static inline uint32_t compute_outcode(const ClipVertex* v) {
-    uint32_t oc = 0;
-    /* Clip-space z is a constant here (the PVR only needs 1/w), so the
-     * near plane is w = NEAR_Z. No far clip: the block/sphere cull handles it. */
-    if (v->w < NEAR_Z)           oc |= OC_NEAR;
-    if (v->x < 0.0f)             oc |= OC_LEFT;
-    if (v->x > SCR_W * v->w)     oc |= OC_RIGHT;
-    if (v->y < 0.0f)             oc |= OC_TOP;
-    if (v->y > SCR_H * v->w)     oc |= OC_BOTTOM;
-    return oc;
-}
-
-static inline float plane_dist(const ClipVertex* v, int plane) {
-    switch (plane) {
-        case 0: return v->w - NEAR_Z;
-        case 2: return v->x;
-        case 3: return SCR_W * v->w - v->x;
-        case 4: return v->y;
-        case 5: return SCR_H * v->w - v->y;
-        default: return 0.0f;
-    }
+    return v->w < NEAR_Z ? OC_NEAR : 0;
 }
 
 static inline void clip_lerp(const ClipVertex* a, const ClipVertex* b,
@@ -101,19 +84,19 @@ static inline void clip_lerp(const ClipVertex* a, const ClipVertex* b,
     co[3] = (uint8_t)(s * ca[3] + t * cb[3]);
 }
 
-static int clip_poly_plane(const ClipVertex* in, int n,
-                           ClipVertex* out, int plane) {
+/* Clip a triangle against the near plane; out gets 0, 3 or 4 verts */
+static int clip_tri_near(const ClipVertex* const in[3], ClipVertex* out) {
     int out_n = 0;
-    for (int i = 0; i < n; i++) {
-        int j = (i + 1 < n) ? i + 1 : 0;
-        float di = plane_dist(&in[i], plane);
-        float dj = plane_dist(&in[j], plane);
+    for (int i = 0; i < 3; i++) {
+        int j = (i + 1 < 3) ? i + 1 : 0;
+        float di = in[i]->w - NEAR_Z;
+        float dj = in[j]->w - NEAR_Z;
         if (di >= 0.0f) {
-            out[out_n++] = in[i];
+            out[out_n++] = *in[i];
             if (dj < 0.0f)
-                clip_lerp(&in[i], &in[j], di, dj, &out[out_n++]);
+                clip_lerp(in[i], in[j], di, dj, &out[out_n++]);
         } else if (dj >= 0.0f) {
-            clip_lerp(&in[i], &in[j], di, dj, &out[out_n++]);
+            clip_lerp(in[i], in[j], di, dj, &out[out_n++]);
         }
     }
     return out_n;
@@ -294,41 +277,27 @@ static void render_clipped(const DMSVertex* src, int count,
             } else {
                 if (in_strip) in_strip = 0;
 
-                /* Up to 7 tris (21 verts) per clipped triangle */
-                if (vtxbuf_left() < 21 * 32) { vtxbuf_warn(); continue; }
+                /* Up to 4 verts per clipped triangle */
+                if (vtxbuf_left() < 4 * 32) { vtxbuf_warn(); continue; }
 
-                ClipVertex* t0 = (j & 1) ? &v[j-1] : &v[j-2];
-                ClipVertex* t1 = (j & 1) ? &v[j-2] : &v[j-1];
-                ClipVertex* t2 = &v[j];
+                const ClipVertex* tri[3] = {
+                    (j & 1) ? &v[j-1] : &v[j-2],
+                    (j & 1) ? &v[j-2] : &v[j-1],
+                    &v[j]
+                };
+                ClipVertex poly[4];
+                int n = clip_tri_near(tri, poly);
 
-                clip_ping[0] = *t0;
-                clip_ping[1] = *t1;
-                clip_ping[2] = *t2;
-                int n = 3;
-
-                /* Side outcodes of verts behind the camera are meaningless and
-                 * near-clip points can land anywhere: trim against every edge. */
-                if (or_codes & OC_NEAR)
-                    or_codes |= OC_LEFT | OC_RIGHT | OC_TOP | OC_BOTTOM;
-
-                ClipVertex* src_buf = clip_ping;
-                ClipVertex* dst_buf = clip_pong;
-
-                for (int p = 0; p < 6; p++) {
-                    if (!(or_codes & (1 << p))) continue;
-                    n = clip_poly_plane(src_buf, n, dst_buf, p);
-                    if (n < 3) break;
-                    ClipVertex* tmp = src_buf;
-                    src_buf = dst_buf;
-                    dst_buf = tmp;
-                }
-
-                if (n >= 3) {
-                    for (int k = 1; k < n - 1; k++) {
-                        submit_vert(&src_buf[0], PVR_CMD_VERTEX);
-                        submit_vert(&src_buf[k], PVR_CMD_VERTEX);
-                        submit_vert(&src_buf[k+1], PVR_CMD_VERTEX_EOL);
-                    }
+                /* Triangle, or a quad sent as a 4-vert strip */
+                if (n == 3) {
+                    submit_vert(&poly[0], PVR_CMD_VERTEX);
+                    submit_vert(&poly[1], PVR_CMD_VERTEX);
+                    submit_vert(&poly[2], PVR_CMD_VERTEX_EOL);
+                } else if (n == 4) {
+                    submit_vert(&poly[0], PVR_CMD_VERTEX);
+                    submit_vert(&poly[1], PVR_CMD_VERTEX);
+                    submit_vert(&poly[3], PVR_CMD_VERTEX);
+                    submit_vert(&poly[2], PVR_CMD_VERTEX_EOL);
                 }
             }
         }
