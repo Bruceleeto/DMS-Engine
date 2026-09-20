@@ -80,6 +80,9 @@ typedef struct __attribute__((aligned(32))) {
     uint32_t flags;
 } DMSVertex;
 
+/* material_flags bit 12: mesh is collided with but never drawn */
+#define DMS_MAT_COLLISION_ONLY (1u << 12)
+
 typedef struct {
     uint32_t vertex_count;
     int32_t  texture_id;
@@ -101,6 +104,12 @@ typedef struct {
     float cx, cy, cz, radius;
 } DMSBlock;
 
+/* Meshes of one block inside one list sit together in the file; a run is
+ * that range, so a culled block is skipped without touching its meshes */
+typedef struct {
+    uint32_t block, first, count;
+} DMSBlockRun;
+
 typedef struct {
     uint32_t    mesh_count;
     uint32_t    opaque_count;       /* meshes [0..opaque-1] → OP list */
@@ -109,6 +118,8 @@ typedef struct {
     DMSMesh    *meshes;
     uint32_t    block_count;        /* 0 for animated models */
     DMSBlock   *blocks;
+    DMSBlockRun *runs;              /* built at load, static models only */
+    uint32_t    list_runs[4];       /* runs of alpha mode l: [list_runs[l], list_runs[l+1]) */
     dttex_info_t *textures;
     int          texture_count;
     DMSSkeleton *skeleton;

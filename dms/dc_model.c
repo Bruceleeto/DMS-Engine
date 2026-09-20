@@ -495,73 +495,130 @@ void dc_model_draw(DMSModel* model, shz_vec3_t pos, float scale,
     dc_model_draw_rotated(model, pos, scale, 0.0f, cam);
 }
 
-/* Static model with blocks: one sphere test per block, one matrix per call,
- * and the header is only resent when the material changes. */
+/* Frustum test with the side planes already in XMTRX. Same decisions as
+ * dc_frustum_cull_sphere(); also hands back the near-plane distance so the
+ * clip test doesn't redo it. */
+static inline int sphere_visible(const WorldFrustum* fr, shz_vec3_t c, float r, float* near_dist) {
+    shz_vec4_t p = shz_vec4_init(c.x, c.y, c.z, 1.0f);
+    float nd = shz_vec4_dot(fr->near_plane, p);
+    *near_dist = nd;
+    if (nd < -r) return 0;
+    if (shz_vec4_dot(fr->far_plane, p) < -r) return 0;
+    shz_vec4_t d = shz_xmtrx_transform_vec4(p);
+    return !(d.x < -r || d.y < -r || d.z < -r || d.w < -r);
+}
+
+enum { XM_OTHER, XM_PLANES, XM_MVP };   /* what XMTRX holds right now */
+#define DRAW_BATCH 64
+
+/* Static model with blocks: one sphere test per block run (a culled block's
+ * meshes are never touched), then one per mesh inside a visible block.
+ * XMTRX swaps between the frustum side planes (tests) and the MVP (drawing)
+ * as few times as possible: a block's meshes are all tested first, then the
+ * survivors drawn. The header copy goes through XMTRX, so the MVP is only
+ * reloaded after a header was sent. */
 static void draw_blocks_list(DMSModel* model, shz_vec3_t pos, float scale,
                              float yaw, const DCCamera* cam, int target_list) {
     shz_sincos_t sc = shz_sincosf(yaw);
     const shz_mat4x4_t* pv = dc_camera_get_pv(cam);
+    const WorldFrustum* fr = dc_camera_get_frustum(cam);
     alignas(32) shz_mat4x4_t mvp;
     shz_xmtrx_load_4x4((shz_mat4x4_t*)pv);
     shz_xmtrx_translate(pos.x - cam->pos.x, pos.y - cam->pos.y, -(pos.z - cam->pos.z));
     if (yaw != 0.0f) shz_xmtrx_apply_rotation_y(yaw);
     shz_xmtrx_apply_scale(scale, scale, scale);
     shz_xmtrx_store_4x4(&mvp);
+    int xm = XM_MVP;
 
-    uint32_t cur_block = UINT32_MAX;
-    int state = 0;                       /* 0 culled, 1 fast, 2 near-clip */
     const pvr_poly_hdr_t* last_hdr = NULL;
     pvr_dr_state_t* dr = NULL;
+    int list = target_list == PVR_LIST_OP_POLY ? 0 : target_list == PVR_LIST_PT_POLY ? 1 : 2;
 
-    for (uint32_t m = 0; m < model->mesh_count; m++) {
-        DMSMesh* mesh = &model->meshes[m];
-        int alpha_mode = mesh->material_flags & 0x3;
-        int pvr_list = alpha_mode == 0 ? PVR_LIST_OP_POLY
-                     : alpha_mode == 1 ? PVR_LIST_PT_POLY : PVR_LIST_TR_POLY;
-        if (pvr_list != target_list) continue;
+    uint32_t batch[DRAW_BATCH];          /* mesh index, top bit = clip path */
 
-        if (mesh->block != cur_block) {
-            cur_block = mesh->block;
-            const DMSBlock* b = &model->blocks[cur_block];
-            float bx = b->cx, bz = b->cz;
-            if (yaw != 0.0f) {
-                bx = b->cx * sc.cos - b->cz * sc.sin;
-                bz = b->cx * sc.sin + b->cz * sc.cos;
-            }
-            shz_vec3_t wc = shz_vec3_init(pos.x + bx * scale, pos.y + b->cy * scale,
-                                          pos.z + bz * scale);
-            float wr = b->radius * scale;
-            if (dc_frustum_cull_sphere(cam, wc, wr) < 0) state = 0;
-            else state = dc_frustum_near_intersect(cam, wc, wr) ? 2 : 1;
+    for (uint32_t r = model->list_runs[list]; r < model->list_runs[list + 1]; r++) {
+        const DMSBlockRun* run = &model->runs[r];
+        const DMSBlock* b = &model->blocks[run->block];
+        float bx = b->cx, bz = b->cz;
+        if (yaw != 0.0f) {
+            bx = b->cx * sc.cos - b->cz * sc.sin;
+            bz = b->cx * sc.sin + b->cz * sc.cos;
         }
-
-        if (!state) {
-            g_stats.meshes_culled++;
+        shz_vec3_t wc = shz_vec3_init(pos.x + bx * scale, pos.y + b->cy * scale,
+                                      pos.z + bz * scale);
+        float wr = b->radius * scale;
+        if (xm != XM_PLANES) {
+            shz_xmtrx_load_4x4((shz_mat4x4_t*)&fr->side_planes);
+            xm = XM_PLANES;
+        }
+        float nd;
+        if (!sphere_visible(fr, wc, wr, &nd)) {
+            g_stats.meshes_culled += run->count;
             continue;
         }
+        int block_near = nd < wr && nd > -wr;
 
-        if (vtxbuf_full(mesh)) continue;
+        uint32_t m = run->first, run_end = run->first + run->count;
+        while (m < run_end) {
+            /* Test: cull each mesh on its own sphere; if the block crosses
+             * the near plane, only meshes whose own sphere crosses it take
+             * the clip path */
+            int n = 0;
+            if (xm != XM_PLANES) {
+                shz_xmtrx_load_4x4((shz_mat4x4_t*)&fr->side_planes);
+                xm = XM_PLANES;
+            }
+            for (; m < run_end && n < DRAW_BATCH; m++) {
+                const DMSMesh* mesh = &model->meshes[m];
+                if (mesh->material_flags & DMS_MAT_COLLISION_ONLY) continue;
+                float mx = mesh->bound_cx, mz = mesh->bound_cz;
+                if (yaw != 0.0f) {
+                    mx = mesh->bound_cx * sc.cos - mesh->bound_cz * sc.sin;
+                    mz = mesh->bound_cx * sc.sin + mesh->bound_cz * sc.cos;
+                }
+                shz_vec3_t mc = shz_vec3_init(pos.x + mx * scale, pos.y + mesh->bound_cy * scale,
+                                              pos.z + mz * scale);
+                float mr = mesh->bound_radius * scale;
+                if (!sphere_visible(fr, mc, mr, &nd)) {
+                    g_stats.meshes_culled++;
+                    continue;
+                }
+                int clip = block_near && nd < mr && nd > -mr;
+                batch[n++] = m | (clip ? 0x80000000u : 0);
+            }
 
-        if (!dr) {
-            dc_list_begin(target_list);
-            dr = dc_dr_state();
-        }
+            /* Draw the survivors */
+            for (int i = 0; i < n; i++) {
+                DMSMesh* mesh = &model->meshes[batch[i] & 0x7fffffffu];
+                if (vtxbuf_full(mesh)) continue;
 
-        g_stats.meshes_drawn++;
-        g_stats.tris_drawn += mesh->tri_count;
+                if (!dr) {
+                    dc_list_begin(target_list);
+                    dr = dc_dr_state();
+                    xm = XM_OTHER;
+                }
 
-        if (!last_hdr || memcmp(last_hdr, &mesh->header, sizeof(pvr_poly_hdr_t))) {
-            shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &mesh->header);
-            last_hdr = &mesh->header;
-        }
+                g_stats.meshes_drawn++;
+                g_stats.tris_drawn += mesh->tri_count;
 
-        shz_xmtrx_load_4x4(&mvp);
-        if (state == 2) {
-            g_stats.verts_clipped += mesh->vertex_count;
-            render_clipped(mesh->vertices, mesh->vertex_count, dr);
-        } else {
-            g_stats.verts_xformed += mesh->vertex_count;
-            render_fast(mesh->vertices, mesh->vertex_count, dr);
+                if (!last_hdr || memcmp(last_hdr, &mesh->header, sizeof(pvr_poly_hdr_t))) {
+                    shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &mesh->header);
+                    last_hdr = &mesh->header;
+                    xm = XM_OTHER;
+                }
+
+                if (xm != XM_MVP) {
+                    shz_xmtrx_load_4x4(&mvp);
+                    xm = XM_MVP;
+                }
+                if (batch[i] & 0x80000000u) {
+                    g_stats.verts_clipped += mesh->vertex_count;
+                    render_clipped(mesh->vertices, mesh->vertex_count, dr);
+                } else {
+                    g_stats.verts_xformed += mesh->vertex_count;
+                    render_fast(mesh->vertices, mesh->vertex_count, dr);
+                }
+            }
         }
     }
 }
@@ -577,6 +634,7 @@ static void draw_skinned_list(DMSModel* model, shz_vec3_t pos, float scale,
         int pvr_list = alpha_mode == 0 ? PVR_LIST_OP_POLY
                      : alpha_mode == 1 ? PVR_LIST_PT_POLY : PVR_LIST_TR_POLY;
         if (pvr_list != target_list) continue;
+        if (mesh->material_flags & DMS_MAT_COLLISION_ONLY) continue;
 
         if (!dr) {
             dc_list_begin(target_list);
@@ -881,6 +939,26 @@ DMSModel* dc_model_load(const char* filename) {
             max_verts = mesh->vertex_count;
     }
 
+    /* ---- Block runs: meshes are sorted by list, then block ---- */
+    if (!is_animated) {
+        model->runs = malloc(mesh_count * sizeof(DMSBlockRun));
+        uint32_t n = 0, list = 0;
+        model->list_runs[0] = 0;
+        for (uint32_t m = 0; m < mesh_count; m++) {
+            const DMSMesh* mesh = &model->meshes[m];
+            uint32_t mode = mesh->material_flags & 0x3;
+            while (list < mode) model->list_runs[++list] = n;
+            if (n == model->list_runs[list] || model->runs[n - 1].block != mesh->block) {
+                model->runs[n].block = mesh->block;
+                model->runs[n].first = m;
+                model->runs[n].count = 0;
+                n++;
+            }
+            model->runs[n - 1].count++;
+        }
+        while (list < 3) model->list_runs[++list] = n;
+    }
+
     /* ---- Cache max bind radius for animated bounds ---- */
     model->max_bind_radius = 0.0f;
     for (uint32_t m = 0; m < mesh_count; m++) {
@@ -982,6 +1060,7 @@ void dc_model_free(DMSModel* model) {
     }
     free(model->meshes);
     free(model->blocks);
+    free(model->runs);
 
     if (model->textures) {
         for (int i = 0; i < model->texture_count; i++)

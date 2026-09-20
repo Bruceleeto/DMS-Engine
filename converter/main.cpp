@@ -1,3 +1,4 @@
+#include <strings.h>
 #include "main.h"
 #define CGLTF_IMPLEMENTATION
 #include "include/cgltf.h"
@@ -74,6 +75,7 @@ typedef struct {
   int doubleSided;        // 0=single-sided, 1=double-sided
   int wrapU, wrapV;       // raw glTF sampler values (10497=REPEAT, 33071=CLAMP, 33648=MIRROR)
   int blockId;            // static levels: which block (by location) this mesh is in
+  int collisionOnly;      // named "collision": collided with, never drawn
 
 } Mesh;
 
@@ -630,6 +632,16 @@ struct MeshInstance {
   bool bake;       // false for skinned nodes and identity transforms
   int bone;        // rigid part: every vertex follows this bone (-1 = none)
 };
+
+// Game rips name their invisible collision geometry; it must never be drawn
+static bool NameHasCollision(const char *name) {
+  if (!name)
+    return false;
+  for (const char *p = name; *p; p++)
+    if (strncasecmp(p, "collision", 9) == 0)
+      return true;
+  return false;
+}
 
 static bool IsIdentity(const float *m) {
   for (int i = 0; i < 16; i++) {
@@ -1501,6 +1513,12 @@ bool LoadGLTF(const char *filename) {
         dstMesh->doubleSided = 0;
         dstMesh->wrapU = 10497;       // REPEAT
         dstMesh->wrapV = 10497;       // REPEAT
+        dstMesh->collisionOnly =
+            NameHasCollision(instances[m].node ? instances[m].node->name : NULL) ||
+            NameHasCollision(srcMesh->name) ||
+            NameHasCollision(primitive->material ? primitive->material->name : NULL);
+        if (dstMesh->collisionOnly)
+          printf("Mesh %d is collision-only (not drawn)\n", meshIndex);
 
         // Get material data for this primitive
         if (primitive->material) {
@@ -1797,6 +1815,16 @@ void WeldVertices(Mesh *mesh, float threshold = 0.001f) {
 // sphere test. Triangles are grouped by their centre, never cut, so the level
 // looks identical.
 #define BLOCK_MAX_SIZE 64.0f // world units; FAR_Z is 200
+// Each material inside a block is cut again into chunks this size, so the
+// runtime can cull chunks inside a visible block and only chunks that really
+// touch the near plane take the clip path (Docs/test/viz shows the effect)
+#define CHUNK_MAX_SIZE 16.0f
+// A material group or chunk with this many triangles or fewer is never
+// split further: clipping it costs little, and each extra mesh costs a
+// fixed amount per frame
+#ifndef CHUNK_MIN_TRIS
+#define CHUNK_MIN_TRIS 32
+#endif
 
 struct BlockTri {
   int mesh;
@@ -1806,7 +1834,12 @@ struct BlockTri {
 };
 
 static void SplitBlock(std::vector<BlockTri> &tris, size_t begin, size_t end,
-                       std::vector<std::pair<size_t, size_t>> &out) {
+                       std::vector<std::pair<size_t, size_t>> &out, float maxSize,
+                       size_t minTris = 0) {
+  if (end - begin <= minTris) {
+    out.push_back({begin, end});
+    return;
+  }
   Vector3 lo = tris[begin].centre, hi = lo;
   float biggestTri = 0.0f;
   for (size_t i = begin; i < end; i++) {
@@ -1819,7 +1852,7 @@ static void SplitBlock(std::vector<BlockTri> &tris, size_t begin, size_t end,
   float size = axis == 0 ? ext.x : axis == 1 ? ext.y : ext.z;
   // A block can't get smaller than its triangles, so past that point
   // splitting only adds blocks
-  if (size <= std::max(BLOCK_MAX_SIZE, biggestTri)) {
+  if (size <= std::max(maxSize, biggestTri)) {
     out.push_back({begin, end});
     return;
   }
@@ -1835,8 +1868,8 @@ static void SplitBlock(std::vector<BlockTri> &tris, size_t begin, size_t end,
     out.push_back({begin, end});
     return;
   }
-  SplitBlock(tris, begin, m, out);
-  SplitBlock(tris, m, end, out);
+  SplitBlock(tris, begin, m, out, maxSize, minTris);
+  SplitBlock(tris, m, end, out, maxSize, minTris);
 }
 
 // Meshes with the same material are merged inside a block
@@ -1844,7 +1877,7 @@ static bool SameMaterial(const Mesh &a, const Mesh &b) {
   return a.textureId == b.textureId && a.materialColor == b.materialColor &&
          a.alphaMode == b.alphaMode && a.alphaCutoff == b.alphaCutoff &&
          a.doubleSided == b.doubleSided && a.wrapU == b.wrapU &&
-         a.wrapV == b.wrapV;
+         a.wrapV == b.wrapV && a.collisionOnly == b.collisionOnly;
 }
 
 void BuildBlocks(Model *m) {
@@ -1881,46 +1914,66 @@ void BuildBlocks(Model *m) {
   if (tris.empty()) return;
 
   std::vector<std::pair<size_t, size_t>> blocks;
-  SplitBlock(tris, 0, tris.size(), blocks);
+  SplitBlock(tris, 0, tris.size(), blocks, BLOCK_MAX_SIZE);
 
   std::vector<Mesh> result;
   for (size_t b = 0; b < blocks.size(); b++) {
     // Triangles of this block, grouped by material
-    std::map<int, std::vector<const BlockTri *>> byMaterial;
+    std::map<int, std::vector<BlockTri>> byMaterial;
     for (size_t i = blocks[b].first; i < blocks[b].second; i++)
-      byMaterial[material[tris[i].mesh]].push_back(&tris[i]);
+      byMaterial[material[tris[i].mesh]].push_back(tris[i]);
 
     for (auto &group : byMaterial) {
-      Mesh c = m->meshes[group.first];
-      std::map<std::pair<int, unsigned int>, int> remap;
-      std::vector<Vertex> verts;
-      c.indexCount = (int)group.second.size() * 3;
-      c.indices = (unsigned int *)calloc(c.indexCount, sizeof(unsigned int));
-      for (size_t t = 0; t < group.second.size(); t++) {
-        const BlockTri *bt = group.second[t];
-        const Mesh *src = &m->meshes[bt->mesh];
-        for (int k = 0; k < 3; k++) {
-          unsigned int old = src->indices[bt->tri * 3 + k];
-          auto key = std::make_pair(bt->mesh, old);
-          auto it = remap.find(key);
-          if (it == remap.end()) {
-            it = remap.emplace(key, (int)verts.size()).first;
-            verts.push_back(src->vertices[old]);
-          }
-          c.indices[t * 3 + k] = it->second;
-        }
+      // Triangles are chunked in size tiers (CHUNK_MAX_SIZE, x2, x4...) with
+      // the chunk size following the tier. Otherwise one huge triangle stops
+      // the split and drags everything around it into its oversized sphere.
+      std::vector<BlockTri> &gt = group.second;
+      std::sort(gt.begin(), gt.end(),
+                [](const BlockTri &x, const BlockTri &y) { return x.size < y.size; });
+      std::vector<std::pair<size_t, size_t>> chunks;
+      size_t first = 0;
+      if (gt.size() <= CHUNK_MIN_TRIS) {
+        chunks.push_back({0, gt.size()});
+        first = gt.size();
       }
-      c.vertexCount = (int)verts.size();
-      c.vertices = (Vertex *)calloc(c.vertexCount, sizeof(Vertex));
-      c.originalVertices = (Vertex *)calloc(c.vertexCount, sizeof(Vertex));
-      c.animatedVertices = (Vertex *)calloc(c.vertexCount, sizeof(Vertex));
-      memcpy(c.vertices, verts.data(), sizeof(Vertex) * c.vertexCount);
-      memcpy(c.originalVertices, verts.data(), sizeof(Vertex) * c.vertexCount);
-      c.stripLengths = NULL;
-      c.stripCount = 0;
-      c.looseIndexCount = 0;
-      c.blockId = (int)b;
-      result.push_back(c);
+      for (float tier = CHUNK_MAX_SIZE; first < gt.size(); tier *= 2.0f) {
+        size_t end = first;
+        while (end < gt.size() && gt[end].size <= tier) end++;
+        if (end > first) SplitBlock(gt, first, end, chunks, tier, CHUNK_MIN_TRIS);
+        first = end;
+      }
+      for (auto &chunk : chunks) {
+        Mesh c = m->meshes[group.first];
+        std::map<std::pair<int, unsigned int>, int> remap;
+        std::vector<Vertex> verts;
+        c.indexCount = (int)(chunk.second - chunk.first) * 3;
+        c.indices = (unsigned int *)calloc(c.indexCount, sizeof(unsigned int));
+        for (size_t t = 0; t < chunk.second - chunk.first; t++) {
+          const BlockTri *bt = &group.second[chunk.first + t];
+          const Mesh *src = &m->meshes[bt->mesh];
+          for (int k = 0; k < 3; k++) {
+            unsigned int old = src->indices[bt->tri * 3 + k];
+            auto key = std::make_pair(bt->mesh, old);
+            auto it = remap.find(key);
+            if (it == remap.end()) {
+              it = remap.emplace(key, (int)verts.size()).first;
+              verts.push_back(src->vertices[old]);
+            }
+            c.indices[t * 3 + k] = it->second;
+          }
+        }
+        c.vertexCount = (int)verts.size();
+        c.vertices = (Vertex *)calloc(c.vertexCount, sizeof(Vertex));
+        c.originalVertices = (Vertex *)calloc(c.vertexCount, sizeof(Vertex));
+        c.animatedVertices = (Vertex *)calloc(c.vertexCount, sizeof(Vertex));
+        memcpy(c.vertices, verts.data(), sizeof(Vertex) * c.vertexCount);
+        memcpy(c.originalVertices, verts.data(), sizeof(Vertex) * c.vertexCount);
+        c.stripLengths = NULL;
+        c.stripCount = 0;
+        c.looseIndexCount = 0;
+        c.blockId = (int)b;
+        result.push_back(c);
+      }
     }
   }
 
@@ -2008,6 +2061,7 @@ void CreateTristrippedModel(const Model *sourceModel, Model *destModel) {
     dstMesh->wrapU = srcMesh->wrapU;
     dstMesh->wrapV = srcMesh->wrapV;
     dstMesh->blockId = srcMesh->blockId;
+    dstMesh->collisionOnly = srcMesh->collisionOnly;
 
     printf("Processing mesh %d of %d...\n", m + 1, sourceModel->meshCount);
     printf("Source mesh has %d vertices and %d indices\n", srcMesh->vertexCount,
@@ -2905,6 +2959,7 @@ void ExportTristrippedModel(const Model *model, const char *filename,
     // bits 7-8:  wrap_v (same)
     // bit  9:    tex_filter (0=bilinear, 1=nearest)
     // bits 10-11: lighting_mode (0=BAKED, 1=DYNAMIC, 2=UNLIT)
+    // bit  12:   collision_only (collided with, never drawn)
     uint32_t material_flags = 0;
     material_flags |= (mesh->alphaMode & 0x3);
     material_flags |= (mesh->doubleSided & 0x1) << 2;
@@ -2916,6 +2971,7 @@ void ExportTristrippedModel(const Model *model, const char *filename,
     // tex_filter: default bilinear (0)
     // lighting_mode: baked=0, dynamic=1
     material_flags |= (bakeLighting ? 0 : 1) << 10;
+    material_flags |= (mesh->collisionOnly & 0x1) << 12;
 
     float alphaCutoff = mesh->alphaCutoff;
     fwrite(&material_flags, sizeof(uint32_t), 1, file);

@@ -18,6 +18,10 @@ static DCCamera camera;
 static DCPlayer player;
 
 
+/* Track */
+static DMSModel* world_model = NULL;
+static ColWorld* col_world = NULL;
+
 /* Ship: the player's model, drawn at the player's feet */
 static DMSModel* ship_model = NULL;
 
@@ -34,6 +38,11 @@ typedef struct {
     uint32_t world_verts_xformed;
     uint32_t world_verts_clipped;
     uint32_t tris_drawn;
+
+    /* per model: 0 = track, 1 = ship */
+    uint64_t model_ns[2];
+    uint32_t model_fast[2];     /* verts through render_fast */
+    uint32_t model_clip[2];     /* verts through render_clipped */
 
     uint32_t samples;
 } FrameProfile;
@@ -74,6 +83,13 @@ static void prof_print_and_reset(void) {
                (float)ps.rnd_last_time / 1e6f);
     }
     last_report_ms = now_ms;
+    static const char* names[2] = { "track", "ship " };
+    for (int i = 0; i < 2; i++)
+        printf("  %s  fast %5lu verts  clip %5lu verts  cpu %.2fms\n", names[i],
+               (unsigned long)(prof.model_fast[i] / prof.samples),
+               (unsigned long)(prof.model_clip[i] / prof.samples),
+               (float)prof.model_ns[i] / n / 1e6f);
+    printf("  frame cpu %.2fms  draw cpu %.2fms\n", total_ms, render_us / 1000.0f);
 
     snprintf(prof_lines[0], sizeof(prof_lines[0]), "FRAME: %.2f ms", total_ms);
     snprintf(prof_lines[1], sizeof(prof_lines[1]), "ANIM: %.0f us", anim_us);
@@ -83,6 +99,17 @@ static void prof_print_and_reset(void) {
     snprintf(prof_lines[5], sizeof(prof_lines[5]), "xform %lu clip %lu", (unsigned long)xform, (unsigned long)clip);
 
     memset(&prof, 0, sizeof(prof));
+}
+
+/* Draw one model's list, charging its time and vertex paths to slot i */
+static void draw_timed(int i, DMSModel* m, shz_vec3_t pos, float yaw, int list) {
+    const DCModelStats* st = dc_model_get_stats();
+    uint32_t fast0 = st->verts_xformed, clip0 = st->verts_clipped;
+    uint64_t t = perf_cntr_timer_ns();
+    dc_model_draw_list_rotated(m, pos, 1.0f, yaw, &camera, list);
+    prof.model_ns[i]   += perf_cntr_timer_ns() - t;
+    prof.model_fast[i] += st->verts_xformed - fast0;
+    prof.model_clip[i] += st->verts_clipped - clip0;
 }
 
 /* ========== MAIN ========== */
@@ -104,10 +131,11 @@ int main(int argc, char* argv[]) {
     player.cam_mode = DC_CAM_THIRD;
     player.move_speed = 1.0f;   /* per frame */
 
-    /* Space: no world, no gravity. Triggers move up/down. */
-    player.gravity = 0.0f;
-    player.jump_force = 0.0f;
-    player.pos = shz_vec3_init(0.0f, 0.0f, 0.0f);
+    player.pos = shz_vec3_init(0.0f, 50.0f, 0.0f);
+
+    world_model = dc_model_load("/pc/world/test.dms");
+    if (world_model)
+        col_world = col_build(world_model, shz_vec3_init(0.0f, 0.0f, 0.0f), 1.0f);
 
     /* Ship: camera distance follows the ship's size */
     ship_model = dc_model_load("/pc/ship/ship.dms");
@@ -152,16 +180,14 @@ int main(int argc, char* argv[]) {
 
         /* Reset (Y button) */
         if (inp && dc_input_held(inp, CONT_Y)) {
-            player.pos = shz_vec3_init(0.0f, 10.0f, 20.0f);
+            player.pos = shz_vec3_init(0.0f, 50.0f, 0.0f);
             player.vy = 0.0f;
             camera.pos = player.pos;
             camera.yaw = 0.0f;
             camera.pitch = 0.0f;
         }
 
-        dc_player_update(&player, &camera, inp, NULL, dt);
-        if (inp)
-            player.pos.y += (inp->rtrig - inp->ltrig) * player.move_speed;
+        dc_player_update(&player, &camera, inp, col_world, dt);
         dc_camera_update(&camera);
         prof.camera_ns += perf_cntr_timer_ns() - t0;
 
@@ -177,15 +203,18 @@ int main(int argc, char* argv[]) {
 
         /* Pass 1: Opaque */
         dc_list_begin(PVR_LIST_OP_POLY);
-        dc_model_draw_list_rotated(ship_model, ship_pos, 1.0f, ship_yaw, &camera, PVR_LIST_OP_POLY);
+        draw_timed(0, world_model, shz_vec3_init(0.0f, 0.0f, 0.0f), 0.0f, PVR_LIST_OP_POLY);
+        draw_timed(1, ship_model, ship_pos, ship_yaw, PVR_LIST_OP_POLY);
 
         /* Pass 2: Transparent */
         dc_list_begin(PVR_LIST_TR_POLY);
-        dc_model_draw_list_rotated(ship_model, ship_pos, 1.0f, ship_yaw, &camera, PVR_LIST_TR_POLY);
+        draw_timed(0, world_model, shz_vec3_init(0.0f, 0.0f, 0.0f), 0.0f, PVR_LIST_TR_POLY);
+        draw_timed(1, ship_model, ship_pos, ship_yaw, PVR_LIST_TR_POLY);
 
         /* Pass 3: Punch-through + HUD */
         dc_list_begin(PVR_LIST_PT_POLY);
-        dc_model_draw_list_rotated(ship_model, ship_pos, 1.0f, ship_yaw, &camera, PVR_LIST_PT_POLY);
+        draw_timed(0, world_model, shz_vec3_init(0.0f, 0.0f, 0.0f), 0.0f, PVR_LIST_PT_POLY);
+        draw_timed(1, ship_model, ship_pos, ship_yaw, PVR_LIST_PT_POLY);
 
         dc_draw_text(fps_str, 10, 10, 16, DC_COLOR_GREEN);
 
@@ -214,6 +243,8 @@ int main(int argc, char* argv[]) {
             prof_print_and_reset();
     }
 
+    col_free(col_world);
+    dc_model_free(world_model);
     dc_model_free(ship_model);
     dc_shutdown();
 
