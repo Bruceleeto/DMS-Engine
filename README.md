@@ -35,7 +35,7 @@ swings on a chain of 14 jointed links.
 
 Credits:
 - Level: [GameCube - Mario Kart Double Dash - Block City](https://sketchfab.com/3d-models/gamecube-mario-kart-double-dash-block-city-9d8002b53a884d0290759f05694a49c3)
-  by [jkimmel694](https://sketchfab.com/jkimmel694), CC Attribution 4.0
+  by [jkimmel694](https://sketchfab.com/jkimmel694)
 - Ball, crate, chain: to add
 
 ### race_track
@@ -48,7 +48,7 @@ over many small meshes.
 
 Credits:
 - Track: [nurburgring (race driver grid ds)](https://sketchfab.com/3d-models/nurburgring-race-driver-grid-ds-fc6393b88aa64fc98e63ee65846d3fc3)
-  by [amogusstrikesback2](https://sketchfab.com/amogusstrikesback2), CC Attribution 4.0
+  by [amogusstrikesback2](https://sketchfab.com/amogusstrikesback2)
 - Car: to add
 
 ### clipping_stresstest
@@ -65,11 +65,16 @@ third-person camera and collision.
 
 Credits: to add
 
-### sonic_city_stress
+### sonic_streets
 
-Free camera over a city level. A general draw and culling stress test.
+![sonic_streets](sonic_streets/resources/example.png)
 
-Credits: to add
+Free camera over City Escape from Sonic Adventure 2. A general draw and
+culling stress test.
+
+Credits:
+- Level: [City Escape - Sonic Adventure 2](https://models.spriters-resource.com/dreamcast/sonicadventure2/asset/297940/)
+  ripped by dshaynie, The Models Resource
 
 ### highpoly_stresstest
 
