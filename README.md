@@ -130,6 +130,26 @@ on it.
 Credits:
 - Room, TV, projector, table: to add
 
+### dragonfly
+
+![dragonfly](dragonfly/resources/example.png)
+
+The dragonfly from Sega's Katana SDK demo, with motion blur. Its 18 parts move
+on their own (no skin). Every frame it is also drawn into a texture over a
+faded copy of last frame's texture, and that is added over the screen, so
+what moves leaves a trail. Shots are a flat glow drawn additive
+(`dc_draw_ex` with `.add`); the trail draws them out into beams.
+
+| Button | Action |
+|---|---|
+| Stick | Turn the camera around the dragonfly |
+| L / R | Zoom |
+| X | Fire |
+| Start | Exit |
+
+Credits:
+- Model and textures: DragonFly demo, Sega Katana SDK (PowerVR / VideoLogic)
+
 ## Blender settings
 
 Export as `.glb`. The converter reads these from the material (Principled
@@ -189,3 +209,26 @@ dc_draw(world, origin);
 
 What is drawn into a target is drawn a second time, and a 256x256 target takes
 256KB of VRAM.
+
+### Trails (motion blur)
+
+A target drawn into itself is last frame's picture, put behind what is drawn
+this frame. A little see-through, it fades frame after frame:
+
+```c
+DCTarget* trail = dc_target_create(256, 256);
+
+/* every frame */
+dc_set_target(trail);
+dc_set_camera(&camera);
+dc_draw(ship, pos);
+dc_draw_target_ex(trail, &(DCTargetOpts){ .alpha = 0.92f });   /* how much stays */
+dc_set_target(NULL);
+dc_set_camera(&camera);
+dc_draw(ship, pos);
+dc_draw_target_ex(trail, &(DCTargetOpts){ .add = true });      /* added over the screen */
+```
+
+Only what is drawn into the trail is blurred. While a trail exists the PVR's
+dithering is off (with it on, the trail never fades out fully). See
+`dragonfly`.

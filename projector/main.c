@@ -44,7 +44,9 @@ static bool check_exit(void) {
 
 int main(int argc, char* argv[]) {
     /* Vertex buffer is double-buffered by KOS, so this costs 2x in VRAM */
-    dc_init((DCInitParams){ .vram_size = 2300 * 1024 });
+    /* Vertex buffer: this room uses about 135KB of it, and KOS
+     * keeps two, so a small one leaves the VRAM for textures and the TV */
+    dc_init((DCInitParams){ .vram_size = 512 * 1024 });
     dc_draw2d_init();
     dc_debug_init();
 

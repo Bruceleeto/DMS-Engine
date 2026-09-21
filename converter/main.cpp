@@ -517,9 +517,11 @@ static int RunPvrtex(const char *inPath, const char *outPath) {
     int w = 0, h = 0;
     bool square = GetImageDimensions(inPath, &w, &h) && (w == h);
 
+    /* -r near: a size the PVR cannot use (not a power of two) is resized to
+     * the nearest one. UVs are 0 to 1, so nothing else changes. */
     char cmd[1024];
     snprintf(cmd, sizeof(cmd),
-        "/opt/toolchains/dc/kos/utils/pvrtex/pvrtex -i \"%s\" -o \"%s\" -f auto -c%s",
+        "/opt/toolchains/dc/kos/utils/pvrtex/pvrtex -i \"%s\" -o \"%s\" -f auto -c -r near%s",
         inPath, outPath, square ? " -m" : "");
     printf("  Running: %s\n", cmd);
     return system(cmd);

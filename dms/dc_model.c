@@ -420,6 +420,31 @@ static void render_skinned(const DMSVertex* src, int count,
  * Mesh dispatch (per-mesh frustum cull + path selection)
  * ================================================================ */
 
+/* Additive drawing (dc_draw_ex .add): every mesh goes in the transparent list
+ * and is added to what is behind it, so black adds nothing. The mesh header
+ * is sent with its list, blend and depth write changed. */
+static bool g_add;
+
+void dc_model_set_add(bool add) {
+    g_add = add;
+}
+
+static inline void send_header(pvr_dr_state_t* dr, const DMSMesh* mesh) {
+    (void)dr;
+    if (!g_add) {
+        shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &mesh->header);
+        return;
+    }
+    alignas(32) pvr_poly_hdr_t h = mesh->header;
+    h.cmd = (h.cmd & ~PVR_TA_CMD_TYPE_MASK) | (PVR_LIST_TR_POLY << PVR_TA_CMD_TYPE_SHIFT);
+    h.mode1 &= ~PVR_TA_PM1_DEPTHWRITE_MASK;
+    h.mode1 |= PVR_DEPTHWRITE_DISABLE << PVR_TA_PM1_DEPTHWRITE_SHIFT;
+    h.mode2 &= ~(PVR_TA_PM2_SRCBLEND_MASK | PVR_TA_PM2_DSTBLEND_MASK);
+    h.mode2 |= (PVR_BLEND_SRCALPHA << PVR_TA_PM2_SRCBLEND_SHIFT) |
+               (PVR_BLEND_ONE << PVR_TA_PM2_DSTBLEND_SHIFT);
+    shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &h);
+}
+
 /* Skinned mesh: cull the whole animated bound, then skin + submit.
  * Returns 1 if the mesh was drawn, 0 if culled. */
 static int draw_skinned_mesh(DMSMesh* mesh, DMSModel* model,
@@ -455,7 +480,7 @@ static int draw_skinned_mesh(DMSMesh* mesh, DMSModel* model,
     g_stats.meshes_drawn++;
     g_stats.tris_drawn += mesh->tri_count;
 
-    shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &mesh->header);
+    send_header(dr, mesh);
 
     /* Build MVP with Z negation baked into scale */
     shz_xmtrx_load_4x4((shz_mat4x4_t*)dc_camera_get_pv(cam));
@@ -554,7 +579,15 @@ static void draw_blocks_list(DMSModel* model, shz_vec3_t pos, float scale,
     uint32_t batch[DRAW_BATCH];          /* mesh index, top bit = clip path */
     uint32_t skip = DMS_MAT_COLLISION_ONLY | (g_env ? DMS_MAT_MIRROR : 0);
 
-    for (uint32_t r = model->list_runs[list]; r < model->list_runs[list + 1]; r++) {
+    uint32_t run_first = model->list_runs[list], run_last = model->list_runs[list + 1];
+    if (g_add) {
+        /* All of it, in the transparent list */
+        if (target_list != PVR_LIST_TR_POLY) return;
+        run_first = model->list_runs[0];
+        run_last = model->list_runs[3];
+    }
+
+    for (uint32_t r = run_first; r < run_last; r++) {
         const DMSBlockRun* run = &model->runs[r];
         const DMSBlock* b = &model->blocks[run->block];
         shz_vec3_t bc = turn_centre(rot, yaw, sc, b->cx, b->cy, b->cz);
@@ -613,7 +646,7 @@ static void draw_blocks_list(DMSModel* model, shz_vec3_t pos, float scale,
                 g_stats.tris_drawn += mesh->tri_count;
 
                 if (!last_hdr || memcmp(last_hdr, &mesh->header, sizeof(pvr_poly_hdr_t))) {
-                    shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &mesh->header);
+                    send_header(dr, mesh);
                     last_hdr = &mesh->header;
                     xm = XM_OTHER;
                 }
@@ -644,7 +677,7 @@ static void draw_skinned_list(DMSModel* model, shz_vec3_t pos, float scale,
         int alpha_mode = mesh->material_flags & 0x3;
         int pvr_list = alpha_mode == 0 ? PVR_LIST_OP_POLY
                      : alpha_mode == 1 ? PVR_LIST_PT_POLY : PVR_LIST_TR_POLY;
-        if (pvr_list != target_list) continue;
+        if (g_add ? target_list != PVR_LIST_TR_POLY : pvr_list != target_list) continue;
         if (mesh->material_flags & DMS_MAT_COLLISION_ONLY) continue;
 
         if (!dr) {
@@ -664,7 +697,7 @@ void dc_model_draw_list_rotated(DMSModel* model, shz_vec3_t pos, float scale,
         draw_skinned_list(model, pos, scale, yaw, cam, target_list);
     else {
         draw_blocks_list(model, pos, scale, yaw, NULL, cam, target_list);
-        draw_reflections(model, pos, scale, yaw, NULL, cam, target_list);
+        if (!g_add) draw_reflections(model, pos, scale, yaw, NULL, cam, target_list);
     }
 }
 
@@ -674,7 +707,7 @@ void dc_model_draw_list_oriented(DMSModel* model, shz_vec3_t pos, float scale,
 
     vtxbuf_sync();
     draw_blocks_list(model, pos, scale, 0.0f, rot, cam, target_list);
-    draw_reflections(model, pos, scale, 0.0f, rot, cam, target_list);
+    if (!g_add) draw_reflections(model, pos, scale, 0.0f, rot, cam, target_list);
 }
 
 void dc_model_draw_list(DMSModel* model, shz_vec3_t pos, float scale,

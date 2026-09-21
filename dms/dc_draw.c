@@ -22,6 +22,7 @@ typedef struct {
     float           yaw;
     bool            has_rot;
     float           rot[9];
+    bool            add;
     int             call_list;
     void          (*call_fn)(void* user);
     void*           call_user;
@@ -66,6 +67,7 @@ static DrawEntry* queue_model(DMSModel* model, shz_vec3_t pos, float scale) {
     e->scale = scale;
     e->yaw = 0.0f;
     e->has_rot = false;
+    e->add = false;
     return e;
 }
 
@@ -82,6 +84,7 @@ void dc_draw_ex(DMSModel* model, const DCDrawOpts* opts) {
     DrawEntry* e = queue_model(model, opts->pos, opts->scale != 0.0f ? opts->scale : 1.0f);
     if (!e) return;
     e->yaw = opts->yaw;
+    e->add = opts->add;
     if (opts->rot) {
         e->has_rot = true;
         memcpy(e->rot, opts->rot, sizeof(e->rot));
@@ -105,6 +108,7 @@ void dc_draw_call(int pvr_list, void (*fn)(void* user), void* user) {
 #define TARGET_WEARERS 16
 #define TARGETS_A_FRAME 8
 #define TARGET_QUADS 8
+#define TARGET_BACK_DEPTH 0.0001f   /* 1/w: behind everything (FAR_Z is 0.001) */
 #define TARGET_QUAD_DEPTH 50.0f     /* 1/w: in front of anything past 0.02 units */
 
 typedef struct {
@@ -116,6 +120,7 @@ struct DCTarget {
     int       width, height;
     pvr_ptr_t txr[2];
     int       front;            /* the picture being shown; the other is drawn into */
+    bool      feeds_itself;     /* its own picture is drawn into it (a trail): dithering is off */
     int       wearer_count;
     TargetWearer wearers[TARGET_WEARERS] __attribute__((aligned(32)));
 };
@@ -155,6 +160,7 @@ void dc_target_free(DCTarget* t) {
     /* A scene still rendering may be reading or writing it */
     pvr_wait_ready();
     if (current_target == t) current_target = NULL;
+    if (t->feeds_itself) vid_set_dithering(true);
     for (int i = 0; i < 2; i++)
         if (t->txr[i]) pvr_mem_free(t->txr[i]);
     free(t);
@@ -250,6 +256,9 @@ static void target_flip(DCTarget* t) {
 typedef struct {
     DCTarget* target;
     float x, y, w, h;
+    uint32_t argb;
+    bool see_through, add;
+    bool behind;        /* drawn into its own target: last frame's picture as the backdrop */
 } TargetQuad;
 
 static TargetQuad target_quads[TARGET_QUADS];
@@ -261,10 +270,25 @@ static void target_quad_draw(void* user) {
     pvr_dr_state_t* dr = dc_dr_state();
     (void)dr;   /* this KOS's pvr_dr_target() does not use it */
 
+    /* No size given: over everything being drawn into */
+    float x = q->x, y = q->y, w = q->w, h = q->h;
+    if (w <= 0.0f || h <= 0.0f) {
+        x = y = 0.0f;
+        dc_render_size(&w, &h);
+    }
+
     pvr_poly_cxt_t cxt;
-    pvr_poly_cxt_txr(&cxt, PVR_LIST_OP_POLY, PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED,
+    pvr_poly_cxt_txr(&cxt, q->see_through ? PVR_LIST_TR_POLY : PVR_LIST_OP_POLY,
+                     PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED,
                      t->width, t->height, t->txr[t->front], PVR_FILTER_BILINEAR);
     cxt.gen.culling = PVR_CULLING_NONE;
+    if (q->see_through) {
+        /* The picture has no alpha of its own: it all comes from the vertex */
+        cxt.txr.env = PVR_TXRENV_MODULATEALPHA;
+        cxt.blend.src = PVR_BLEND_SRCALPHA;
+        cxt.blend.dst = q->add ? PVR_BLEND_ONE : PVR_BLEND_INVSRCALPHA;
+        cxt.depth.write = PVR_DEPTHWRITE_DISABLE;
+    }
     pvr_poly_hdr_t* hdr = (pvr_poly_hdr_t*)pvr_dr_target(*dr);
     pvr_poly_compile(hdr, &cxt);
     pvr_dr_commit(hdr);
@@ -273,12 +297,12 @@ static void target_quad_draw(void* user) {
     for (int i = 0; i < 4; i++) {
         pvr_vertex_t* v = (pvr_vertex_t*)pvr_dr_target(*dr);
         v->flags = (i == 3) ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
-        v->x = q->x + corner[i][0] * q->w;
-        v->y = q->y + corner[i][1] * q->h;
-        v->z = TARGET_QUAD_DEPTH;
+        v->x = x + corner[i][0] * w;
+        v->y = y + corner[i][1] * h;
+        v->z = q->behind ? TARGET_BACK_DEPTH : TARGET_QUAD_DEPTH;
         v->u = corner[i][0];
         v->v = corner[i][1];
-        v->argb = 0xFFFFFFFF;
+        v->argb = q->argb;
         v->oargb = 0;
         pvr_dr_commit(v);
     }
@@ -289,7 +313,42 @@ void dc_draw_target(DCTarget* target, float x, float y, float width, float heigh
     TargetQuad* q = &target_quads[target_quad_count++];
     q->target = target;
     q->x = x; q->y = y; q->w = width; q->h = height;
+    q->argb = 0xFFFFFFFF;
+    q->see_through = q->add = false;
+    q->behind = false;
     dc_draw_call(PVR_LIST_OP_POLY, target_quad_draw, q);
+}
+
+void dc_draw_target_ex(DCTarget* target, const DCTargetOpts* opts) {
+    if (!target || !opts || !target->txr[0] || target_quad_count >= TARGET_QUADS) return;
+    float alpha = opts->alpha > 0.0f ? opts->alpha : 1.0f;
+    if (alpha > 1.0f) alpha = 1.0f;
+    TargetQuad* q = &target_quads[target_quad_count++];
+    q->target = target;
+    q->x = opts->x; q->y = opts->y; q->w = opts->width; q->h = opts->height;
+    q->argb = ((uint32_t)(alpha * 255.0f) << 24) | 0x00FFFFFF;
+    q->add = opts->add;
+    q->see_through = opts->add || alpha < 1.0f;
+    /* Into itself: what is drawn this frame goes over last frame's picture at
+     * full strength, and fades behind it frame after frame (a trail) */
+    q->behind = current_target == target;
+    if (q->behind && !target->feeds_itself) {
+        /* The PVR dithers what it renders: a small fixed pattern added before
+         * the colour is cut to 16 bits. Fed back every frame, the pattern wins
+         * over the fade and dark leftovers never clear. KOS has one switch for
+         * the screen and textures alike, so it goes off while this target lives. */
+        target->feeds_itself = true;
+        vid_set_dithering(false);
+    }
+    if (q->behind && !opts->add) {
+        /* Behind everything there is only the black the target starts from,
+         * so see-through over it is the same as the picture made darker: a
+         * solid quad, which the PVR draws far cheaper than a blended one */
+        uint32_t grey = (uint32_t)(alpha * 255.0f);
+        q->argb = 0xFF000000 | (grey << 16) | (grey << 8) | grey;
+        q->see_through = false;
+    }
+    dc_draw_call(q->see_through ? PVR_LIST_TR_POLY : PVR_LIST_OP_POLY, target_quad_draw, q);
 }
 
 /* Does the model have anything for this list? Saves a walk over its blocks. */
@@ -319,7 +378,8 @@ static void flush_scene(const DCTarget* target) {
                 if (e->call_list != lists[l]) continue;
                 dc_list_begin(lists[l]);
                 e->call_fn(e->call_user);
-            } else if (model_uses_list(e->model, lists[l])) {
+            } else if (e->add ? lists[l] == PVR_LIST_TR_POLY
+                              : model_uses_list(e->model, lists[l])) {
                 const DCCamera* cam = e->cam;
                 if (target) {
                     if (squeezed_from != cam) {
@@ -332,12 +392,14 @@ static void flush_scene(const DCTarget* target) {
                     }
                     cam = &squeezed;
                 }
+                if (e->add) dc_model_set_add(true);
                 if (e->has_rot)
                     dc_model_draw_list_oriented(e->model, e->pos, e->scale, e->rot,
                                                 cam, lists[l]);
                 else
                     dc_model_draw_list_rotated(e->model, e->pos, e->scale, e->yaw,
                                                cam, lists[l]);
+                if (e->add) dc_model_set_add(false);
             }
         }
     }

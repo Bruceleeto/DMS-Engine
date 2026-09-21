@@ -162,9 +162,11 @@ void dc_camera_orbit(DCCamera* cam, shz_vec3_t target, float distance,
     shz_sincos_t sc_y = shz_sincosf(cam->yaw);
     shz_sincos_t sc_p = shz_sincosf(cam->pitch);
 
-    cam->pos.x = target.x + distance * sc_p.cos * sc_y.sin;
+    /* Behind the target along the view direction, so the camera faces it
+     * (positive pitch looks down, so the camera goes up) */
+    cam->pos.x = target.x - distance * sc_p.cos * sc_y.sin;
     cam->pos.y = target.y + distance * sc_p.sin;
-    cam->pos.z = target.z + distance * sc_p.cos * sc_y.cos;
+    cam->pos.z = target.z - distance * sc_p.cos * sc_y.cos;
 }
 
 /* ================================================================

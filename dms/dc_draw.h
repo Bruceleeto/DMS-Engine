@@ -1,6 +1,7 @@
 #ifndef DC_DRAW_H
 #define DC_DRAW_H
 
+#include <stdbool.h>
 #include "dc_camera.h"
 #include "dc_model.h"
 
@@ -37,6 +38,8 @@ typedef struct {
     const float* rot;       /* turned any way, used instead of yaw (static models
                              * only): 9 floats, 3 columns, where the model's x, y
                              * and z axes point in the world. It is copied. */
+    bool         add;       /* added to what is behind it, so black adds nothing:
+                             * flashes, glows, fire. Draw it after the solid things. */
 } DCDrawOpts;
 
 void dc_draw_ex(DMSModel* model, const DCDrawOpts* opts);
@@ -85,6 +88,26 @@ int dc_target_show_on(DCTarget* target, DMSModel* model, const char* material);
 /* The target as a flat picture on the screen (a rear view mirror, or to see
  * what a target holds) */
 void dc_draw_target(DCTarget* target, float x, float y, float width, float height);
+
+/* The same with more say. Fields left out are zero, which means "as it is".
+ * Drawn into the target itself, it is last frame's picture put behind what
+ * is drawn this frame. A little see-through, it fades frame after frame and
+ * leaves a trail behind what moves (motion blur). Then add it over the screen:
+ *
+ *     dc_set_target(trail);
+ *     dc_draw(ship, pos);
+ *     dc_draw_target_ex(trail, &(DCTargetOpts){ .alpha = 0.9f });
+ *     dc_set_target(NULL);
+ *     dc_draw(ship, pos);
+ *     dc_draw_target_ex(trail, &(DCTargetOpts){ .add = true });
+ */
+typedef struct {
+    float x, y, width, height;  /* no size: over everything being drawn into */
+    float alpha;                /* 0 means 1 (solid) */
+    bool  add;                  /* added to what is behind it, black adds nothing */
+} DCTargetOpts;
+
+void dc_draw_target_ex(DCTarget* target, const DCTargetOpts* opts);
 
 /* Your own PVR drawing: fn runs at frame end with the given list open
  * (PVR_LIST_OP_POLY, PVR_LIST_TR_POLY or PVR_LIST_PT_POLY). */
