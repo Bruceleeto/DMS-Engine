@@ -38,6 +38,21 @@ Credits:
   by [jkimmel694](https://sketchfab.com/jkimmel694)
 - Ball, crate, chain: to add
 
+### bowling
+
+![bowling](bowling/resources/example.png)
+
+Ten-pin bowling with picophysics. Two lanes of ten pins, and balls rolled from
+the camera.
+
+| Button | Action |
+|---|---|
+| A | Roll a ball |
+| Y | Reset the pins |
+| Start | Exit |
+
+Credits: to add
+
 ### race_track
 
 ![race_track](race_track/resources/example.png)
