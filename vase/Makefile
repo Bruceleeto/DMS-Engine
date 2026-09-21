@@ -2,11 +2,12 @@ TARGET = test.elf
 OBJS = main.o ../dms/dc_engine.o ../dms/dc_input.o ../dms/dc_camera.o ../dms/dc_model.o \
        ../dms/dc_player.o ../dms/dc_draw2d.o ../dms/dc_draw.o ../dms/dc_debug.o ../dms/collision.o
 
-
+# Converted assets go here and are read over dcload at /pc (run dc-tool with -c pc).
+# The level is too big for a romdisk: it would sit in RAM twice.
 OUTPUT_DIR = pc
 
 # Set BAKE=1 to bake vertex lighting (AO, shadows)
-BAKE = 1
+BAKE = 0
 
 # Path to converter
 CONVERTER_DIR = ../converter
@@ -37,7 +38,16 @@ $(STRIPPY):
 GLBS = $(wildcard assets/*/*.glb)
 DMS  = $(patsubst assets/%.glb,$(OUTPUT_DIR)/%.dms,$(GLBS))
 
-assets: $(DMS)
+# Images (backgrounds): assets/<dir>/<name>.png -> <name>.dt
+PNGS = $(wildcard assets/*/*.png)
+DTS  = $(patsubst assets/%.png,$(OUTPUT_DIR)/%.dt,$(PNGS))
+PVRTEX = $(KOS_BASE)/utils/pvrtex/pvrtex
+
+assets: $(DMS) $(DTS)
+
+$(OUTPUT_DIR)/%.dt: assets/%.png
+	@mkdir -p $(@D)
+	$(PVRTEX) -i $< -o $@ -f auto
 
 $(OUTPUT_DIR)/%.dms: assets/%.glb | $(STRIPPY)
 	@mkdir -p $(@D)

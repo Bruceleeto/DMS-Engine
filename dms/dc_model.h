@@ -42,6 +42,13 @@ void dc_model_draw_list_oriented(DMSModel* model, shz_vec3_t pos, float scale,
                                  const float rot[9], const DCCamera* cam, int target_list);
 
 /* ================================================================
+ * Reflections
+ * ================================================================ */
+
+/* Engine use (dc_set_environment): the image metallic meshes reflect, or NULL */
+void dc_model_set_environment(const dttex_info_t* tex);
+
+/* ================================================================
  * Animation
  * ================================================================ */
 

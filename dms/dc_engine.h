@@ -47,6 +47,34 @@ float dc_fps(void);
 uint64_t dc_time_ms(void);
 
 /* ================================================================
+ * Frame statistics (shown by dc_debug_stats)
+ * ================================================================ */
+
+/* Parts of a frame the engine times by itself */
+enum { DC_PROF_ANIM, DC_PROF_CAM, DC_PROF_DRAW, DC_PROF_COUNT };
+
+/* Engine use: time a part. Nested calls for the same part count once. */
+void dc_prof_begin(int part);
+void dc_prof_end(int part);
+
+/* Averages over the last 60 frames */
+typedef struct {
+    bool     valid;                 /* false until the first 60 frames are in */
+    float    frame_ms;              /* dc_frame_begin to the end of dc_frame_end */
+    float    anim_us;               /* dc_model_animate */
+    float    cam_us;                /* dc_player_update, dc_camera_update */
+    float    draw_us;               /* drawing the queue */
+    uint32_t meshes_drawn, meshes_culled;
+    uint32_t verts_xformed, verts_clipped;
+} DCFrameStats;
+
+const DCFrameStats* dc_frame_stats(void);
+
+/* Engine use (dc_debug_stats): print the FPS / polys per second line on the
+ * serial log at the end of this averaging interval */
+void dc_frame_stats_log(void);
+
+/* ================================================================
  * Display
  * ================================================================ */
 

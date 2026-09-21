@@ -1,6 +1,6 @@
 TARGET = test.elf
 OBJS = main.o ../dms/dc_engine.o ../dms/dc_input.o ../dms/dc_camera.o ../dms/dc_model.o \
-       ../dms/dc_player.o ../dms/dc_draw2d.o ../dms/dc_debug.o ../dms/collision.o
+       ../dms/dc_player.o ../dms/dc_draw2d.o ../dms/dc_draw.o ../dms/dc_debug.o ../dms/collision.o
 
 
 OUTPUT_DIR = pc

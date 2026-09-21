@@ -1,6 +1,6 @@
 TARGET = test.elf
 OBJS = main.o ../dms/dc_engine.o ../dms/dc_input.o ../dms/dc_camera.o ../dms/dc_model.o \
-       ../dms/dc_player.o ../dms/dc_draw2d.o ../dms/dc_debug.o ../dms/collision.o
+       ../dms/dc_player.o ../dms/dc_draw2d.o ../dms/dc_draw.o ../dms/dc_debug.o ../dms/collision.o
 
 # Converted assets go here and are read over dcload at /pc (run dc-tool with -c pc).
 # The level is too big for a romdisk: it would sit in RAM twice.

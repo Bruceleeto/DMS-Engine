@@ -1,4 +1,5 @@
 #include "dc_camera.h"
+#include "dc_engine.h"
 #include <math.h>
 
 #define DC_PITCH_LIMIT (SHZ_F_PI * 0.49f)  /* ~88 degrees */
@@ -86,6 +87,7 @@ static void build_frustum(DCCamera* cam, float fov_rad, float aspect) {
 }
 
 void dc_camera_update(DCCamera* cam) {
+    dc_prof_begin(DC_PROF_CAM);
     float fov_rad = SHZ_DEG_TO_RAD(cam->fov);
     float aspect = SCR_W / SCR_H;
 
@@ -102,6 +104,7 @@ void dc_camera_update(DCCamera* cam) {
 
     /* Build world-space frustum planes */
     build_frustum(cam, fov_rad, aspect);
+    dc_prof_end(DC_PROF_CAM);
 }
 
 /* ================================================================

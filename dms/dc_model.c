@@ -493,6 +493,13 @@ static inline int sphere_visible(const WorldFrustum* fr, shz_vec3_t c, float r, 
     return !(d.x < -r || d.y < -r || d.z < -r || d.w < -r);
 }
 
+/* The environment image (dc_set_environment), NULL for none. Mirrors are
+ * left out of the normal draw while it is set: draw_reflections draws them. */
+static const dttex_info_t* g_env;
+
+static void draw_reflections(DMSModel* model, shz_vec3_t pos, float scale, float yaw,
+                             const float* rot, const DCCamera* cam, int target_list);
+
 enum { XM_OTHER, XM_PLANES, XM_MVP };   /* what XMTRX holds right now */
 
 #define DRAW_BATCH 64
@@ -545,6 +552,7 @@ static void draw_blocks_list(DMSModel* model, shz_vec3_t pos, float scale,
     int list = target_list == PVR_LIST_OP_POLY ? 0 : target_list == PVR_LIST_PT_POLY ? 1 : 2;
 
     uint32_t batch[DRAW_BATCH];          /* mesh index, top bit = clip path */
+    uint32_t skip = DMS_MAT_COLLISION_ONLY | (g_env ? DMS_MAT_MIRROR : 0);
 
     for (uint32_t r = model->list_runs[list]; r < model->list_runs[list + 1]; r++) {
         const DMSBlockRun* run = &model->runs[r];
@@ -576,7 +584,7 @@ static void draw_blocks_list(DMSModel* model, shz_vec3_t pos, float scale,
             }
             for (; m < run_end && n < DRAW_BATCH; m++) {
                 const DMSMesh* mesh = &model->meshes[m];
-                if (mesh->material_flags & DMS_MAT_COLLISION_ONLY) continue;
+                if (mesh->material_flags & skip) continue;
                 shz_vec3_t tc = turn_centre(rot, yaw, sc, mesh->bound_cx, mesh->bound_cy,
                                             mesh->bound_cz);
                 shz_vec3_t mc = shz_vec3_init(pos.x + tc.x * scale, pos.y + tc.y * scale,
@@ -654,8 +662,10 @@ void dc_model_draw_list_rotated(DMSModel* model, shz_vec3_t pos, float scale,
     vtxbuf_sync();
     if (model->skeleton)
         draw_skinned_list(model, pos, scale, yaw, cam, target_list);
-    else
+    else {
         draw_blocks_list(model, pos, scale, yaw, NULL, cam, target_list);
+        draw_reflections(model, pos, scale, yaw, NULL, cam, target_list);
+    }
 }
 
 void dc_model_draw_list_oriented(DMSModel* model, shz_vec3_t pos, float scale,
@@ -664,6 +674,7 @@ void dc_model_draw_list_oriented(DMSModel* model, shz_vec3_t pos, float scale,
 
     vtxbuf_sync();
     draw_blocks_list(model, pos, scale, 0.0f, rot, cam, target_list);
+    draw_reflections(model, pos, scale, 0.0f, rot, cam, target_list);
 }
 
 void dc_model_draw_list(DMSModel* model, shz_vec3_t pos, float scale,
@@ -676,6 +687,215 @@ void dc_model_draw_rotated(DMSModel* model, shz_vec3_t pos, float scale,
     dc_model_draw_list_rotated(model, pos, scale, yaw, cam, PVR_LIST_OP_POLY);
     dc_model_draw_list_rotated(model, pos, scale, yaw, cam, PVR_LIST_PT_POLY);
     dc_model_draw_list_rotated(model, pos, scale, yaw, cam, PVR_LIST_TR_POLY);
+}
+
+/* ================================================================
+ * Reflections
+ *
+ * Metallic meshes reflect the environment image. The picture is looked up
+ * with the normal as the camera sees it, so it slides over the surface as
+ * the model or the camera turns.
+ *
+ * Mirror (solid, roughness near 0): the image in place of its own texture,
+ * tinted by its vertex colours. One OP pass, the same cost as drawing it plain.
+ * Other solid mesh: the image is added over it, in the TR list.
+ * See-through mesh: the three accumulation buffer passes of Katana's Vase
+ * sample. The image goes into the PVR's second buffer, the mesh's own
+ * texture cuts it out by its alpha, and the result is laid over the frame.
+ * ================================================================ */
+
+#define SHINE_ALPHA 0x80000000u   /* strength of the image over a solid mesh */
+
+static pvr_poly_hdr_t g_env_mirror_hdr __attribute__((aligned(32)));
+static pvr_poly_hdr_t g_env_shine_hdr __attribute__((aligned(32)));
+static pvr_poly_hdr_t g_env_accum_hdr __attribute__((aligned(32)));
+static pvr_poly_hdr_t g_env_flush_hdr __attribute__((aligned(32)));
+
+static DMSVertex* g_env_verts;
+static uint32_t   g_env_verts_size;
+
+void dc_model_set_environment(const dttex_info_t* tex) {
+    g_env = (tex && tex->ptr) ? tex : NULL;
+    if (!g_env) return;
+
+    pvr_poly_cxt_t cxt;
+
+    pvr_poly_cxt_txr(&cxt, PVR_LIST_OP_POLY, tex->pvrformat, tex->width, tex->height,
+                     tex->ptr, PVR_FILTER_BILINEAR);
+    cxt.gen.culling = PVR_CULLING_NONE;
+    pvr_poly_compile(&g_env_mirror_hdr, &cxt);
+
+    pvr_poly_cxt_txr(&cxt, PVR_LIST_TR_POLY, tex->pvrformat, tex->width, tex->height,
+                     tex->ptr, PVR_FILTER_BILINEAR);
+    cxt.gen.culling = PVR_CULLING_NONE;
+    cxt.txr.env = PVR_TXRENV_MODULATEALPHA;
+    cxt.blend.src = PVR_BLEND_SRCALPHA;
+    cxt.blend.dst = PVR_BLEND_ONE;
+    cxt.depth.write = PVR_DEPTHWRITE_DISABLE;
+    pvr_poly_compile(&g_env_shine_hdr, &cxt);
+
+    /* Front faces only from here on */
+    pvr_poly_cxt_txr(&cxt, PVR_LIST_TR_POLY, tex->pvrformat, tex->width, tex->height,
+                     tex->ptr, PVR_FILTER_BILINEAR);
+    cxt.gen.culling = PVR_CULLING_CCW;
+    cxt.txr.env = PVR_TXRENV_REPLACE;
+    cxt.blend.src = PVR_BLEND_ONE;
+    cxt.blend.dst = PVR_BLEND_ZERO;
+    cxt.blend.dst_enable = PVR_BLEND_ENABLE;
+    pvr_poly_compile(&g_env_accum_hdr, &cxt);
+
+    pvr_poly_cxt_col(&cxt, PVR_LIST_TR_POLY);
+    cxt.gen.culling = PVR_CULLING_CCW;
+    cxt.blend.src = PVR_BLEND_SRCALPHA;
+    cxt.blend.dst = PVR_BLEND_INVSRCALPHA;
+    cxt.blend.src_enable = PVR_BLEND_ENABLE;
+    pvr_poly_compile(&g_env_flush_hdr, &cxt);
+}
+
+/* The mesh's vertices with their UVs swapped for a lookup into the
+ * environment image. right and up are the camera's axes in model space,
+ * already scaled so a full-length normal gives 0.5. */
+static const DMSVertex* env_vertices(const DMSMesh* mesh, const float* right,
+                                     const float* up, uint32_t argb_and, uint32_t argb_or) {
+    if (mesh->vertex_count > g_env_verts_size) {
+        free(g_env_verts);
+        g_env_verts = memalign(32, mesh->vertex_count * sizeof(DMSVertex));
+        g_env_verts_size = g_env_verts ? mesh->vertex_count : 0;
+        if (!g_env_verts) return NULL;
+    }
+    const DMSVertex* src = mesh->vertices;
+    DMSVertex* dst = g_env_verts;
+    for (uint32_t i = 0; i < mesh->vertex_count; i++) {
+        SHZ_PREFETCH(&src[i + 4]);
+        float nx = src[i].nx, ny = src[i].ny, nz = src[i].nz;
+        dst[i].x = src[i].x;
+        dst[i].y = src[i].y;
+        dst[i].z = src[i].z;
+        dst[i].u = 0.5f + (nx * right[0] + ny * right[1] + nz * right[2]);
+        dst[i].v = 0.5f - (nx * up[0] + ny * up[1] + nz * up[2]);
+        dst[i].argb = (src[i].argb & argb_and) | argb_or;
+        dst[i].flags = src[i].flags;
+    }
+    return dst;
+}
+
+static void draw_reflections(DMSModel* model, shz_vec3_t pos, float scale, float yaw,
+                             const float* rot, const DCCamera* cam, int target_list) {
+    if (!g_env || !model->metallic_count) return;
+    if (target_list == PVR_LIST_PT_POLY) return;
+    int want_mirror = target_list == PVR_LIST_OP_POLY;
+    if (want_mirror && !model->mirror_count) return;
+
+    shz_sincos_t sc = shz_sincosf(yaw);
+    float yaw_rot[9] = { sc.cos, 0.0f, sc.sin,  0.0f, 1.0f, 0.0f,  -sc.sin, 0.0f, sc.cos };
+    const float* cols = rot ? rot : yaw_rot;
+
+    /* Camera right and up in the world, the same way the frustum is turned,
+     * then into model space */
+    shz_xmtrx_init_identity();
+    shz_xmtrx_apply_rotation_y(-cam->yaw);
+    shz_xmtrx_apply_rotation_x(-cam->pitch);
+    shz_vec4_t wr = shz_xmtrx_transform_vec4(shz_vec4_init(1.0f, 0.0f, 0.0f, 0.0f));
+    shz_vec4_t wu = shz_xmtrx_transform_vec4(shz_vec4_init(0.0f, 1.0f, 0.0f, 0.0f));
+    wr.z = -wr.z;
+    wu.z = -wu.z;
+    const float k = 0.5f / 127.0f;
+    float right[3], up[3];
+    for (int j = 0; j < 3; j++) {
+        right[j] = (cols[j*3] * wr.x + cols[j*3+1] * wr.y + cols[j*3+2] * wr.z) * k;
+        up[j]    = (cols[j*3] * wu.x + cols[j*3+1] * wu.y + cols[j*3+2] * wu.z) * k;
+    }
+
+    const shz_mat4x4_t* pv = dc_camera_get_pv(cam);
+    const WorldFrustum* fr = dc_camera_get_frustum(cam);
+    alignas(32) shz_mat4x4_t mvp;
+    shz_xmtrx_load_4x4((shz_mat4x4_t*)pv);
+    shz_xmtrx_translate(pos.x - cam->pos.x, pos.y - cam->pos.y, -(pos.z - cam->pos.z));
+    if (rot) {
+        alignas(32) shz_mat4x4_t rm;
+        rm.elem2D[0][0] =  rot[0]; rm.elem2D[0][1] =  rot[1]; rm.elem2D[0][2] = -rot[2]; rm.elem2D[0][3] = 0.0f;
+        rm.elem2D[1][0] =  rot[3]; rm.elem2D[1][1] =  rot[4]; rm.elem2D[1][2] = -rot[5]; rm.elem2D[1][3] = 0.0f;
+        rm.elem2D[2][0] = -rot[6]; rm.elem2D[2][1] = -rot[7]; rm.elem2D[2][2] =  rot[8]; rm.elem2D[2][3] = 0.0f;
+        rm.elem2D[3][0] = 0.0f;    rm.elem2D[3][1] = 0.0f;    rm.elem2D[3][2] = 0.0f;    rm.elem2D[3][3] = 1.0f;
+        shz_xmtrx_apply_4x4(&rm);
+    } else if (yaw != 0.0f) {
+        shz_xmtrx_apply_rotation_y(yaw);
+    }
+    shz_xmtrx_apply_scale(scale, scale, scale);
+    shz_xmtrx_store_4x4(&mvp);
+
+    vtxbuf_sync();
+    pvr_dr_state_t* dr = NULL;
+
+    for (uint32_t m = 0; m < model->mesh_count; m++) {
+        DMSMesh* mesh = &model->meshes[m];
+        if (!(mesh->material_flags & DMS_MAT_METALLIC)) continue;
+        if (mesh->material_flags & DMS_MAT_COLLISION_ONLY) continue;
+        int mirror = (mesh->material_flags & DMS_MAT_MIRROR) != 0;
+        if (mirror != want_mirror) continue;
+
+        shz_vec3_t tc = turn_centre(rot, yaw, sc, mesh->bound_cx, mesh->bound_cy, mesh->bound_cz);
+        shz_vec3_t mc = shz_vec3_init(pos.x + tc.x * scale, pos.y + tc.y * scale,
+                                      pos.z + tc.z * scale);
+        float mr = mesh->bound_radius * scale;
+        float nd;
+        shz_xmtrx_load_4x4((shz_mat4x4_t*)&fr->side_planes);
+        if (!sphere_visible(fr, mc, mr, &nd)) continue;
+        int clip = nd < mr && nd > -mr;
+
+        /* See-through with a texture of its own: Katana's passes. Anything
+         * else gets the image added over it. */
+        int tid = mesh->texture_id;
+        int glass = (mesh->material_flags & 0x3) == 2 && tid >= 0 &&
+                    tid < model->texture_count && model->textures[tid].ptr;
+
+        const DMSVertex* env = mirror ? env_vertices(mesh, right, up, 0xFFFFFFFFu, 0)
+                             : glass  ? env_vertices(mesh, right, up, 0, 0xFFFFFFFFu)
+                                      : env_vertices(mesh, right, up, 0x00FFFFFFu, SHINE_ALPHA);
+        if (!env) return;
+
+        pvr_poly_hdr_t cut_hdr __attribute__((aligned(32)));
+        const pvr_poly_hdr_t* hdrs[3] = { mirror ? &g_env_mirror_hdr : &g_env_shine_hdr, NULL, NULL };
+        const DMSVertex*      vtx[3]  = { env, mesh->vertices, mesh->vertices };
+        int passes = 1;
+        if (mirror) {
+            g_stats.meshes_drawn++;
+        } else if (glass) {
+            const dttex_info_t* tex = &model->textures[tid];
+            pvr_poly_cxt_t cxt;
+            pvr_poly_cxt_txr(&cxt, PVR_LIST_TR_POLY, tex->pvrformat, tex->width, tex->height,
+                             tex->ptr, ((mesh->material_flags >> 9) & 1) ? PVR_FILTER_NONE
+                                                                        : PVR_FILTER_BILINEAR);
+            cxt.gen.culling = PVR_CULLING_CCW;
+            cxt.txr.env = PVR_TXRENV_MODULATEALPHA;
+            cxt.blend.src = PVR_BLEND_DESTALPHA;
+            cxt.blend.dst = PVR_BLEND_SRCALPHA;
+            cxt.blend.dst_enable = PVR_BLEND_ENABLE;
+            pvr_poly_compile(&cut_hdr, &cxt);
+            hdrs[0] = &g_env_accum_hdr;
+            hdrs[1] = &cut_hdr;
+            hdrs[2] = &g_env_flush_hdr;
+            passes = 3;
+        }
+
+        for (int p = 0; p < passes; p++) {
+            if (vtxbuf_full(mesh, clip)) return;
+            if (!dr) {
+                dc_list_begin(target_list);
+                dr = dc_dr_state();
+            }
+            shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), hdrs[p]);
+            shz_xmtrx_load_4x4(&mvp);
+            g_stats.tris_drawn += mesh->tri_count;
+            if (clip) {
+                g_stats.verts_clipped += mesh->vertex_count;
+                render_clipped(vtx[p], mesh->vertex_count, dr);
+            } else {
+                g_stats.verts_xformed += mesh->vertex_count;
+                render_fast(vtx[p], mesh->vertex_count, dr);
+            }
+        }
+    }
 }
 
 /* ================================================================
@@ -774,8 +994,10 @@ static void update_bounds_from_skeleton(DMSModel* model) {
 void dc_model_animate(DMSModel* model, float dt) {
     if (!model || !model->skeleton) return;
 
+    dc_prof_begin(DC_PROF_ANIM);
     update_skeleton(model->skeleton, dt);
     update_bounds_from_skeleton(model);
+    dc_prof_end(DC_PROF_ANIM);
 }
 
 void dc_model_set_anim(DMSModel* model, int anim_index) {
@@ -1052,6 +1274,12 @@ DMSModel* dc_model_load(const char* filename) {
         }
 
         pvr_poly_compile(&mesh->header, &cxt);
+
+        if ((mesh->material_flags & DMS_MAT_METALLIC) && !model->skeleton &&
+            !(mesh->material_flags & DMS_MAT_COLLISION_ONLY)) {
+            model->metallic_count++;
+            if (mesh->material_flags & DMS_MAT_MIRROR) model->mirror_count++;
+        }
     }
 
     fclose(f);

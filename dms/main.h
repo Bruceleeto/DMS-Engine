@@ -78,6 +78,12 @@ typedef struct __attribute__((aligned(32))) {
 
 /* material_flags bit 12: mesh is collided with but never drawn */
 #define DMS_MAT_COLLISION_ONLY (1u << 12)
+/* material_flags bit 13: glTF metallic of 0.5 or more. Reflects the environment
+ * image once dc_set_environment() has been called */
+#define DMS_MAT_METALLIC       (1u << 13)
+/* material_flags bit 14: a mirror (solid, metallic, roughness near 0). Shows
+ * the environment image in place of its own texture */
+#define DMS_MAT_MIRROR         (1u << 14)
 
 typedef struct {
     uint32_t vertex_count;
@@ -122,6 +128,8 @@ typedef struct {
     float        anim_bound_cx, anim_bound_cy, anim_bound_cz;
     float        anim_bound_radius;
     float        max_bind_radius;
+    uint32_t     metallic_count;    /* meshes that reflect the environment */
+    uint32_t     mirror_count;      /* of those, mirrors */
 } DMSModel;
 
 /* ================================================================

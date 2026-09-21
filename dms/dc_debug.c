@@ -1,5 +1,7 @@
 #include "dc_debug.h"
 #include "dc_engine.h"
+#include "dc_draw2d.h"
+#include <stdio.h>
 
 #define DBG_RING_SEGS 20
 #define DBG_RING_WIDTH 0.04f  /* fraction of radius */
@@ -101,4 +103,31 @@ void dc_debug_sphere(shz_vec3_t center, float radius,
             pvr_dr_commit(pv_vert);
         }
     }
+}
+
+void dc_debug_stats(void) {
+    char line[48];
+    snprintf(line, sizeof(line), "FPS: %.1f", dc_fps());
+    dc_draw_text(line, 10, 10, 16, DC_COLOR_GREEN);
+
+    dc_frame_stats_log();
+
+    const DCFrameStats* st = dc_frame_stats();
+    if (!st->valid) return;
+
+    int y = 480 - 16 * 6 - 4;
+    snprintf(line, sizeof(line), "FRAME: %.2f ms", st->frame_ms);
+    dc_draw_text(line, 10, y, 16, DC_COLOR_GREEN);
+    snprintf(line, sizeof(line), "ANIM: %.0f us", st->anim_us);
+    dc_draw_text(line, 10, y + 16, 16, DC_COLOR_GREEN);
+    snprintf(line, sizeof(line), "CAM:  %.0f us", st->cam_us);
+    dc_draw_text(line, 10, y + 32, 16, DC_COLOR_GREEN);
+    snprintf(line, sizeof(line), "DRAW: %.0f us", st->draw_us);
+    dc_draw_text(line, 10, y + 48, 16, DC_COLOR_GREEN);
+    snprintf(line, sizeof(line), "drawn %lu culled %lu",
+             (unsigned long)st->meshes_drawn, (unsigned long)st->meshes_culled);
+    dc_draw_text(line, 10, y + 64, 16, DC_COLOR_GREEN);
+    snprintf(line, sizeof(line), "xform %lu clip %lu",
+             (unsigned long)st->verts_xformed, (unsigned long)st->verts_clipped);
+    dc_draw_text(line, 10, y + 80, 16, DC_COLOR_GREEN);
 }

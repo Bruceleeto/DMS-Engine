@@ -77,6 +77,8 @@ typedef struct {
   int wrapU, wrapV;       // raw glTF sampler values (10497=REPEAT, 33071=CLAMP, 33648=MIRROR)
   int blockId;            // static levels: which block (by location) this mesh is in
   int collisionOnly;      // named "collision": collided with, never drawn
+  int metallic;           // glTF metallicFactor of 0.5 or more: 1 = reflects the
+                          // environment, 2 = a mirror (roughness near 0)
 
 } Mesh;
 
@@ -223,6 +225,9 @@ struct StripInfo {
   std::vector<uint32_t> indices; // Indices making up this strip
   uint32_t stripId;              // ID of this strip
 };
+
+// Metallic materials smoother than this are mirrors
+#define MIRROR_ROUGHNESS 0.25f
 
 struct MeshTriStrips {
   std::vector<Vertex> vertices;         // Optimized vertex buffer
@@ -1575,6 +1580,14 @@ bool LoadGLTF(const char *filename) {
             cgltf_pbr_metallic_roughness *pbr =
                 &mat->pbr_metallic_roughness;
 
+            if (pbr->metallic_factor >= 0.5f)
+              dstMesh->metallic =
+                  pbr->roughness_factor < MIRROR_ROUGHNESS ? 2 : 1;
+            if (dstMesh->metallic)
+              printf("Mesh %d material is metallic (%.2f, roughness %.2f)%s\n",
+                     meshIndex, pbr->metallic_factor, pbr->roughness_factor,
+                     dstMesh->metallic == 2 ? ": a mirror" : "");
+
             float *bc = pbr->base_color_factor;
             uint8_t a = (uint8_t)(bc[3] * 255.0f);
             uint8_t r = (uint8_t)(bc[0] * 255.0f);
@@ -2023,7 +2036,8 @@ static bool SameMaterial(const Mesh &a, const Mesh &b) {
   return a.textureId == b.textureId && a.materialColor == b.materialColor &&
          a.alphaMode == b.alphaMode && a.alphaCutoff == b.alphaCutoff &&
          a.doubleSided == b.doubleSided && a.wrapU == b.wrapU &&
-         a.wrapV == b.wrapV && a.collisionOnly == b.collisionOnly;
+         a.wrapV == b.wrapV && a.collisionOnly == b.collisionOnly &&
+         a.metallic == b.metallic;
 }
 
 void BuildBlocks(Model *m) {
@@ -2260,6 +2274,7 @@ void CreateTristrippedModel(const Model *sourceModel, Model *destModel) {
     dstMesh->wrapV = srcMesh->wrapV;
     dstMesh->blockId = srcMesh->blockId;
     dstMesh->collisionOnly = srcMesh->collisionOnly;
+    dstMesh->metallic = srcMesh->metallic;
 
     if (srcMesh->prestripped) {
       dstMesh->vertexCount = srcMesh->vertexCount;
@@ -3518,6 +3533,9 @@ void ExportTristrippedModel(const Model *model, const char *filename,
     // bit  9:    tex_filter (0=bilinear, 1=nearest)
     // bits 10-11: lighting_mode (0=BAKED, 1=DYNAMIC, 2=UNLIT)
     // bit  12:   collision_only (collided with, never drawn)
+    // bit  13:   metallic (reflects the environment image)
+    // bit  14:   mirror (solid, metallic, roughness near 0: shows only the
+    //            environment image, tinted by its vertex colours)
     uint32_t material_flags = 0;
     material_flags |= (mesh->alphaMode & 0x3);
     material_flags |= (mesh->doubleSided & 0x1) << 2;
@@ -3530,6 +3548,8 @@ void ExportTristrippedModel(const Model *model, const char *filename,
     // lighting_mode: baked=0, dynamic=1
     material_flags |= (bakeLighting ? 0 : 1) << 10;
     material_flags |= (mesh->collisionOnly & 0x1) << 12;
+    material_flags |= (mesh->metallic != 0) << 13;
+    material_flags |= (mesh->metallic == 2 && mesh->alphaMode == 0) << 14;
 
     float alphaCutoff = mesh->alphaCutoff;
     fwrite(&material_flags, sizeof(uint32_t), 1, file);

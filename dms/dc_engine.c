@@ -1,5 +1,9 @@
 #include "dc_engine.h"
 #include "dc_input.h"
+#include "dc_model.h"
+#include "dc_draw.h"
+#include "dc_draw2d.h"
+#include <dc/perfctr.h>
 #include <dc/pvr.h>
 #include <arch/timer.h>
 #include <string.h>
@@ -23,7 +27,21 @@ static struct {
     pvr_dr_state_t dr_state;
     int  current_list;       /* currently open PVR list, or -1 */
     bool scene_active;
+
+    /* Frame statistics, summed over PROF_INTERVAL frames then averaged */
+    uint64_t frame_start_ns;
+    uint64_t part_start_ns[DC_PROF_COUNT];
+    int      part_depth[DC_PROF_COUNT];
+    uint64_t part_ns[DC_PROF_COUNT];
+    uint64_t frame_ns;
+    uint32_t sum_drawn, sum_culled, sum_xformed, sum_clipped, sum_tris;
+    bool     stats_log;         /* dc_debug_stats() was called: print the serial line */
+    uint64_t last_report_ms;
+    uint32_t samples;
+    DCFrameStats stats;
 } g_engine;
+
+#define PROF_INTERVAL 60
 
 /* ================================================================
  * Init / Shutdown
@@ -63,6 +81,9 @@ void dc_shutdown(void) {
  * ================================================================ */
 
 void dc_frame_begin(void) {
+    g_engine.frame_start_ns = perf_cntr_timer_ns();
+    dc_model_reset_stats();
+
     /* ---- Timing ---- */
     uint64_t now = timer_ms_gettime64();
     g_engine.delta_time = (float)(now - g_engine.last_frame_ms) / 1000.0f;
@@ -85,7 +106,81 @@ void dc_frame_begin(void) {
     g_engine.scene_active = true;
 }
 
+/* Add this frame to the running sums; every PROF_INTERVAL frames turn them
+ * into the averages dc_frame_stats() hands out */
+static void stats_frame_done(void) {
+    const DCModelStats* ms = dc_model_get_stats();
+    g_engine.sum_drawn   += ms->meshes_drawn;
+    g_engine.sum_culled  += ms->meshes_culled;
+    g_engine.sum_xformed += ms->verts_xformed;
+    g_engine.sum_clipped += ms->verts_clipped;
+    g_engine.sum_tris    += ms->tris_drawn;
+    g_engine.frame_ns += perf_cntr_timer_ns() - g_engine.frame_start_ns;
+
+    if (++g_engine.samples < PROF_INTERVAL) return;
+
+    float n = (float)g_engine.samples;
+    DCFrameStats* st = &g_engine.stats;
+    st->valid    = true;
+    st->frame_ms = (float)g_engine.frame_ns / n / 1000000.0f;
+    st->anim_us  = (float)g_engine.part_ns[DC_PROF_ANIM] / n / 1000.0f;
+    st->cam_us   = (float)g_engine.part_ns[DC_PROF_CAM]  / n / 1000.0f;
+    st->draw_us  = (float)g_engine.part_ns[DC_PROF_DRAW] / n / 1000.0f;
+    st->meshes_drawn  = g_engine.sum_drawn   / g_engine.samples;
+    st->meshes_culled = g_engine.sum_culled  / g_engine.samples;
+    st->verts_xformed = g_engine.sum_xformed / g_engine.samples;
+    st->verts_clipped = g_engine.sum_clipped / g_engine.samples;
+
+    /* Wall-clock interval since the last report, so vsync waits are counted */
+    uint64_t now_ms = timer_ms_gettime64();
+    if (g_engine.stats_log && g_engine.last_report_ms) {
+        float secs = (float)(now_ms - g_engine.last_report_ms) / 1000.0f;
+        pvr_stats_t ps;
+        pvr_get_stats(&ps);
+        printf("FPS: %.1f  PPS: %.0f polys/sec (%lu tris/frame)  "
+               "vtxbuf %luKB (max %luKB)  render %.2fms\n",
+               n / secs, (float)g_engine.sum_tris / secs,
+               (unsigned long)(g_engine.sum_tris / g_engine.samples),
+               (unsigned long)(ps.vtx_buffer_used / 1024),
+               (unsigned long)(ps.vtx_buffer_used_max / 1024),
+               (float)ps.rnd_last_time / 1e6f);
+    }
+    g_engine.last_report_ms = now_ms;
+    g_engine.stats_log = false;
+    g_engine.sum_tris = 0;
+
+    memset(g_engine.part_ns, 0, sizeof(g_engine.part_ns));
+    g_engine.frame_ns = 0;
+    g_engine.sum_drawn = g_engine.sum_culled = 0;
+    g_engine.sum_xformed = g_engine.sum_clipped = 0;
+    g_engine.samples = 0;
+}
+
+void dc_prof_begin(int part) {
+    if (g_engine.part_depth[part]++ == 0)
+        g_engine.part_start_ns[part] = perf_cntr_timer_ns();
+}
+
+void dc_prof_end(int part) {
+    if (--g_engine.part_depth[part] == 0)
+        g_engine.part_ns[part] += perf_cntr_timer_ns() - g_engine.part_start_ns[part];
+}
+
+void dc_frame_stats_log(void) {
+    g_engine.stats_log = true;
+}
+
+const DCFrameStats* dc_frame_stats(void) {
+    return &g_engine.stats;
+}
+
 void dc_frame_end(void) {
+    /* Everything queued with dc_draw*, then the text on top */
+    dc_prof_begin(DC_PROF_DRAW);
+    dc_draw_flush();
+    dc_draw2d_flush();
+    dc_prof_end(DC_PROF_DRAW);
+
     /* Close any open list */
     if (g_engine.current_list >= 0) {
         pvr_list_finish();
@@ -94,6 +189,8 @@ void dc_frame_end(void) {
 
     pvr_scene_finish();
     g_engine.scene_active = false;
+
+    stats_frame_done();
 }
 
 /* ================================================================

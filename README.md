@@ -117,3 +117,40 @@ the polygon rate limit: about 2.3 million polygons a second.
 Credits:
 - Model: [[Free] Ugandan Tails](https://sketchfab.com/3d-models/free-ugandan-tails-cd6dca09d7ed4838b6c0d71c5adc448c)
   by [LuAnton](https://sketchfab.com/LuAnton)
+
+## Blender settings
+
+Export as `.glb`. The converter reads these from the material (Principled
+BSDF):
+
+| Setting | What it does |
+|---|---|
+| Base Color, and its texture | The colour and texture of the mesh |
+| Alpha, or a texture with alpha | Soft alpha makes the mesh transparent, hard alpha makes it a cutout |
+| Backface Culling | Off means double sided |
+| Metallic, 0.5 or more | The mesh reflects the environment image |
+| Roughness, under 0.25 | With Metallic: a mirror |
+| Emission | With `-bake`, the material lights the things around it |
+
+IOR and the other settings are ignored.
+
+### Reflections
+
+Set Metallic to 1 on the material.
+
+- A solid material with Roughness at 0 is a mirror: it shows the environment
+  image in place of its own texture, tinted by its Base Color.
+- A solid material with more Roughness keeps its texture and gets a shine
+  over it.
+- A see-through material (glass) gets a reflection, cut out by the alpha of
+  its texture.
+
+In the example, load the image to reflect and hand it to the engine once:
+
+```c
+DCImage* environment = dc_image_load(ASSETS "environment/environment.dt");
+dc_set_environment(environment);
+```
+
+`make assets` turns `assets/<dir>/<name>.png` into the `.dt`. Without the
+`dc_set_environment` call, metallic materials draw as normal. See `vase`.

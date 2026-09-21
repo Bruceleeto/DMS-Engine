@@ -1,4 +1,5 @@
 #include "dc_player.h"
+#include "dc_engine.h"
 #include <math.h>
 
 #define DC_PITCH_LIMIT_DEFAULT (SHZ_F_PI * 0.45f)
@@ -278,6 +279,7 @@ void dc_player_update(DCPlayer* p, DCCamera* cam,
                       const DCInput* inp, ColWorld* col, float dt) {
     if (!inp || !inp->connected) return;
 
+    dc_prof_begin(DC_PROF_CAM);
     switch (p->cam_mode) {
         case DC_CAM_FPS:
             update_fps(p, cam, inp, col, dt);
@@ -289,4 +291,5 @@ void dc_player_update(DCPlayer* p, DCCamera* cam,
             update_noclip(p, cam, inp, dt);
             break;
     }
+    dc_prof_end(DC_PROF_CAM);
 }
