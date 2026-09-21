@@ -12,6 +12,11 @@
 #include "dms/dc_debug.h"
 #include "dms/collision.h"
 
+/* Where assets are read from: /pc/ over dcload, /cd/ when built with make disc */
+#ifndef ASSETS
+#define ASSETS "/pc/"
+#endif
+
 /* ---- App state ---- */
 static DCCamera camera;
 static DCPlayer player;
@@ -116,7 +121,7 @@ int main(int argc, char* argv[]) {
     player.cam_height = 1.7f;
 
     /* Load world */
-    dms_model = dc_model_load("/pc/world/test.dms");
+    dms_model = dc_model_load(ASSETS "world/test.dms");
     dms_pos = shz_vec3_init(0.0f, 0.0f, 0.0f);
     dms_scale = 1.0f;
 
@@ -140,7 +145,7 @@ int main(int argc, char* argv[]) {
     }
 
     /* Load character, scaled so it matches the player's collision height */
-    char_model = dc_model_load("/pc/char/model.dms");
+    char_model = dc_model_load(ASSETS "char/model.dms");
     if (char_model) {
         float lo = 1e30f, hi = -1e30f;
         for (uint32_t m = 0; m < char_model->mesh_count; m++) {

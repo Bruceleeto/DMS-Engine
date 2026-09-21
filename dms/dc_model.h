@@ -36,6 +36,11 @@ void dc_model_draw_list(DMSModel* model, shz_vec3_t pos, float scale,
 void dc_model_draw_list_rotated(DMSModel* model, shz_vec3_t pos, float scale,
                                 float yaw, const DCCamera* cam, int target_list);
 
+/* Draw list turned any way (static models only). rot is 3 columns: where the
+ * model's x, y and z axes point in the world. */
+void dc_model_draw_list_oriented(DMSModel* model, shz_vec3_t pos, float scale,
+                                 const float rot[9], const DCCamera* cam, int target_list);
+
 /* ================================================================
  * Animation
  * ================================================================ */

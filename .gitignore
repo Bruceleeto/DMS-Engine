@@ -2,6 +2,7 @@
 *.a
 *.dms
 *.elf
+*.cdi
 
 converter/strippy
 clipping_sh4zam/pc/

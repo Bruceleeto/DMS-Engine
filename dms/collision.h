@@ -62,6 +62,11 @@ ColWorld*    col_build(DMSModel* dms_model, shz_vec3_t pos, float scale);
 shz_vec3_t   col_move(ColWorld* w, shz_vec3_t from, shz_vec3_t to, float radius);
 ColGroundHit col_ground(ColWorld* w, shz_vec3_t origin, float max_dist);
 ColRayHit  col_raycast(ColWorld* w, shz_vec3_t org, shz_vec3_t dir, float max_dist);
+/* Triangles whose bounds touch the sphere, each one once, for code that does
+ * its own tests (a physics engine). Writes up to max and returns how many;
+ * a return of max may mean some were left out. */
+#define COL_QUERY_MAX 128
+int        col_query(ColWorld* w, shz_vec3_t centre, float radius, ColTri* out, int max);
 void       col_free(ColWorld* w);
 
 /* ================================================================ */
@@ -665,6 +670,58 @@ ColRayHit col_raycast(ColWorld* w, shz_vec3_t org, shz_vec3_t dir, float max_dis
 }
 
 /* ================================================================ */
+int col_query(ColWorld* w, shz_vec3_t centre, float radius, ColTri* out, int max) {
+    if (!w || max <= 0) return 0;
+    if (max > COL_QUERY_MAX) max = COL_QUERY_MAX;
+
+    ColTriRef seen[COL_QUERY_MAX];
+    int n = 0;
+
+    int cx0 = col_cell_x(w, centre.x - radius);
+    int cx1 = col_cell_x(w, centre.x + radius);
+    int cz0 = col_cell_z(w, centre.z - radius);
+    int cz1 = col_cell_z(w, centre.z + radius);
+    int many_cells = cx0 != cx1 || cz0 != cz1;
+
+    for (int gz = cz0; gz <= cz1; gz++) {
+        for (int gx = cx0; gx <= cx1; gx++) {
+            const ColCell* cell = col_find_cell(w, gx, gz);
+            if (!cell) continue;
+            ColTriRef* refs = &w->tri_refs[cell->start];
+
+            for (int i = 0; i < cell->count; i++) {
+                /* A triangle sits in every cell it touches */
+                if (many_cells) {
+                    int dup = 0;
+                    for (int k = 0; k < n; k++)
+                        if (seen[k] == refs[i]) { dup = 1; break; }
+                    if (dup) continue;
+                }
+
+                ColTri ct;
+                col_tri_get(w, refs[i], &ct);
+
+                /* The grid is flat, so height and the rest of the box are checked here */
+                float lo, hi;
+                lo = ct.v0.y + col_minf(0.0f, col_minf(ct.edge1.y, ct.edge2.y));
+                hi = ct.v0.y + col_maxf(0.0f, col_maxf(ct.edge1.y, ct.edge2.y));
+                if (lo > centre.y + radius || hi < centre.y - radius) continue;
+                lo = ct.v0.x + col_minf(0.0f, col_minf(ct.edge1.x, ct.edge2.x));
+                hi = ct.v0.x + col_maxf(0.0f, col_maxf(ct.edge1.x, ct.edge2.x));
+                if (lo > centre.x + radius || hi < centre.x - radius) continue;
+                lo = ct.v0.z + col_minf(0.0f, col_minf(ct.edge1.z, ct.edge2.z));
+                hi = ct.v0.z + col_maxf(0.0f, col_maxf(ct.edge1.z, ct.edge2.z));
+                if (lo > centre.z + radius || hi < centre.z - radius) continue;
+
+                if (n == max) return n;
+                seen[n] = refs[i];
+                out[n++] = ct;
+            }
+        }
+    }
+    return n;
+}
+
 void col_free(ColWorld* w) {
     if (!w) return;
     free(w->tri_refs);

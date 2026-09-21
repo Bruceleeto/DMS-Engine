@@ -19,7 +19,13 @@ CFLAGS += -std=gnu2x -O3 -I.. \
           -fmerge-all-constants -funroll-loops -fno-PIC -fipa-pta \
           -ftree-vectorize -I$(KOS_BASE)/utils
 
-.PHONY: all assets assets-clean clean rm-elf run dist
+# make disc builds with assets read from the disc, not dcload
+ifdef DISC
+CFLAGS += -DASSETS='"/cd/"'
+endif
+DISC_IMAGE = $(notdir $(CURDIR)).cdi
+
+.PHONY: all assets assets-clean clean rm-elf run dist disc
 
 all: rm-elf $(TARGET)
 
@@ -57,6 +63,14 @@ $(TARGET): $(OBJS)
 
 run: $(TARGET)
 	$(KOS_LOADER) $(TARGET)
+
+# make disc - clean build reading from /cd, then a .cdi with pc/ as the disc root.
+# main.o is removed after so the next plain make reads from /pc again.
+disc: assets
+	$(MAKE) clean
+	$(MAKE) $(TARGET) DISC=1
+	mkdcdisc -e $(TARGET) -D $(OUTPUT_DIR) -o $(DISC_IMAGE) -N
+	-rm -f main.o
 
 dist: $(TARGET)
 	-rm -f $(OBJS)

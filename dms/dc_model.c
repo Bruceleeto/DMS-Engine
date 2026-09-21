@@ -503,15 +503,39 @@ enum { XM_OTHER, XM_PLANES, XM_MVP };   /* what XMTRX holds right now */
  * as few times as possible: a block's meshes are all tested first, then the
  * survivors drawn. The header copy goes through XMTRX, so the MVP is only
  * reloaded after a header was sent. */
+/* Bounds centre of a block or mesh, turned the way the model is drawn.
+ * rot is 3 columns (where the model's x, y and z axes point), or NULL for yaw */
+static inline shz_vec3_t turn_centre(const float* rot, float yaw, shz_sincos_t sc,
+                                     float cx, float cy, float cz) {
+    if (rot)
+        return shz_vec3_init(rot[0] * cx + rot[3] * cy + rot[6] * cz,
+                             rot[1] * cx + rot[4] * cy + rot[7] * cz,
+                             rot[2] * cx + rot[5] * cy + rot[8] * cz);
+    if (yaw != 0.0f)
+        return shz_vec3_init(cx * sc.cos - cz * sc.sin, cy, cx * sc.sin + cz * sc.cos);
+    return shz_vec3_init(cx, cy, cz);
+}
+
 static void draw_blocks_list(DMSModel* model, shz_vec3_t pos, float scale,
-                             float yaw, const DCCamera* cam, int target_list) {
+                             float yaw, const float* rot,
+                             const DCCamera* cam, int target_list) {
     shz_sincos_t sc = shz_sincosf(yaw);
     const shz_mat4x4_t* pv = dc_camera_get_pv(cam);
     const WorldFrustum* fr = dc_camera_get_frustum(cam);
     alignas(32) shz_mat4x4_t mvp;
     shz_xmtrx_load_4x4((shz_mat4x4_t*)pv);
     shz_xmtrx_translate(pos.x - cam->pos.x, pos.y - cam->pos.y, -(pos.z - cam->pos.z));
-    if (yaw != 0.0f) shz_xmtrx_apply_rotation_y(yaw);
+    if (rot) {
+        /* Vertices go in with z negated, so the z row and z column flip sign */
+        alignas(32) shz_mat4x4_t rm;
+        rm.elem2D[0][0] =  rot[0]; rm.elem2D[0][1] =  rot[1]; rm.elem2D[0][2] = -rot[2]; rm.elem2D[0][3] = 0.0f;
+        rm.elem2D[1][0] =  rot[3]; rm.elem2D[1][1] =  rot[4]; rm.elem2D[1][2] = -rot[5]; rm.elem2D[1][3] = 0.0f;
+        rm.elem2D[2][0] = -rot[6]; rm.elem2D[2][1] = -rot[7]; rm.elem2D[2][2] =  rot[8]; rm.elem2D[2][3] = 0.0f;
+        rm.elem2D[3][0] = 0.0f;    rm.elem2D[3][1] = 0.0f;    rm.elem2D[3][2] = 0.0f;    rm.elem2D[3][3] = 1.0f;
+        shz_xmtrx_apply_4x4(&rm);
+    } else if (yaw != 0.0f) {
+        shz_xmtrx_apply_rotation_y(yaw);
+    }
     shz_xmtrx_apply_scale(scale, scale, scale);
     shz_xmtrx_store_4x4(&mvp);
     int xm = XM_MVP;
@@ -525,13 +549,9 @@ static void draw_blocks_list(DMSModel* model, shz_vec3_t pos, float scale,
     for (uint32_t r = model->list_runs[list]; r < model->list_runs[list + 1]; r++) {
         const DMSBlockRun* run = &model->runs[r];
         const DMSBlock* b = &model->blocks[run->block];
-        float bx = b->cx, bz = b->cz;
-        if (yaw != 0.0f) {
-            bx = b->cx * sc.cos - b->cz * sc.sin;
-            bz = b->cx * sc.sin + b->cz * sc.cos;
-        }
-        shz_vec3_t wc = shz_vec3_init(pos.x + bx * scale, pos.y + b->cy * scale,
-                                      pos.z + bz * scale);
+        shz_vec3_t bc = turn_centre(rot, yaw, sc, b->cx, b->cy, b->cz);
+        shz_vec3_t wc = shz_vec3_init(pos.x + bc.x * scale, pos.y + bc.y * scale,
+                                      pos.z + bc.z * scale);
         float wr = b->radius * scale;
         if (xm != XM_PLANES) {
             shz_xmtrx_load_4x4((shz_mat4x4_t*)&fr->side_planes);
@@ -557,13 +577,10 @@ static void draw_blocks_list(DMSModel* model, shz_vec3_t pos, float scale,
             for (; m < run_end && n < DRAW_BATCH; m++) {
                 const DMSMesh* mesh = &model->meshes[m];
                 if (mesh->material_flags & DMS_MAT_COLLISION_ONLY) continue;
-                float mx = mesh->bound_cx, mz = mesh->bound_cz;
-                if (yaw != 0.0f) {
-                    mx = mesh->bound_cx * sc.cos - mesh->bound_cz * sc.sin;
-                    mz = mesh->bound_cx * sc.sin + mesh->bound_cz * sc.cos;
-                }
-                shz_vec3_t mc = shz_vec3_init(pos.x + mx * scale, pos.y + mesh->bound_cy * scale,
-                                              pos.z + mz * scale);
+                shz_vec3_t tc = turn_centre(rot, yaw, sc, mesh->bound_cx, mesh->bound_cy,
+                                            mesh->bound_cz);
+                shz_vec3_t mc = shz_vec3_init(pos.x + tc.x * scale, pos.y + tc.y * scale,
+                                              pos.z + tc.z * scale);
                 float mr = mesh->bound_radius * scale;
                 if (!sphere_visible(fr, mc, mr, &nd)) {
                     g_stats.meshes_culled++;
@@ -638,7 +655,15 @@ void dc_model_draw_list_rotated(DMSModel* model, shz_vec3_t pos, float scale,
     if (model->skeleton)
         draw_skinned_list(model, pos, scale, yaw, cam, target_list);
     else
-        draw_blocks_list(model, pos, scale, yaw, cam, target_list);
+        draw_blocks_list(model, pos, scale, yaw, NULL, cam, target_list);
+}
+
+void dc_model_draw_list_oriented(DMSModel* model, shz_vec3_t pos, float scale,
+                                 const float rot[9], const DCCamera* cam, int target_list) {
+    if (!model || model->mesh_count == 0 || model->skeleton) return;
+
+    vtxbuf_sync();
+    draw_blocks_list(model, pos, scale, 0.0f, rot, cam, target_list);
 }
 
 void dc_model_draw_list(DMSModel* model, shz_vec3_t pos, float scale,

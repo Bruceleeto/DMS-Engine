@@ -15,7 +15,7 @@ static struct {
     /* Timing */
     uint64_t last_frame_ms;
     float    delta_time;
-    float    fps_samples[60];
+    float    frame_secs[60];     /* last 60 frame times, for dc_fps */
     int      fps_idx;
     uint32_t frame_count;
 
@@ -70,9 +70,8 @@ void dc_frame_begin(void) {
     if (g_engine.delta_time < 0.0001f) g_engine.delta_time = 0.0001f;
     g_engine.last_frame_ms = now;
 
-    /* FPS rolling average */
-    float instant_fps = 1.0f / g_engine.delta_time;
-    g_engine.fps_samples[g_engine.fps_idx % 60] = instant_fps;
+    /* Frame times for the FPS rolling average */
+    g_engine.frame_secs[g_engine.fps_idx % 60] = g_engine.delta_time;
     g_engine.fps_idx++;
 
     g_engine.frame_count++;
@@ -109,10 +108,12 @@ float dc_fps(void) {
     int count = g_engine.fps_idx < 60 ? g_engine.fps_idx : 60;
     if (count == 0) return 0.0f;
 
-    float sum = 0.0f;
+    /* Frames over total time. Averaging each frame's 1/time reads high when
+     * frame times are uneven (10ms + 23ms is 60fps, not 71). */
+    float secs = 0.0f;
     for (int i = 0; i < count; i++)
-        sum += g_engine.fps_samples[i];
-    return sum / (float)count;
+        secs += g_engine.frame_secs[i];
+    return (float)count / secs;
 }
 
 uint64_t dc_time_ms(void) {
