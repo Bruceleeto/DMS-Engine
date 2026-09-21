@@ -77,6 +77,7 @@ typedef struct {
   int wrapU, wrapV;       // raw glTF sampler values (10497=REPEAT, 33071=CLAMP, 33648=MIRROR)
   int blockId;            // static levels: which block (by location) this mesh is in
   int collisionOnly;      // named "collision": collided with, never drawn
+  char materialName[32];  // glTF material name, so code can find the mesh
   int metallic;           // glTF metallicFactor of 0.5 or more: 1 = reflects the
                           // environment, 2 = a mirror (roughness near 0)
 
@@ -613,8 +614,22 @@ void ExtractAndConvertTextures(cgltf_data *data, const char *inputFilename) {
     printf("\n=== Texture Extraction ===\n");
     printf("Found %zu images in GLB/GLTF\n", data->images_count);
 
+    /* Only base colour images are drawn. Normal, roughness and occlusion maps
+     * would only fill VRAM. */
+    std::vector<bool> used(data->images_count, false);
+    for (size_t m = 0; m < data->materials_count; m++) {
+        const cgltf_texture *t =
+            data->materials[m].pbr_metallic_roughness.base_color_texture.texture;
+        if (data->materials[m].has_pbr_metallic_roughness && t && t->image)
+            used[t->image - data->images] = true;
+    }
+
     for (size_t i = 0; i < data->images_count; i++) {
         cgltf_image *img = &data->images[i];
+        if (!used[i]) {
+            printf("  Texture %zu: not a base colour, skipped\n", i);
+            continue;
+        }
         const void *imageData = NULL;
         size_t imageSize = 0;
         char tmpPath[512], dtPath[512];
@@ -1571,6 +1586,10 @@ bool LoadGLTF(const char *filename) {
         if (primitive->material) {
           cgltf_material *mat = primitive->material;
 
+          if (mat->name)
+            snprintf(dstMesh->materialName, sizeof(dstMesh->materialName), "%s",
+                     mat->name);
+
           // Alpha mode: cgltf_alpha_mode_opaque=0, mask=1, blend=2
           dstMesh->alphaMode = (int)mat->alpha_mode;
           dstMesh->alphaCutoff = mat->alpha_cutoff;
@@ -2032,7 +2051,12 @@ static void CutStrip(const std::vector<Vertex> &v, const std::vector<uint32_t> &
 }
 
 // Meshes with the same material are merged inside a block
+// Same look. Materials that look the same but are named differently still
+// merge, unless one of them has no texture: an untextured material with a
+// name of its own is there for code to find (a screen for a render target).
 static bool SameMaterial(const Mesh &a, const Mesh &b) {
+  if (a.textureId < 0 && strcmp(a.materialName, b.materialName) != 0)
+    return false;
   return a.textureId == b.textureId && a.materialColor == b.materialColor &&
          a.alphaMode == b.alphaMode && a.alphaCutoff == b.alphaCutoff &&
          a.doubleSided == b.doubleSided && a.wrapU == b.wrapU &&
@@ -2275,6 +2299,8 @@ void CreateTristrippedModel(const Model *sourceModel, Model *destModel) {
     dstMesh->blockId = srcMesh->blockId;
     dstMesh->collisionOnly = srcMesh->collisionOnly;
     dstMesh->metallic = srcMesh->metallic;
+    memcpy(dstMesh->materialName, srcMesh->materialName,
+           sizeof(dstMesh->materialName));
 
     if (srcMesh->prestripped) {
       dstMesh->vertexCount = srcMesh->vertexCount;
@@ -3707,6 +3733,11 @@ void ExportTristrippedModel(const Model *model, const char *filename,
   fseek(file, endPos, SEEK_SET);
 
   printf("=== Texture embedding complete ===\n");
+
+  // Material names, after everything else: "MATN", then 32 chars per mesh
+  fwrite("MATN", 1, 4, file);
+  for (uint32_t m = 0; m < meshCount; m++)
+    fwrite(model->meshes[meshOrder[m]].materialName, 1, 32, file);
 
   long finalPos = ftell(file);
   fclose(file);

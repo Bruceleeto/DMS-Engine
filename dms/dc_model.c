@@ -1213,6 +1213,7 @@ DMSModel* dc_model_load(const char* filename) {
     printf("DMS: %lu embedded textures\n", (unsigned long)tex_count);
 
     model->texture_count = tex_count;
+    long tex_end = ftell(f) + (long)tex_count * 8;   /* end of the texture data */
     if (tex_count > 0) {
         struct { uint32_t offset; uint32_t size; } *tex_table;
         tex_table = malloc(tex_count * 8);
@@ -1228,6 +1229,8 @@ DMSModel* dc_model_load(const char* filename) {
             fread(buf, 1, tex_table[i].size, f);
 
             pvrtex_load_from_buffer(buf, tex_table[i].size, &model->textures[i]);
+            if ((long)(tex_table[i].offset + tex_table[i].size) > tex_end)
+                tex_end = (long)(tex_table[i].offset + tex_table[i].size);
             free(buf);
 
             printf("  Tex %lu: %ux%u, %lu bytes\n",
@@ -1239,41 +1242,30 @@ DMSModel* dc_model_load(const char* filename) {
         free(tex_table);
     }
 
+    /* Material names follow the last texture */
+    char tag[4];
+    if (fseek(f, tex_end, SEEK_SET) == 0 &&
+        fread(tag, 1, 4, f) == 4 && !memcmp(tag, "MATN", 4)) {
+        model->material_names = malloc(mesh_count * 32);
+        if (model->material_names &&
+            fread(model->material_names, 32, mesh_count, f) != mesh_count) {
+            free(model->material_names);
+            model->material_names = NULL;
+        }
+    }
+
     /* Compile PVR headers using material_flags */
     for (uint32_t m = 0; m < mesh_count; m++) {
         DMSMesh* mesh = &model->meshes[m];
-        pvr_poly_cxt_t cxt;
-
-        int alpha_mode   = mesh->material_flags & 0x3;
-        int tex_filter   = (mesh->material_flags >> 9) & 0x1;
-
-        int pvr_list;
-        if (alpha_mode == 0)      pvr_list = PVR_LIST_OP_POLY;
-        else if (alpha_mode == 1) pvr_list = PVR_LIST_PT_POLY;
-        else                      pvr_list = PVR_LIST_TR_POLY;
-
         int tid = mesh->texture_id;
 
         if (tid >= 0 && tid < (int)tex_count && model->textures[tid].ptr) {
             dttex_info_t* tex = &model->textures[tid];
-            pvr_poly_cxt_txr(&cxt, pvr_list,
-                             tex->pvrformat,
-                             tex->width, tex->height,
-                             tex->ptr,
-                             tex_filter ? PVR_FILTER_NONE : PVR_FILTER_BILINEAR);
+            dc_model_compile_header(mesh, &mesh->header, tex->pvrformat,
+                                    tex->width, tex->height, tex->ptr);
         } else {
-            pvr_poly_cxt_col(&cxt, pvr_list);
+            dc_model_compile_header(mesh, &mesh->header, 0, 0, 0, NULL);
         }
-
-        cxt.gen.culling = PVR_CULLING_NONE;
-
-        if (alpha_mode == 2) {
-            cxt.txr.env = PVR_TXRENV_MODULATEALPHA;
-            cxt.blend.src = PVR_BLEND_SRCALPHA;
-            cxt.blend.dst = PVR_BLEND_INVSRCALPHA;
-        }
-
-        pvr_poly_compile(&mesh->header, &cxt);
 
         if ((mesh->material_flags & DMS_MAT_METALLIC) && !model->skeleton &&
             !(mesh->material_flags & DMS_MAT_COLLISION_ONLY)) {
@@ -1284,6 +1276,39 @@ DMSModel* dc_model_load(const char* filename) {
 
     fclose(f);
     return model;
+}
+
+/* ================================================================
+ * Mesh header
+ * ================================================================ */
+
+void dc_model_compile_header(const DMSMesh* mesh, pvr_poly_hdr_t* out, int pvrformat,
+                             int width, int height, pvr_ptr_t txr) {
+    pvr_poly_cxt_t cxt;
+
+    int alpha_mode   = mesh->material_flags & 0x3;
+    int tex_filter   = (mesh->material_flags >> 9) & 0x1;
+
+    int pvr_list;
+    if (alpha_mode == 0)      pvr_list = PVR_LIST_OP_POLY;
+    else if (alpha_mode == 1) pvr_list = PVR_LIST_PT_POLY;
+    else                      pvr_list = PVR_LIST_TR_POLY;
+
+    if (txr)
+        pvr_poly_cxt_txr(&cxt, pvr_list, pvrformat, width, height, txr,
+                         tex_filter ? PVR_FILTER_NONE : PVR_FILTER_BILINEAR);
+    else
+        pvr_poly_cxt_col(&cxt, pvr_list);
+
+    cxt.gen.culling = PVR_CULLING_NONE;
+
+    if (alpha_mode == 2) {
+        cxt.txr.env = PVR_TXRENV_MODULATEALPHA;
+        cxt.blend.src = PVR_BLEND_SRCALPHA;
+        cxt.blend.dst = PVR_BLEND_INVSRCALPHA;
+    }
+
+    pvr_poly_compile(out, &cxt);
 }
 
 /* ================================================================
@@ -1301,6 +1326,7 @@ void dc_model_free(DMSModel* model) {
     free(model->meshes);
     free(model->blocks);
     free(model->runs);
+    free(model->material_names);
 
     if (model->textures) {
         for (int i = 0; i < model->texture_count; i++)

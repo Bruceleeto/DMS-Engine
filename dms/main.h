@@ -130,6 +130,7 @@ typedef struct {
     float        max_bind_radius;
     uint32_t     metallic_count;    /* meshes that reflect the environment */
     uint32_t     mirror_count;      /* of those, mirrors */
+    char       (*material_names)[32]; /* glTF material name of each mesh, or NULL */
 } DMSModel;
 
 /* ================================================================

@@ -3,6 +3,8 @@
 #include "dc_engine.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <malloc.h>
 
 #define DRAW_QUEUE_MAX 256
 
@@ -12,6 +14,7 @@ typedef enum { ENTRY_MODEL, ENTRY_CALL } EntryKind;
  * without the calls that fill it changing. */
 typedef struct {
     EntryKind       kind;
+    DCTarget*       target;     /* NULL for the screen */
     DMSModel*       model;
     const DCCamera* cam;
     shz_vec3_t      pos;
@@ -27,6 +30,7 @@ typedef struct {
 static DrawEntry       queue[DRAW_QUEUE_MAX];
 static int             queue_count;
 static const DCCamera* current_cam;
+static DCTarget*       current_target;
 
 static DrawEntry* queue_push(void) {
     if (queue_count >= DRAW_QUEUE_MAX) {
@@ -38,7 +42,9 @@ static DrawEntry* queue_push(void) {
         }
         return NULL;
     }
-    return &queue[queue_count++];
+    DrawEntry* e = &queue[queue_count++];
+    e->target = current_target;
+    return e;
 }
 
 static DrawEntry* queue_model(DMSModel* model, shz_vec3_t pos, float scale) {
@@ -92,6 +98,200 @@ void dc_draw_call(int pvr_list, void (*fn)(void* user), void* user) {
     e->call_user = user;
 }
 
+/* ================================================================
+ * Render targets
+ * ================================================================ */
+
+#define TARGET_WEARERS 16
+#define TARGETS_A_FRAME 8
+#define TARGET_QUADS 8
+#define TARGET_QUAD_DEPTH 50.0f     /* 1/w: in front of anything past 0.02 units */
+
+typedef struct {
+    DMSMesh*       mesh;
+    pvr_poly_hdr_t hdr[2] __attribute__((aligned(32)));   /* one per picture */
+} TargetWearer;
+
+struct DCTarget {
+    int       width, height;
+    pvr_ptr_t txr[2];
+    int       front;            /* the picture being shown; the other is drawn into */
+    int       wearer_count;
+    TargetWearer wearers[TARGET_WEARERS] __attribute__((aligned(32)));
+};
+
+static bool power_of_two(int n) { return n >= 8 && n <= 1024 && !(n & (n - 1)); }
+
+DCTarget* dc_target_create(int width, int height) {
+    if (!power_of_two(width) || !power_of_two(height)) {
+        printf("dc_target_create: %dx%d, sizes must be powers of two from 8 to 1024\n",
+               width, height);
+        return NULL;
+    }
+    DCTarget* t = memalign(32, sizeof(DCTarget));
+    if (!t) return NULL;
+    memset(t, 0, sizeof(*t));
+    t->width = width;
+    t->height = height;
+    for (int i = 0; i < 2; i++) {
+        t->txr[i] = pvr_mem_malloc(width * height * 2);
+        if (!t->txr[i]) {
+            /* Still a target, with no picture: what is drawn into it is
+             * dropped, not sent to the screen */
+            printf("dc_target_create: no VRAM for %dx%d (%luKB free)\n", width, height,
+                   (unsigned long)pvr_mem_available() / 1024);
+            if (t->txr[0]) pvr_mem_free(t->txr[0]);
+            t->txr[0] = t->txr[1] = NULL;
+            return t;
+        }
+        /* Black until first drawn */
+        memset(t->txr[i], 0, width * height * 2);
+    }
+    return t;
+}
+
+void dc_target_free(DCTarget* t) {
+    if (!t) return;
+    /* A scene still rendering may be reading or writing it */
+    pvr_wait_ready();
+    if (current_target == t) current_target = NULL;
+    for (int i = 0; i < 2; i++)
+        if (t->txr[i]) pvr_mem_free(t->txr[i]);
+    free(t);
+}
+
+void dc_set_target(DCTarget* target) {
+    current_target = target;
+}
+
+/* UVs for a flat mesh that has none: the picture across its bounds, as seen
+ * by someone facing it */
+static void flat_uvs(DMSMesh* mesh) {
+    if (!mesh->vertex_count) return;
+    /* No UVs in Blender comes out as one UV for every vertex (0,0, or 0,1 with
+     * v flipped) */
+    for (uint32_t i = 1; i < mesh->vertex_count; i++)
+        if (mesh->vertices[i].u != mesh->vertices[0].u ||
+            mesh->vertices[i].v != mesh->vertices[0].v) return;
+
+    shz_vec3_t n = shz_vec3_init(0.0f, 0.0f, 0.0f);
+    for (uint32_t i = 0; i < mesh->vertex_count; i++)
+        n = shz_vec3_add(n, shz_vec3_init(mesh->vertices[i].nx, mesh->vertices[i].ny,
+                                          mesh->vertices[i].nz));
+    if (shz_vec3_dot(n, n) < 1.0f) return;
+    n = shz_vec3_normalize(n);
+
+    /* A screen lying flat has its top towards -z */
+    shz_vec3_t world_up = (n.y > 0.9f || n.y < -0.9f) ? shz_vec3_init(0.0f, 0.0f, -1.0f)
+                                                      : shz_vec3_init(0.0f, 1.0f, 0.0f);
+    /* The engine draws x to the right when looking along +z (left handed), so
+     * someone facing the mesh has n x up on their right */
+    shz_vec3_t right = shz_vec3_normalize(shz_vec3_cross(n, world_up));
+    shz_vec3_t up = shz_vec3_cross(right, n);
+
+    float r0 = 1e30f, r1 = -1e30f, u0 = 1e30f, u1 = -1e30f;
+    for (uint32_t i = 0; i < mesh->vertex_count; i++) {
+        shz_vec3_t p = shz_vec3_init(mesh->vertices[i].x, mesh->vertices[i].y, mesh->vertices[i].z);
+        float r = shz_vec3_dot(p, right), u = shz_vec3_dot(p, up);
+        if (r < r0) r0 = r;
+        if (r > r1) r1 = r;
+        if (u < u0) u0 = u;
+        if (u > u1) u1 = u;
+    }
+    if (r1 - r0 < 1e-6f || u1 - u0 < 1e-6f) return;
+
+    for (uint32_t i = 0; i < mesh->vertex_count; i++) {
+        shz_vec3_t p = shz_vec3_init(mesh->vertices[i].x, mesh->vertices[i].y, mesh->vertices[i].z);
+        mesh->vertices[i].u = (shz_vec3_dot(p, right) - r0) / (r1 - r0);
+        mesh->vertices[i].v = 1.0f - (shz_vec3_dot(p, up) - u0) / (u1 - u0);
+    }
+}
+
+int dc_target_show_on(DCTarget* t, DMSModel* model, const char* material) {
+    if (!t || !model || !material) return 0;
+    if (!t->txr[0]) return 0;
+    if (!model->material_names) {
+        printf("dc_target_show_on: the model has no material names, reconvert it\n");
+        return 0;
+    }
+    int n = 0;
+    for (uint32_t m = 0; m < model->mesh_count; m++) {
+        DMSMesh* mesh = &model->meshes[m];
+        if (strncmp(model->material_names[m], material, 32) != 0) continue;
+        flat_uvs(mesh);
+        /* A screen gives off its own light: the picture as it is, not dimmed
+         * by the room's baked lighting */
+        for (uint32_t i = 0; i < mesh->vertex_count; i++)
+            mesh->vertices[i].argb |= 0x00ffffffu;
+        if (t->wearer_count >= TARGET_WEARERS) {
+            printf("dc_target_show_on: more than %d meshes on one target\n", TARGET_WEARERS);
+            break;
+        }
+        TargetWearer* w = &t->wearers[t->wearer_count++];
+        w->mesh = mesh;
+        for (int i = 0; i < 2; i++)
+            dc_model_compile_header(mesh, &w->hdr[i],
+                                    PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED,
+                                    t->width, t->height, t->txr[i]);
+        mesh->header = w->hdr[t->front];
+        n++;
+    }
+    if (!n) printf("dc_target_show_on: no mesh has the material \"%s\"\n", material);
+    return n;
+}
+
+/* The picture just drawn becomes the one shown */
+static void target_flip(DCTarget* t) {
+    t->front ^= 1;
+    for (int i = 0; i < t->wearer_count; i++)
+        t->wearers[i].mesh->header = t->wearers[i].hdr[t->front];
+}
+
+typedef struct {
+    DCTarget* target;
+    float x, y, w, h;
+} TargetQuad;
+
+static TargetQuad target_quads[TARGET_QUADS];
+static int        target_quad_count;
+
+static void target_quad_draw(void* user) {
+    const TargetQuad* q = (const TargetQuad*)user;
+    const DCTarget* t = q->target;
+    pvr_dr_state_t* dr = dc_dr_state();
+    (void)dr;   /* this KOS's pvr_dr_target() does not use it */
+
+    pvr_poly_cxt_t cxt;
+    pvr_poly_cxt_txr(&cxt, PVR_LIST_OP_POLY, PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED,
+                     t->width, t->height, t->txr[t->front], PVR_FILTER_BILINEAR);
+    cxt.gen.culling = PVR_CULLING_NONE;
+    pvr_poly_hdr_t* hdr = (pvr_poly_hdr_t*)pvr_dr_target(*dr);
+    pvr_poly_compile(hdr, &cxt);
+    pvr_dr_commit(hdr);
+
+    static const float corner[4][2] = {{0, 0}, {1, 0}, {0, 1}, {1, 1}};
+    for (int i = 0; i < 4; i++) {
+        pvr_vertex_t* v = (pvr_vertex_t*)pvr_dr_target(*dr);
+        v->flags = (i == 3) ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
+        v->x = q->x + corner[i][0] * q->w;
+        v->y = q->y + corner[i][1] * q->h;
+        v->z = TARGET_QUAD_DEPTH;
+        v->u = corner[i][0];
+        v->v = corner[i][1];
+        v->argb = 0xFFFFFFFF;
+        v->oargb = 0;
+        pvr_dr_commit(v);
+    }
+}
+
+void dc_draw_target(DCTarget* target, float x, float y, float width, float height) {
+    if (!target || !target->txr[0] || target_quad_count >= TARGET_QUADS) return;
+    TargetQuad* q = &target_quads[target_quad_count++];
+    q->target = target;
+    q->x = x; q->y = y; q->w = width; q->h = height;
+    dc_draw_call(PVR_LIST_OP_POLY, target_quad_draw, q);
+}
+
 /* Does the model have anything for this list? Saves a walk over its blocks. */
 static bool model_uses_list(const DMSModel* model, int pvr_list) {
     if (pvr_list == PVR_LIST_OP_POLY) return model->opaque_count != 0;
@@ -100,27 +300,70 @@ static bool model_uses_list(const DMSModel* model, int pvr_list) {
     return model->transparent_count != 0 || model->metallic_count != 0;
 }
 
-void dc_draw_flush(void) {
+/* Everything queued for one target (NULL: the screen), a list at a time */
+static void flush_scene(const DCTarget* target) {
     static const int lists[3] = { PVR_LIST_OP_POLY, PVR_LIST_TR_POLY, PVR_LIST_PT_POLY };
+
+    /* A camera is built for the screen. Into a target its picture is squeezed
+     * to the target's size: screen x and y are rows 1 and 2 of the matrix. */
+    alignas(32) DCCamera squeezed;
+    const DCCamera* squeezed_from = NULL;
+    float sx = target ? (float)target->width / SCR_W : 1.0f;
+    float sy = target ? (float)target->height / SCR_H : 1.0f;
 
     for (int l = 0; l < 3; l++) {
         for (int i = 0; i < queue_count; i++) {
             const DrawEntry* e = &queue[i];
+            if (e->target != target) continue;
             if (e->kind == ENTRY_CALL) {
                 if (e->call_list != lists[l]) continue;
                 dc_list_begin(lists[l]);
                 e->call_fn(e->call_user);
-            } else {
-                if (model_uses_list(e->model, lists[l])) {
-                    if (e->has_rot)
-                        dc_model_draw_list_oriented(e->model, e->pos, e->scale, e->rot,
-                                                    e->cam, lists[l]);
-                    else
-                        dc_model_draw_list_rotated(e->model, e->pos, e->scale, e->yaw,
-                                                   e->cam, lists[l]);
+            } else if (model_uses_list(e->model, lists[l])) {
+                const DCCamera* cam = e->cam;
+                if (target) {
+                    if (squeezed_from != cam) {
+                        squeezed = *cam;
+                        for (int c = 0; c < 4; c++) {
+                            squeezed._pv_matrix.elem2D[c][1] *= sx;
+                            squeezed._pv_matrix.elem2D[c][2] *= sy;
+                        }
+                        squeezed_from = cam;
+                    }
+                    cam = &squeezed;
                 }
+                if (e->has_rot)
+                    dc_model_draw_list_oriented(e->model, e->pos, e->scale, e->rot,
+                                                cam, lists[l]);
+                else
+                    dc_model_draw_list_rotated(e->model, e->pos, e->scale, e->yaw,
+                                               cam, lists[l]);
             }
         }
     }
+}
+
+void dc_draw_flush(void) {
+    /* Targets first, in the order they were first used, then the screen */
+    DCTarget* done[TARGETS_A_FRAME];
+    int done_count = 0;
+    for (int i = 0; i < queue_count; i++) {
+        DCTarget* t = queue[i].target;
+        if (!t) continue;
+        int seen = 0;
+        for (int d = 0; d < done_count; d++) seen |= done[d] == t;
+        if (seen || done_count >= TARGETS_A_FRAME) continue;
+        done[done_count++] = t;
+
+        if (!t->txr[0]) continue;
+        if (!dc_scene_begin_texture(t->txr[t->front ^ 1], t->width, t->height)) continue;
+        flush_scene(t);
+        dc_scene_end_texture();
+        target_flip(t);
+    }
+
+    flush_scene(NULL);
     queue_count = 0;
+    target_quad_count = 0;
+    current_target = NULL;
 }

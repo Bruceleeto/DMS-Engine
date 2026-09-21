@@ -41,6 +41,51 @@ typedef struct {
 
 void dc_draw_ex(DMSModel* model, const DCDrawOpts* opts);
 
+/* ================================================================
+ * Render targets
+ *
+ * A texture the engine draws into, for a screen inside the level, a mirror, a
+ * rear view. Pick it, draw into it like the screen, then go back:
+ *
+ *     dc_set_target(tv);                  // what follows goes into the texture
+ *     dc_set_camera(&security_cam);
+ *     dc_draw(world, origin);
+ *     dc_set_target(NULL);                // back to the screen
+ *     dc_set_camera(&camera);
+ *     dc_draw(world, origin);             // the TV model in it shows the texture
+ *
+ * Targets are drawn first at dc_frame_end(), so the screen shows this frame's
+ * picture. Inside a target, a model showing that same target has last frame's
+ * picture (a screen showing itself works). The picture is the camera's whole
+ * view squeezed to the texture, so a 4:3 screen in the level looks right.
+ * No alpha in the picture (the PVR renders RGB565).
+ * ================================================================ */
+
+typedef struct DCTarget DCTarget;
+
+/* width and height: powers of two, 8 to 1024. Costs width x height x 4 bytes
+ * of VRAM (two pictures: the one being drawn, the one being shown). With no
+ * VRAM left it says so and what is drawn into the target is dropped. Load the
+ * models first or not: either way works. */
+DCTarget* dc_target_create(int width, int height);
+
+/* Free the target before the models showing it */
+void dc_target_free(DCTarget* target);
+
+/* Draws that follow go into the target; NULL for the screen. Every frame
+ * starts on the screen. */
+void dc_set_target(DCTarget* target);
+
+/* Every mesh of the model with that material name (the name it has in
+ * Blender) shows the target from now on. Returns how many meshes that was.
+ * A mesh without UVs gets the picture stretched flat across it, upright and
+ * facing the way its normals point, so a plain rectangle is enough. */
+int dc_target_show_on(DCTarget* target, DMSModel* model, const char* material);
+
+/* The target as a flat picture on the screen (a rear view mirror, or to see
+ * what a target holds) */
+void dc_draw_target(DCTarget* target, float x, float y, float width, float height);
+
 /* Your own PVR drawing: fn runs at frame end with the given list open
  * (PVR_LIST_OP_POLY, PVR_LIST_TR_POLY or PVR_LIST_PT_POLY). */
 void dc_draw_call(int pvr_list, void (*fn)(void* user), void* user);

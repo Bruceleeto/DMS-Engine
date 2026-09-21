@@ -118,6 +118,18 @@ Credits:
 - Model: [[Free] Ugandan Tails](https://sketchfab.com/3d-models/free-ugandan-tails-cd6dca09d7ed4838b6c0d71c5adc448c)
   by [LuAnton](https://sketchfab.com/LuAnton)
 
+### projector
+
+![projector](projector/resources/example.png)
+
+First-person walk through a room with a TV that shows the room live, from a
+camera turning on the projector (render to texture). The TV's screen is a
+plain rectangle with a material named `RTT_effect`; one call puts the picture
+on it.
+
+Credits:
+- Room, TV, projector, table: to add
+
 ## Blender settings
 
 Export as `.glb`. The converter reads these from the material (Principled
@@ -154,3 +166,26 @@ dc_set_environment(environment);
 
 `make assets` turns `assets/<dir>/<name>.png` into the `.dt`. Without the
 `dc_set_environment` call, metallic materials draw as normal. See `vase`.
+
+### Screens (render to texture)
+
+Give the screen its own material in Blender, with any name. It needs no
+texture and no UVs: a flat rectangle gets the picture stretched across it,
+upright, and at full brightness. In the example, make a target, put it on the
+material, then draw into it like the screen:
+
+```c
+DCTarget* tv = dc_target_create(256, 256);
+dc_target_show_on(tv, world, "RTT_effect");
+
+/* every frame */
+dc_set_target(tv);                 /* what follows goes into the TV's picture */
+dc_set_camera(&security_cam);
+dc_draw(world, origin);
+dc_set_target(NULL);               /* back to the screen */
+dc_set_camera(&camera);
+dc_draw(world, origin);
+```
+
+What is drawn into a target is drawn a second time, and a 256x256 target takes
+256KB of VRAM.

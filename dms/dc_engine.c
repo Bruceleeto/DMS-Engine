@@ -27,6 +27,8 @@ static struct {
     pvr_dr_state_t dr_state;
     int  current_list;       /* currently open PVR list, or -1 */
     bool scene_active;
+    bool list_opened;        /* a list was opened in the scene being built */
+    float render_w, render_h;   /* size of what is being drawn into */
 
     /* Frame statistics, summed over PROF_INTERVAL frames then averaged */
     uint64_t frame_start_ns;
@@ -104,6 +106,9 @@ void dc_frame_begin(void) {
     pvr_scene_begin();
     g_engine.current_list = -1;
     g_engine.scene_active = true;
+    g_engine.list_opened = false;
+    g_engine.render_w = SCR_W;
+    g_engine.render_h = SCR_H;
 }
 
 /* Add this frame to the running sums; every PROF_INTERVAL frames turn them
@@ -243,9 +248,47 @@ pvr_dr_state_t* dc_list_begin(int pvr_list) {
 
     /* Open new list */
     pvr_list_begin(pvr_list);
+    g_engine.list_opened = true;
     g_engine.current_list = pvr_list;
 
     return &g_engine.dr_state;
+}
+
+bool dc_scene_begin_texture(pvr_ptr_t txr, int w, int h) {
+    /* The screen scene was begun by dc_frame_begin(). It can only be put off
+     * while nothing has gone into it */
+    if (g_engine.list_opened) {
+        static bool warned;
+        if (!warned) {
+            printf("DMS: a render target cannot be drawn after drawing to the screen "
+                   "by hand in the same frame\n");
+            warned = true;
+        }
+        return false;
+    }
+    if (pvr_scene_begin_rtt(txr, w, h, w) < 0) return false;
+    g_engine.current_list = -1;
+    g_engine.render_w = (float)w;
+    g_engine.render_h = (float)h;
+    return true;
+}
+
+void dc_scene_end_texture(void) {
+    dc_list_finish();
+    pvr_scene_finish();
+
+    /* Back to the screen. No wait: KOS renders the texture before the scene
+     * that uses it */
+    pvr_scene_begin();
+    g_engine.current_list = -1;
+    g_engine.list_opened = false;
+    g_engine.render_w = SCR_W;
+    g_engine.render_h = SCR_H;
+}
+
+void dc_render_size(float* w, float* h) {
+    *w = g_engine.render_w;
+    *h = g_engine.render_h;
 }
 
 void dc_list_finish(void) {

@@ -103,12 +103,16 @@ static void background_draw(void* user) {
     pvr_poly_compile(hdr, &cxt);
     pvr_dr_commit(hdr);
 
+    /* The screen, or the render target being drawn into */
+    float rw, rh;
+    dc_render_size(&rw, &rh);
+
     static const float corner[4][2] = {{0, 0}, {1, 0}, {0, 1}, {1, 1}};
     for (int i = 0; i < 4; i++) {
         pvr_vertex_t* v = (pvr_vertex_t*)pvr_dr_target(*dr);
         v->flags = (i == 3) ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
-        v->x = corner[i][0] * 640.0f;
-        v->y = corner[i][1] * 480.0f;
+        v->x = corner[i][0] * rw;
+        v->y = corner[i][1] * rh;
         v->z = BACKGROUND_DEPTH;
         v->u = corner[i][0];
         v->v = corner[i][1];

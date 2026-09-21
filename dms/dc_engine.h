@@ -92,6 +92,14 @@ pvr_dr_state_t* dc_list_begin(int pvr_list);
 /* Finish the currently open list (if any). */
 void dc_list_finish(void);
 
+/* Engine use (the draw queue): draw a scene into a texture (RGB565, not
+ * twiddled, w by h) before the screen's scene. Returns false if it cannot. */
+bool dc_scene_begin_texture(pvr_ptr_t txr, int w, int h);
+void dc_scene_end_texture(void);
+
+/* Size in pixels of what is being drawn into: the screen, or a render target */
+void dc_render_size(float* w, float* h);
+
 /* Get current DR state (only valid between dc_list_begin and dc_list_finish). */
 pvr_dr_state_t* dc_dr_state(void);
 
