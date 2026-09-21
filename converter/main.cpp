@@ -2680,73 +2680,79 @@ static void BuildBVH() {
     printf("BVH built: %zu nodes, %zu tri refs\n", g_bvh.size(), g_bvhTriIdx.size());
 }
 
+/* Calls fn(i0, i1, i2) for every triangle of a mesh. The index list holds the
+ * strips first (stripLengths), then loose triangles, three indices each. */
+template <class F> static void ForEachMeshTriangle(const Mesh *mesh, F fn) {
+  if (!mesh->indices || mesh->indexCount < 3)
+    return;
+  const uint32_t vc = (uint32_t)mesh->vertexCount;
+  auto tri = [&](uint32_t i0, uint32_t i1, uint32_t i2) {
+    /* Strips repeat vertices to turn corners: skip those empty triangles */
+    if (i0 < vc && i1 < vc && i2 < vc && i0 != i1 && i1 != i2 && i0 != i2)
+      fn(i0, i1, i2);
+  };
+
+  int pos = 0;
+  for (int s = 0; s < mesh->stripCount && mesh->stripLengths; s++) {
+    int len = (int)mesh->stripLengths[s];
+    if (pos + len > mesh->indexCount)
+      break;
+    for (int k = 0; k + 2 < len; k++) {
+      uint32_t i0 = mesh->indices[pos + k];
+      uint32_t i1 = mesh->indices[pos + k + 1];
+      uint32_t i2 = mesh->indices[pos + k + 2];
+      if (k & 1)
+        std::swap(i0, i1);      /* every other triangle of a strip is wound backwards */
+      tri(i0, i1, i2);
+    }
+    pos += len;
+  }
+  for (; pos + 2 < mesh->indexCount; pos += 3)
+    tri(mesh->indices[pos], mesh->indices[pos + 1], mesh->indices[pos + 2]);
+}
+
 void BuildRTScene(const Model *model) {
   g_rtTriangles.clear();
   for (int m = 0; m < model->meshCount; m++) {
     const Mesh *mesh = &model->meshes[m];
-    if (!mesh->indices || mesh->indexCount < 3)
-      continue;
-
-    int i = 0;
-    while (i < mesh->indexCount) {
-      uint32_t rawIndex = mesh->indices[i];
-      bool isStrip = (rawIndex & 0x80000000) != 0;
-
-      if (isStrip) {
-        uint32_t sId = (rawIndex >> 24) & 0x7F;
-        int stripStart = i;
-
-        while (i < mesh->indexCount && (mesh->indices[i] & 0x80000000) &&
-               ((mesh->indices[i] >> 24) & 0x7F) == sId) {
-          i++;
-        }
-        int stripLen = i - stripStart;
-
-        for (int j = 0; j < stripLen - 2; j++) {
-          uint32_t i0 = mesh->indices[stripStart + j] & 0x00FFFFFF;
-          uint32_t i1 = mesh->indices[stripStart + j + 1] & 0x00FFFFFF;
-          uint32_t i2 = mesh->indices[stripStart + j + 2] & 0x00FFFFFF;
-
-          if (j & 1)
-            std::swap(i0, i1);
-
-          if (i0 < (uint32_t)mesh->vertexCount &&
-              i1 < (uint32_t)mesh->vertexCount &&
-              i2 < (uint32_t)mesh->vertexCount) {
-            const Vertex &v0 = mesh->vertices[i0];
-            const Vertex &v1 = mesh->vertices[i1];
-            const Vertex &v2 = mesh->vertices[i2];
-            g_rtTriangles.push_back(
-                {v0.x, v0.y, v0.z, v1.x, v1.y, v1.z, v2.x, v2.y, v2.z});
-          }
-        }
-      } else {
-        if (i + 2 < mesh->indexCount) {
-          uint32_t i0 = mesh->indices[i] & 0x00FFFFFF;
-          uint32_t i1 = mesh->indices[i + 1] & 0x00FFFFFF;
-          uint32_t i2 = mesh->indices[i + 2] & 0x00FFFFFF;
-
-          if (i0 < (uint32_t)mesh->vertexCount &&
-              i1 < (uint32_t)mesh->vertexCount &&
-              i2 < (uint32_t)mesh->vertexCount) {
-            const Vertex &v0 = mesh->vertices[i0];
-            const Vertex &v1 = mesh->vertices[i1];
-            const Vertex &v2 = mesh->vertices[i2];
-            g_rtTriangles.push_back(
-                {v0.x, v0.y, v0.z, v1.x, v1.y, v1.z, v2.x, v2.y, v2.z});
-          }
-        }
-        i += 3;
-      }
-    }
+    ForEachMeshTriangle(mesh, [&](uint32_t i0, uint32_t i1, uint32_t i2) {
+      const Vertex &v0 = mesh->vertices[i0];
+      const Vertex &v1 = mesh->vertices[i1];
+      const Vertex &v2 = mesh->vertices[i2];
+      g_rtTriangles.push_back(
+          {v0.x, v0.y, v0.z, v1.x, v1.y, v1.z, v2.x, v2.y, v2.z});
+    });
   }
   printf("Built RT scene: %zu triangles\n", g_rtTriangles.size());
   BuildBVH();
 }
 
+/* Average length of the edges meeting at each vertex. The bake uses it to tell
+ * a vertex's own neighbouring faces from real occluders. */
+static std::vector<float> MeshVertexEdgeLengths(const Mesh *mesh) {
+  std::vector<float> sum(mesh->vertexCount, 0.0f);
+  std::vector<int> count(mesh->vertexCount, 0);
+  auto edge = [&](uint32_t a, uint32_t b) {
+    const Vertex &va = mesh->vertices[a], &vb = mesh->vertices[b];
+    float dx = va.x - vb.x, dy = va.y - vb.y, dz = va.z - vb.z;
+    float len = sqrtf(dx * dx + dy * dy + dz * dz);
+    sum[a] += len; count[a]++;
+    sum[b] += len; count[b]++;
+  };
+  ForEachMeshTriangle(mesh, [&](uint32_t i0, uint32_t i1, uint32_t i2) {
+    edge(i0, i1);
+    edge(i1, i2);
+    edge(i2, i0);
+  });
+  for (int i = 0; i < mesh->vertexCount; i++)
+    sum[i] = count[i] ? sum[i] / count[i] : 0.0f;
+  return sum;
+}
+
 static inline bool RayTriHit(const std::array<float,9>& tri,
                               float ox, float oy, float oz,
-                              float dx, float dy, float dz, float maxDist) {
+                              float dx, float dy, float dz, float maxDist,
+                              float minDist) {
     float e1x = tri[3]-tri[0], e1y = tri[4]-tri[1], e1z = tri[5]-tri[2];
     float e2x = tri[6]-tri[0], e2y = tri[7]-tri[1], e2z = tri[8]-tri[2];
     float hx = dy*e2z - dz*e2y, hy = dz*e2x - dx*e2z, hz = dx*e2y - dy*e2x;
@@ -2760,11 +2766,12 @@ static inline bool RayTriHit(const std::array<float,9>& tri,
     float v = f * (dx*qx + dy*qy + dz*qz);
     if (v < 0.0f || u+v > 1.0f) return false;
     float t = f * (e2x*qx + e2y*qy + e2z*qz);
-    return (t > 1e-4f && t < maxDist);
+    return (t > minDist && t < maxDist);
 }
 
+/* Hits nearer than minDist are ignored */
 bool RayHit(float ox, float oy, float oz, float dx, float dy, float dz,
-            float maxDist) {
+            float maxDist, float minDist = 1e-4f) {
   if (!g_bvhBuilt) return false;
 
   float idx = 1.0f / (fabsf(dx) > 1e-8f ? dx : (dx >= 0 ? 1e-8f : -1e-8f));
@@ -2783,7 +2790,7 @@ bool RayHit(float ox, float oy, float oz, float dx, float dy, float dz,
       /* Leaf */
       for (int i = 0; i < node.triCount; i++) {
         if (RayTriHit(g_rtTriangles[g_bvhTriIdx[node.triStart + i]],
-                      ox, oy, oz, dx, dy, dz, maxDist))
+                      ox, oy, oz, dx, dy, dz, maxDist, minDist))
           return true;
       }
     } else {
@@ -2794,47 +2801,109 @@ bool RayHit(float ox, float oy, float oz, float dx, float dy, float dz,
   return false;
 }
 
+/* Bake sample counts. Offline only, so these can be generous. */
+#define BAKE_AO_SAMPLES     256
+#define BAKE_SHADOW_SAMPLES 64
+#define BAKE_SUN_SPREAD     0.10f   /* tan of the key light's half angle: soft edges */
+#define BAKE_SELF_DIST_MAX  0.25f   /* never ignore occluders further away than this */
+
+/* A repeatable 0..1 value from a position. Sample patterns are turned by it, so
+ * two vertices at the same place (a seam between meshes) bake exactly alike. */
+static float BakeHash(float x, float y, float z) {
+  uint32_t h = 2166136261u;
+  float f[3] = {x, y, z};
+  for (int i = 0; i < 3; i++) {
+    uint32_t bits;
+    memcpy(&bits, &f[i], 4);
+    if (bits == 0x80000000u) bits = 0;   /* -0 and +0 are the same place */
+    h = (h ^ bits) * 16777619u;
+    h ^= h >> 15;
+  }
+  return (float)(h & 0xFFFFFF) / (float)0x1000000;
+}
+
+/* Two unit vectors at right angles to n */
+static void BakeFrame(float nx, float ny, float nz, float *t, float *b) {
+  float upX = (fabsf(nx) < 0.9f) ? 1.0f : 0.0f,
+        upY = (fabsf(nx) < 0.9f) ? 0.0f : 1.0f;
+  t[0] = upY * nz; t[1] = -upX * nz; t[2] = upX * ny - upY * nx;
+  float tlen = sqrtf(t[0] * t[0] + t[1] * t[1] + t[2] * t[2]);
+  t[0] /= tlen; t[1] /= tlen; t[2] /= tlen;
+  b[0] = ny * t[2] - nz * t[1];
+  b[1] = nz * t[0] - nx * t[2];
+  b[2] = nx * t[1] - ny * t[0];
+}
+
+/* selfDist: hits nearer than this are the vertex's own neighbouring faces */
 float ComputeAO(float px, float py, float pz, float nx, float ny, float nz,
-                int samples) {
-  thread_local std::mt19937 rng(12345 + omp_get_thread_num());
-  thread_local std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-
+                int samples, float bias, float selfDist) {
   float ao = 0.0f;
-  float bias = 0.001f;
   float maxDist = 2.0f; // AO radius
+  float t[3], b[3];
+  BakeFrame(nx, ny, nz, t, b);
+  float turn = 6.283185f * BakeHash(px, py, pz);
 
+  /* Cosine weighted hemisphere, evenly spread (golden angle spiral) */
   for (int i = 0; i < samples; i++) {
-    float u1 = dist(rng), u2 = dist(rng);
-    float r = sqrtf(u1), theta = 6.283185f * u2;
+    float u1 = (i + 0.5f) / samples;
+    float r = sqrtf(u1), theta = turn + 2.399963f * i;
     float lx = r * cosf(theta), ly = r * sinf(theta), lz = sqrtf(1.0f - u1);
 
-    // Build tangent frame
-    float upX = (fabsf(nx) < 0.9f) ? 1.0f : 0.0f,
-          upY = (fabsf(nx) < 0.9f) ? 0.0f : 1.0f;
-    float tx = upY * nz, ty = -upX * nz, tz = upX * ny - upY * nx;
-    float tlen = sqrtf(tx * tx + ty * ty + tz * tz);
-    tx /= tlen;
-    ty /= tlen;
-    tz /= tlen;
-    float bx = ny * tz - nz * ty, by = nz * tx - nx * tz,
-          bz = nx * ty - ny * tx;
-
-    float dx = lx * tx + ly * bx + lz * nx;
-    float dy = lx * ty + ly * by + lz * ny;
-    float dz = lx * tz + ly * bz + lz * nz;
+    float dx = lx * t[0] + ly * b[0] + lz * nx;
+    float dy = lx * t[1] + ly * b[1] + lz * ny;
+    float dz = lx * t[2] + ly * b[2] + lz * nz;
 
     if (!RayHit(px + nx * bias, py + ny * bias, pz + nz * bias, dx, dy, dz,
-                maxDist))
+                maxDist, selfDist))
       ao += 1.0f;
   }
   return ao / samples;
 }
 
+/* How much of the key light reaches a point, 0..1. The light is a small disc,
+ * not a point, so shadow edges are soft and do not flip from vertex to vertex. */
+static float ComputeKeyShadow(float px, float py, float pz, float nx, float ny,
+                              float nz, float lx, float ly, float lz,
+                              float bias, float selfDist) {
+  float t[3], b[3];
+  BakeFrame(lx, ly, lz, t, b);
+  float turn = 6.283185f * BakeHash(pz, px, py);
+  float ox = px + nx * bias, oy = py + ny * bias, oz = pz + nz * bias;
+
+  int lit = 0, used = 0;
+  for (int i = 0; i < BAKE_SHADOW_SAMPLES; i++) {
+    float r = BAKE_SUN_SPREAD * sqrtf((i + 0.5f) / BAKE_SHADOW_SAMPLES);
+    float theta = turn + 2.399963f * i;
+    float dx = lx + (t[0] * cosf(theta) + b[0] * sinf(theta)) * r;
+    float dy = ly + (t[1] * cosf(theta) + b[1] * sinf(theta)) * r;
+    float dz = lz + (t[2] * cosf(theta) + b[2] * sinf(theta)) * r;
+    float len = sqrtf(dx * dx + dy * dy + dz * dz);
+    dx /= len; dy /= len; dz /= len;
+
+    /* Part of the disc below the surface's own horizon: not a shadow */
+    if (dx * nx + dy * ny + dz * nz <= 0.0f)
+      continue;
+    used++;
+    if (!RayHit(ox, oy, oz, dx, dy, dz, 100.0f, selfDist))
+      lit++;
+  }
+  return used ? (float)lit / used : 0.0f;
+}
+
+/* edgeLen: average length of the edges at this vertex */
 LitColor CalculateVertexLighting(float px, float py, float pz, float nx,
-                                 float ny, float nz, uint8_t baseR,
-                                 uint8_t baseG, uint8_t baseB, uint8_t vertR,
-                                 uint8_t vertG, uint8_t vertB) {
-  float ao = ComputeAO(px, py, pz, nx, ny, nz, 64);
+                                 float ny, float nz, float edgeLen,
+                                 uint8_t baseR, uint8_t baseG, uint8_t baseB,
+                                 uint8_t vertR, uint8_t vertG, uint8_t vertB) {
+  /* On a smooth surface the vertex normal is not any face's normal, so a ray
+   * leaving a vertex can clip the faces right next to it and shadow itself in
+   * speckles. Start the ray clear of the surface and ignore hits within about
+   * one edge length. Both follow the mesh's own detail, not a fixed size. */
+  float bias = fmaxf(0.001f, edgeLen * 0.02f);
+  float selfDist = fminf(edgeLen * 0.75f, BAKE_SELF_DIST_MAX);
+  if (selfDist < 1e-4f) selfDist = 1e-4f;
+
+  float ao = ComputeAO(px, py, pz, nx, ny, nz, BAKE_AO_SAMPLES, bias, selfDist);
 
   // Key light
   float keyX = 0.4f, keyY = 0.8f, keyZ = 0.4f;
@@ -2842,15 +2911,19 @@ LitColor CalculateVertexLighting(float px, float py, float pz, float nx,
   keyX /= klen;
   keyY /= klen;
   keyZ /= klen;
-  float keyNdotL = fmaxf(0.0f, nx * keyX + ny * keyY + nz * keyZ);
+  float keyDot = nx * keyX + ny * keyY + nz * keyZ;
+  float keyNdotL = fmaxf(0.0f, keyDot);
   float keyWrap = (keyNdotL + 0.5f) / 1.5f;
   keyWrap *= keyWrap;
 
-  // Key light shadow
-  float shadow = RayHit(px + nx * 0.001f, py + ny * 0.001f, pz + nz * 0.001f,
-                        keyX, keyY, keyZ, 100.0f)
-                     ? 0.3f
-                     : 1.0f;
+  // Key light shadow. Surfaces turned away from the light are in their own
+  // shadow; fade into that across the terminator so there is no hard line.
+  float facing = fminf(1.0f, fmaxf(0.0f, keyDot / 0.25f));
+  facing = facing * facing * (3.0f - 2.0f * facing);
+  float reach = facing > 0.0f ? ComputeKeyShadow(px, py, pz, nx, ny, nz, keyX, keyY,
+                                                 keyZ, bias, selfDist)
+                              : 0.0f;
+  float shadow = 0.3f + 0.7f * reach * facing;
 
   // Fill light
   float fillX = -0.5f, fillY = 0.3f, fillZ = -0.3f;
@@ -3045,6 +3118,7 @@ void ExportTristrippedModel(const Model *model, const char *filename,
     if (bakeLighting) {
       printf("    Computing lighting (%d threads)...", omp_get_max_threads());
       fflush(stdout);
+      std::vector<float> edgeLen = MeshVertexEdgeLengths(mesh);
       #pragma omp parallel for schedule(dynamic, 64)
       for (int i = 0; i < mesh->vertexCount; i++) {
         Vertex *v = &mesh->vertices[i];
@@ -3052,8 +3126,8 @@ void ExportTristrippedModel(const Model *model, const char *filename,
         float vny = v->ny / 127.0f;
         float vnz = v->nz / 127.0f;
         LitColor lit =
-            CalculateVertexLighting(v->x, v->y, v->z, vnx, vny, vnz, baseR, baseG,
-                                    baseB, v->r, v->g, v->b);
+            CalculateVertexLighting(v->x, v->y, v->z, vnx, vny, vnz, edgeLen[i],
+                                    baseR, baseG, baseB, v->r, v->g, v->b);
         v->r = lit.r;
         v->g = lit.g;
         v->b = lit.b;
