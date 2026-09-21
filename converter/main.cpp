@@ -117,6 +117,11 @@ std::vector<std::vector<uint32_t>> g_raw_strips;
 std::vector<uint32_t> g_loose_triangles;
 std::vector<std::array<float, 9>> g_rtTriangles; // v0, v1, v2 packed
 
+/* What the bake needs to know about materials. Meshes are merged by texture and
+ * material colour, so those two are the key. */
+static std::map<int, std::array<float, 3>> g_texAverage;   /* textureId -> average colour */
+static std::map<std::pair<int, uint32_t>, std::array<float, 3>> g_emissive;
+
 bool LoadGLTF(const char *filename);
 void Cleanup(void);
 void optimize_mesh();
@@ -551,6 +556,42 @@ static int CgltfImageAlphaKind(cgltf_image *img, const char *inputDir) {
     }
     cache[img] = kind;
     return kind;
+}
+
+/* Average colour of an image, 0..1, see-through pixels left out. The bake uses
+ * it as the colour a textured surface bounces. */
+static bool CgltfImageAverage(cgltf_image *img, const char *inputDir, float *rgb) {
+    static std::map<cgltf_image *, std::array<float, 4>> cache;
+    auto it = cache.find(img);
+    if (it == cache.end()) {
+        int w, h, n;
+        unsigned char *px = NULL;
+        if (img->buffer_view) {
+            const stbi_uc *p = (const stbi_uc *)img->buffer_view->buffer->data
+                               + img->buffer_view->offset;
+            px = stbi_load_from_memory(p, (int)img->buffer_view->size, &w, &h, &n, 4);
+        } else if (img->uri && strncmp(img->uri, "data:", 5) != 0) {
+            char path[512];
+            snprintf(path, sizeof(path), "%s/%s", inputDir, img->uri);
+            px = stbi_load(path, &w, &h, &n, 4);
+        }
+        std::array<float, 4> avg = {1.0f, 1.0f, 1.0f, 0.0f};
+        if (px) {
+            double sum[3] = {0, 0, 0}, weight = 0;
+            for (size_t i = 0, count = (size_t)w * h; i < count; i++) {
+                double a = px[i * 4 + 3] / 255.0;
+                sum[0] += px[i * 4] * a; sum[1] += px[i * 4 + 1] * a; sum[2] += px[i * 4 + 2] * a;
+                weight += a;
+            }
+            stbi_image_free(px);
+            if (weight > 0)
+                avg = {(float)(sum[0] / weight / 255.0), (float)(sum[1] / weight / 255.0),
+                       (float)(sum[2] / weight / 255.0), 1.0f};
+        }
+        it = cache.insert({img, avg}).first;
+    }
+    rgb[0] = it->second[0]; rgb[1] = it->second[1]; rgb[2] = it->second[2];
+    return it->second[3] != 0.0f;
 }
 
 void ExtractAndConvertTextures(cgltf_data *data, const char *inputFilename) {
@@ -1595,6 +1636,39 @@ bool LoadGLTF(const char *filename) {
                   dstMesh->alphaMode = 2;
                 }
               }
+            }
+          }
+
+          /* For the bake: the colour the surface bounces, and any glow */
+          {
+            char srcDir[256] = ".";
+            strncpy(srcDir, filename, sizeof(srcDir) - 1);
+            char *sl = strrchr(srcDir, '/');
+            if (!sl) sl = strrchr(srcDir, '\\');
+            if (sl) *sl = '\0'; else strcpy(srcDir, ".");
+
+            float avg[3];
+            if (dstMesh->textureId >= 0 &&
+                CgltfImageAverage(&data->images[dstMesh->textureId], srcDir, avg))
+            {
+              if (!g_texAverage.count(dstMesh->textureId))
+                printf("Texture %d average colour: %.2f %.2f %.2f\n", dstMesh->textureId,
+                       avg[0], avg[1], avg[2]);
+              g_texAverage[dstMesh->textureId] = {avg[0], avg[1], avg[2]};
+            }
+
+            float strength = mat->has_emissive_strength
+                                 ? mat->emissive_strength.emissive_strength : 1.0f;
+            float e[3] = {mat->emissive_factor[0] * strength,
+                          mat->emissive_factor[1] * strength,
+                          mat->emissive_factor[2] * strength};
+            if (mat->emissive_texture.texture && mat->emissive_texture.texture->image &&
+                CgltfImageAverage(mat->emissive_texture.texture->image, srcDir, avg)) {
+              e[0] *= avg[0]; e[1] *= avg[1]; e[2] *= avg[2];
+            }
+            if (e[0] + e[1] + e[2] > 0.01f) {
+              g_emissive[{dstMesh->textureId, dstMesh->materialColor}] = {e[0], e[1], e[2]};
+              printf("Mesh %d material glows: %.2f %.2f %.2f\n", meshIndex, e[0], e[1], e[2]);
             }
           }
 
@@ -2711,61 +2785,131 @@ template <class F> static void ForEachMeshTriangle(const Mesh *mesh, F fn) {
     tri(mesh->indices[pos], mesh->indices[pos + 1], mesh->indices[pos + 2]);
 }
 
+/* AO radius: this part of the model's size, but at most this many average edges */
+#define BAKE_AO_SIZE_PART   0.04f
+#define BAKE_AO_EDGE_PART   6.0f
+
+/* One triangle of the ray scene, as the bake sees it */
+struct BakeTri {
+  int mesh;
+  uint32_t i[3];       /* vertices in that mesh */
+  float n[3];          /* face normal, on the side the vertex normals point */
+  float area;
+  float edge;          /* average edge length */
+  float albedo[3];     /* colour it bounces: material x average texture x vertex colour */
+  float emit[3];       /* light it gives off */
+};
+static std::vector<BakeTri> g_bakeTris;                   /* same order as g_rtTriangles */
+static std::vector<std::array<float, 3>> g_bakeTriLight;  /* light leaving each triangle */
+static float g_bakeAORadius = 2.0f;
+
 void BuildRTScene(const Model *model) {
   g_rtTriangles.clear();
+  g_bakeTris.clear();
+  float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+  double edgeSum = 0, areaSum = 0;
+
   for (int m = 0; m < model->meshCount; m++) {
     const Mesh *mesh = &model->meshes[m];
+    if (mesh->collisionOnly)
+      continue;                 /* never drawn, so it casts no shadow either */
+
+    float base[3] = {((mesh->materialColor >> 16) & 0xFF) / 255.0f,
+                     ((mesh->materialColor >> 8) & 0xFF) / 255.0f,
+                     (mesh->materialColor & 0xFF) / 255.0f};
+    auto tex = g_texAverage.find(mesh->textureId);
+    if (tex != g_texAverage.end())
+      for (int c = 0; c < 3; c++) base[c] *= tex->second[c];
+    float emit[3] = {0, 0, 0};
+    auto glow = g_emissive.find({mesh->textureId, mesh->materialColor});
+    if (glow != g_emissive.end())
+      for (int c = 0; c < 3; c++) emit[c] = glow->second[c];
+
     ForEachMeshTriangle(mesh, [&](uint32_t i0, uint32_t i1, uint32_t i2) {
-      const Vertex &v0 = mesh->vertices[i0];
-      const Vertex &v1 = mesh->vertices[i1];
-      const Vertex &v2 = mesh->vertices[i2];
-      g_rtTriangles.push_back(
-          {v0.x, v0.y, v0.z, v1.x, v1.y, v1.z, v2.x, v2.y, v2.z});
+      const Vertex *v[3] = {&mesh->vertices[i0], &mesh->vertices[i1], &mesh->vertices[i2]};
+      float e1[3] = {v[1]->x - v[0]->x, v[1]->y - v[0]->y, v[1]->z - v[0]->z};
+      float e2[3] = {v[2]->x - v[0]->x, v[2]->y - v[0]->y, v[2]->z - v[0]->z};
+      float e3[3] = {v[2]->x - v[1]->x, v[2]->y - v[1]->y, v[2]->z - v[1]->z};
+      float n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2],
+                    e1[0] * e2[1] - e1[1] * e2[0]};
+      float len = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+      if (len < 1e-12f)
+        return;
+
+      BakeTri t;
+      t.mesh = m;
+      t.i[0] = i0; t.i[1] = i1; t.i[2] = i2;
+      t.area = len * 0.5f;
+      t.edge = (sqrtf(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2]) +
+                sqrtf(e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2]) +
+                sqrtf(e3[0] * e3[0] + e3[1] * e3[1] + e3[2] * e3[2])) / 3.0f;
+      /* Mirrored models wind backwards: trust the vertex normals for the side */
+      float side = 0;
+      for (int k = 0; k < 3; k++)
+        side += n[0] * v[k]->nx + n[1] * v[k]->ny + n[2] * v[k]->nz;
+      float flip = side < 0 ? -1.0f : 1.0f;
+      for (int c = 0; c < 3; c++) t.n[c] = n[c] / len * flip;
+      float vc[3] = {(v[0]->r + v[1]->r + v[2]->r) / 765.0f,
+                     (v[0]->g + v[1]->g + v[2]->g) / 765.0f,
+                     (v[0]->b + v[1]->b + v[2]->b) / 765.0f};
+      for (int c = 0; c < 3; c++) {
+        t.albedo[c] = base[c] * vc[c];
+        t.emit[c] = emit[c];
+      }
+      g_bakeTris.push_back(t);
+      g_rtTriangles.push_back({v[0]->x, v[0]->y, v[0]->z, v[1]->x, v[1]->y, v[1]->z,
+                               v[2]->x, v[2]->y, v[2]->z});
+      for (int k = 0; k < 3; k++) {
+        float p[3] = {v[k]->x, v[k]->y, v[k]->z};
+        for (int c = 0; c < 3; c++) {
+          lo[c] = fminf(lo[c], p[c]);
+          hi[c] = fmaxf(hi[c], p[c]);
+        }
+      }
+      edgeSum += (double)t.edge * t.area;
+      areaSum += t.area;
     });
   }
   printf("Built RT scene: %zu triangles\n", g_rtTriangles.size());
+
+  /* How far ambient occlusion looks. A fixed distance is wrong for anything not
+   * built at the scale it was tuned on, so take it from the model: a slice of
+   * its size, but no more than a few polygons across on a big open level. */
+  if (areaSum > 0) {
+    float diag = sqrtf((hi[0] - lo[0]) * (hi[0] - lo[0]) + (hi[1] - lo[1]) * (hi[1] - lo[1]) +
+                       (hi[2] - lo[2]) * (hi[2] - lo[2]));
+    float meanEdge = (float)(edgeSum / areaSum);
+    g_bakeAORadius = fminf(diag * BAKE_AO_SIZE_PART, meanEdge * BAKE_AO_EDGE_PART);
+    printf("AO radius %.3f (model size %.2f, average edge %.3f)\n", g_bakeAORadius, diag,
+           meanEdge);
+  }
   BuildBVH();
 }
 
-/* Average length of the edges meeting at each vertex. The bake uses it to tell
- * a vertex's own neighbouring faces from real occluders. */
-static std::vector<float> MeshVertexEdgeLengths(const Mesh *mesh) {
-  std::vector<float> sum(mesh->vertexCount, 0.0f);
-  std::vector<int> count(mesh->vertexCount, 0);
-  auto edge = [&](uint32_t a, uint32_t b) {
-    const Vertex &va = mesh->vertices[a], &vb = mesh->vertices[b];
-    float dx = va.x - vb.x, dy = va.y - vb.y, dz = va.z - vb.z;
-    float len = sqrtf(dx * dx + dy * dy + dz * dz);
-    sum[a] += len; count[a]++;
-    sum[b] += len; count[b]++;
-  };
-  ForEachMeshTriangle(mesh, [&](uint32_t i0, uint32_t i1, uint32_t i2) {
-    edge(i0, i1);
-    edge(i1, i2);
-    edge(i2, i0);
-  });
-  for (int i = 0; i < mesh->vertexCount; i++)
-    sum[i] = count[i] ? sum[i] / count[i] : 0.0f;
-  return sum;
+/* Returns the distance along the ray, or a negative number for a miss */
+static inline float RayTriDist(const std::array<float,9>& tri,
+                               float ox, float oy, float oz,
+                               float dx, float dy, float dz) {
+    float e1x = tri[3]-tri[0], e1y = tri[4]-tri[1], e1z = tri[5]-tri[2];
+    float e2x = tri[6]-tri[0], e2y = tri[7]-tri[1], e2z = tri[8]-tri[2];
+    float hx = dy*e2z - dz*e2y, hy = dz*e2x - dx*e2z, hz = dx*e2y - dy*e2x;
+    float a = e1x*hx + e1y*hy + e1z*hz;
+    if (fabsf(a) < 1e-7f) return -1.0f;
+    float f = 1.0f / a;
+    float sx = ox-tri[0], sy = oy-tri[1], sz = oz-tri[2];
+    float u = f * (sx*hx + sy*hy + sz*hz);
+    if (u < 0.0f || u > 1.0f) return -1.0f;
+    float qx = sy*e1z - sz*e1y, qy = sz*e1x - sx*e1z, qz = sx*e1y - sy*e1x;
+    float v = f * (dx*qx + dy*qy + dz*qz);
+    if (v < 0.0f || u+v > 1.0f) return -1.0f;
+    return f * (e2x*qx + e2y*qy + e2z*qz);
 }
 
 static inline bool RayTriHit(const std::array<float,9>& tri,
                               float ox, float oy, float oz,
                               float dx, float dy, float dz, float maxDist,
                               float minDist) {
-    float e1x = tri[3]-tri[0], e1y = tri[4]-tri[1], e1z = tri[5]-tri[2];
-    float e2x = tri[6]-tri[0], e2y = tri[7]-tri[1], e2z = tri[8]-tri[2];
-    float hx = dy*e2z - dz*e2y, hy = dz*e2x - dx*e2z, hz = dx*e2y - dy*e2x;
-    float a = e1x*hx + e1y*hy + e1z*hz;
-    if (fabsf(a) < 1e-7f) return false;
-    float f = 1.0f / a;
-    float sx = ox-tri[0], sy = oy-tri[1], sz = oz-tri[2];
-    float u = f * (sx*hx + sy*hy + sz*hz);
-    if (u < 0.0f || u > 1.0f) return false;
-    float qx = sy*e1z - sz*e1y, qy = sz*e1x - sx*e1z, qz = sx*e1y - sy*e1x;
-    float v = f * (dx*qx + dy*qy + dz*qz);
-    if (v < 0.0f || u+v > 1.0f) return false;
-    float t = f * (e2x*qx + e2y*qy + e2z*qz);
+    float t = RayTriDist(tri, ox, oy, oz, dx, dy, dz);
     return (t > minDist && t < maxDist);
 }
 
@@ -2801,11 +2945,53 @@ bool RayHit(float ox, float oy, float oz, float dx, float dy, float dz,
   return false;
 }
 
-/* Bake sample counts. Offline only, so these can be generous. */
-#define BAKE_AO_SAMPLES     256
+/* The nearest triangle along a ray, or -1. Hits nearer than minDist are ignored. */
+static int RayNearest(float ox, float oy, float oz, float dx, float dy, float dz,
+                      float minDist, float *dist) {
+  if (!g_bvhBuilt) return -1;
+
+  float idx = 1.0f / (fabsf(dx) > 1e-8f ? dx : (dx >= 0 ? 1e-8f : -1e-8f));
+  float idy = 1.0f / (fabsf(dy) > 1e-8f ? dy : (dy >= 0 ? 1e-8f : -1e-8f));
+  float idz = 1.0f / (fabsf(dz) > 1e-8f ? dz : (dz >= 0 ? 1e-8f : -1e-8f));
+
+  int stack[64];
+  int sp = 0;
+  stack[sp++] = 0;
+  int best = -1;
+  float bestT = 1e30f;
+
+  while (sp > 0) {
+    const BVHNode& node = g_bvh[stack[--sp]];
+    if (!RayAABB(node.box, ox, oy, oz, idx, idy, idz, bestT))
+      continue;
+    if (node.left == -1) {
+      for (int i = 0; i < node.triCount; i++) {
+        int tri = g_bvhTriIdx[node.triStart + i];
+        float t = RayTriDist(g_rtTriangles[tri], ox, oy, oz, dx, dy, dz);
+        if (t > minDist && t < bestT) {
+          bestT = t;
+          best = tri;
+        }
+      }
+    } else {
+      stack[sp++] = node.left;
+      stack[sp++] = node.right;
+    }
+  }
+  *dist = bestT;
+  return best;
+}
+
+/* Bake settings. Offline only, so the sample counts can be generous. None of
+ * these are for the user: they are relative to the model, not to a scale. */
+#define BAKE_GATHER_SAMPLES 256     /* rays per vertex for AO, sky and bounced light */
 #define BAKE_SHADOW_SAMPLES 64
+#define BAKE_TRI_GATHER     48      /* the same, per triangle, for the bounce passes */
+#define BAKE_TRI_SHADOW     16
+#define BAKE_BOUNCES        2
+#define BAKE_BOUNCE_GAIN    0.8f
+#define BAKE_VERTEX_FACES   8       /* a vertex is lit from at most this many of its faces */
 #define BAKE_SUN_SPREAD     0.10f   /* tan of the key light's half angle: soft edges */
-#define BAKE_SELF_DIST_MAX  0.25f   /* never ignore occluders further away than this */
 
 /* A repeatable 0..1 value from a position. Sample patterns are turned by it, so
  * two vertices at the same place (a seam between meshes) bake exactly alike. */
@@ -2834,45 +3020,83 @@ static void BakeFrame(float nx, float ny, float nz, float *t, float *b) {
   b[2] = nx * t[1] - ny * t[0];
 }
 
-/* selfDist: hits nearer than this are the vertex's own neighbouring faces */
-float ComputeAO(float px, float py, float pz, float nx, float ny, float nz,
-                int samples, float bias, float selfDist) {
-  float ao = 0.0f;
-  float maxDist = 2.0f; // AO radius
+/* Ambient colour from a direction: warm from below, blue from above */
+static inline void BakeSky(float dy, float *rgb) {
+  float hemi = dy * 0.5f + 0.5f;
+  rgb[0] = 0.3f + 0.2f * hemi;
+  rgb[1] = 0.25f + 0.35f * hemi;
+  rgb[2] = 0.2f + 0.6f * hemi;
+}
+
+/* One set of rays over the hemisphere gives three things:
+ *   ao      how open the point is to its near surroundings, 0..1
+ *   sky     ambient light from the rays that reach the sky
+ *   bounce  light coming off the surfaces the other rays hit
+ * selfDist: hits nearer than this are the point's own neighbouring faces */
+static void BakeGather(const float *p, const float *n, const float *faceN, int samples,
+                       float bias, float selfDist, bool useBounce, float *ao, float *sky,
+                       float *bounce) {
   float t[3], b[3];
-  BakeFrame(nx, ny, nz, t, b);
-  float turn = 6.283185f * BakeHash(px, py, pz);
+  BakeFrame(n[0], n[1], n[2], t, b);
+  float turn = 6.283185f * BakeHash(p[0], p[1], p[2]);
+  float ox = p[0] + faceN[0] * bias, oy = p[1] + faceN[1] * bias, oz = p[2] + faceN[2] * bias;
+  float open = 0.0f;
+  int used = 0;
+  sky[0] = sky[1] = sky[2] = 0.0f;
+  bounce[0] = bounce[1] = bounce[2] = 0.0f;
 
   /* Cosine weighted hemisphere, evenly spread (golden angle spiral) */
   for (int i = 0; i < samples; i++) {
     float u1 = (i + 0.5f) / samples;
     float r = sqrtf(u1), theta = turn + 2.399963f * i;
     float lx = r * cosf(theta), ly = r * sinf(theta), lz = sqrtf(1.0f - u1);
+    float dx = lx * t[0] + ly * b[0] + lz * n[0];
+    float dy = lx * t[1] + ly * b[1] + lz * n[1];
+    float dz = lx * t[2] + ly * b[2] + lz * n[2];
 
-    float dx = lx * t[0] + ly * b[0] + lz * nx;
-    float dy = lx * t[1] + ly * b[1] + lz * ny;
-    float dz = lx * t[2] + ly * b[2] + lz * nz;
+    /* A smoothed normal leans past the edge of its own flat face. Rays that
+     * would go down through that face see the inside of the model: drop them. */
+    if (dx * faceN[0] + dy * faceN[1] + dz * faceN[2] <= 0.0f)
+      continue;
+    used++;
 
-    if (!RayHit(px + nx * bias, py + ny * bias, pz + nz * bias, dx, dy, dz,
-                maxDist, selfDist))
-      ao += 1.0f;
+    float dist;
+    int tri = RayNearest(ox, oy, oz, dx, dy, dz, selfDist, &dist);
+    if (tri < 0) {
+      float c[3];
+      BakeSky(dy, c);
+      sky[0] += c[0]; sky[1] += c[1]; sky[2] += c[2];
+      open += 1.0f;
+      continue;
+    }
+    /* Occlusion fades out with distance instead of stopping at a hard edge */
+    open += fminf(1.0f, dist / g_bakeAORadius);
+    if (useBounce) {
+      const std::array<float, 3> &l = g_bakeTriLight[tri];
+      bounce[0] += l[0]; bounce[1] += l[1]; bounce[2] += l[2];
+    }
   }
-  return ao / samples;
+  if (!used) used = 1;
+  *ao = open / used;
+  for (int c = 0; c < 3; c++) {
+    sky[c] /= used;
+    bounce[c] /= used;
+  }
 }
 
 /* How much of the key light reaches a point, 0..1. The light is a small disc,
  * not a point, so shadow edges are soft and do not flip from vertex to vertex. */
 static float ComputeKeyShadow(float px, float py, float pz, float nx, float ny,
                               float nz, float lx, float ly, float lz,
-                              float bias, float selfDist) {
+                              int samples, float bias, float selfDist) {
   float t[3], b[3];
   BakeFrame(lx, ly, lz, t, b);
   float turn = 6.283185f * BakeHash(pz, px, py);
   float ox = px + nx * bias, oy = py + ny * bias, oz = pz + nz * bias;
 
   int lit = 0, used = 0;
-  for (int i = 0; i < BAKE_SHADOW_SAMPLES; i++) {
-    float r = BAKE_SUN_SPREAD * sqrtf((i + 0.5f) / BAKE_SHADOW_SAMPLES);
+  for (int i = 0; i < samples; i++) {
+    float r = BAKE_SUN_SPREAD * sqrtf((i + 0.5f) / samples);
     float theta = turn + 2.399963f * i;
     float dx = lx + (t[0] * cosf(theta) + b[0] * sinf(theta)) * r;
     float dy = ly + (t[1] * cosf(theta) + b[1] * sinf(theta)) * r;
@@ -2884,26 +3108,26 @@ static float ComputeKeyShadow(float px, float py, float pz, float nx, float ny,
     if (dx * nx + dy * ny + dz * nz <= 0.0f)
       continue;
     used++;
-    if (!RayHit(ox, oy, oz, dx, dy, dz, 100.0f, selfDist))
+    if (!RayHit(ox, oy, oz, dx, dy, dz, 1e30f, selfDist))
       lit++;
   }
   return used ? (float)lit / used : 0.0f;
 }
 
-/* edgeLen: average length of the edges at this vertex */
-LitColor CalculateVertexLighting(float px, float py, float pz, float nx,
-                                 float ny, float nz, float edgeLen,
-                                 uint8_t baseR, uint8_t baseG, uint8_t baseB,
-                                 uint8_t vertR, uint8_t vertG, uint8_t vertB) {
-  /* On a smooth surface the vertex normal is not any face's normal, so a ray
-   * leaving a vertex can clip the faces right next to it and shadow itself in
-   * speckles. Start the ray clear of the surface and ignore hits within about
-   * one edge length. Both follow the mesh's own detail, not a fixed size. */
-  float bias = fmaxf(0.001f, edgeLen * 0.02f);
-  float selfDist = fminf(edgeLen * 0.75f, BAKE_SELF_DIST_MAX);
-  if (selfDist < 1e-4f) selfDist = 1e-4f;
+/* All the light arriving at a point, as a colour to multiply the surface by.
+ * edgeLen: size of the polygons here. */
+static void BakeLightAt(const float *p, const float *n, const float *faceN, float edgeLen,
+                        int gatherSamples,
+                        int shadowSamples, bool useBounce, float *light) {
+  /* Rays start just clear of the face and ignore only the very nearest hits.
+   * Nothing more is needed against self shadowing: BakeGather drops the rays
+   * that would pass down through the point's own face. Both sizes follow the
+   * mesh's own detail, so a wall right next to a corner vertex still counts. */
+  float bias = fmaxf(1e-4f, edgeLen * 0.02f);
+  float selfDist = fmaxf(1e-4f, edgeLen * 0.05f);
 
-  float ao = ComputeAO(px, py, pz, nx, ny, nz, BAKE_AO_SAMPLES, bias, selfDist);
+  float ao, sky[3], bounce[3];
+  BakeGather(p, n, faceN, gatherSamples, bias, selfDist, useBounce, &ao, sky, bounce);
 
   // Key light
   float keyX = 0.4f, keyY = 0.8f, keyZ = 0.4f;
@@ -2911,7 +3135,7 @@ LitColor CalculateVertexLighting(float px, float py, float pz, float nx,
   keyX /= klen;
   keyY /= klen;
   keyZ /= klen;
-  float keyDot = nx * keyX + ny * keyY + nz * keyZ;
+  float keyDot = n[0] * keyX + n[1] * keyY + n[2] * keyZ;
   float keyNdotL = fmaxf(0.0f, keyDot);
   float keyWrap = (keyNdotL + 0.5f) / 1.5f;
   keyWrap *= keyWrap;
@@ -2920,8 +3144,8 @@ LitColor CalculateVertexLighting(float px, float py, float pz, float nx,
   // shadow; fade into that across the terminator so there is no hard line.
   float facing = fminf(1.0f, fmaxf(0.0f, keyDot / 0.25f));
   facing = facing * facing * (3.0f - 2.0f * facing);
-  float reach = facing > 0.0f ? ComputeKeyShadow(px, py, pz, nx, ny, nz, keyX, keyY,
-                                                 keyZ, bias, selfDist)
+  float reach = facing > 0.0f ? ComputeKeyShadow(p[0], p[1], p[2], faceN[0], faceN[1], faceN[2], keyX,
+                                                 keyY, keyZ, shadowSamples, bias, selfDist)
                               : 0.0f;
   float shadow = 0.3f + 0.7f * reach * facing;
 
@@ -2931,49 +3155,187 @@ LitColor CalculateVertexLighting(float px, float py, float pz, float nx,
   fillX /= flen;
   fillY /= flen;
   fillZ /= flen;
-  float fillDiffuse = (nx * fillX + ny * fillY + nz * fillZ) * 0.5f + 0.5f;
+  float fillDiffuse = (n[0] * fillX + n[1] * fillY + n[2] * fillZ) * 0.5f + 0.5f;
   fillDiffuse *= fillDiffuse;
 
-  // Hemisphere ambient
-  float hemi = ny * 0.5f + 0.5f;
-  float ambR = 0.3f + 0.2f * hemi;
-  float ambG = 0.25f + 0.35f * hemi;
-  float ambB = 0.2f + 0.6f * hemi;
+  // Ambient. Half is the sky the point can really see, so an overhang is
+  // darker underneath and bluer on top. The other half only looks at near
+  // surroundings, so an indoor level with no sky at all still gets some light.
+  float amb[3];
+  BakeSky(n[1], amb);
+
+  const float keyCol[3] = {0.7f, 0.65f, 0.55f};
+  const float fillCol[3] = {0.25f, 0.3f, 0.35f};
+  for (int c = 0; c < 3; c++)
+    light[c] = 0.35f * (0.5f * amb[c] * ao + 0.5f * sky[c]) +
+               keyWrap * keyCol[c] * shadow + fillDiffuse * fillCol[c] +
+               bounce[c] * BAKE_BOUNCE_GAIN;
+}
+
+/* Light leaving every triangle: what it gives off, plus what it reflects. Each
+ * pass reads the one before, so pass 1 is direct light and pass 2 onwards add a
+ * bounce each. */
+static void BakeTriangleLight() {
+  int count = (int)g_bakeTris.size();
+  g_bakeTriLight.assign(count, {0.0f, 0.0f, 0.0f});
+  std::vector<std::array<float, 3>> next(count);
+
+  for (int pass = 0; pass < BAKE_BOUNCES; pass++) {
+    #pragma omp parallel for schedule(dynamic, 256)
+    for (int i = 0; i < count; i++) {
+      const BakeTri &t = g_bakeTris[i];
+      const std::array<float, 9> &v = g_rtTriangles[i];
+      float p[3] = {(v[0] + v[3] + v[6]) / 3.0f, (v[1] + v[4] + v[7]) / 3.0f,
+                    (v[2] + v[5] + v[8]) / 3.0f};
+      float light[3];
+      BakeLightAt(p, t.n, t.n, t.edge, BAKE_TRI_GATHER, BAKE_TRI_SHADOW, pass > 0, light);
+      for (int c = 0; c < 3; c++)
+        next[i][c] = t.emit[c] + t.albedo[c] * light[c];
+    }
+    g_bakeTriLight.swap(next);
+  }
+}
+
+/* Vertices at the same place with the same normal, whichever mesh they are in */
+struct BakeVertKey {
+  uint32_t pos[3];
+  int8_t n[3];
+  bool operator<(const BakeVertKey &o) const {
+    if (int d = memcmp(pos, o.pos, sizeof(pos))) return d < 0;
+    return memcmp(n, o.n, sizeof(n)) < 0;
+  }
+};
+
+static BakeVertKey BakeKeyOf(const Vertex *v) {
+  BakeVertKey k;
+  float f[3] = {v->x, v->y, v->z};
+  memcpy(k.pos, f, sizeof(f));
+  for (int i = 0; i < 3; i++)
+    if (k.pos[i] == 0x80000000u) k.pos[i] = 0;
+  k.n[0] = v->nx; k.n[1] = v->ny; k.n[2] = v->nz;
+  return k;
+}
+
+/* Bakes light into the vertex colours of every drawn mesh. Free at runtime: the
+ * result is only the colours the vertices already carry. */
+static void BakeModelLighting(const Model *model) {
+  BuildRTScene(model);
+  if (g_rtTriangles.empty())
+    return;
+  printf("Baking lighting (%d threads): %d bounces...", omp_get_max_threads(),
+         BAKE_BOUNCES);
+  fflush(stdout);
+  BakeTriangleLight();
+
+  /* A vertex colour stands for the faces around the vertex, not the single
+   * point it sits at, which is often the darkest spot of a crease. So light is
+   * sampled a little way into each face that uses the vertex and averaged by
+   * area. Vertices split between meshes share one answer, so seams match. */
+  struct Corner { int tri, corner; };
+  std::map<BakeVertKey, int> slotOf;
+  std::vector<std::vector<Corner>> corners;
+  for (int i = 0; i < (int)g_bakeTris.size(); i++) {
+    const BakeTri &t = g_bakeTris[i];
+    for (int k = 0; k < 3; k++) {
+      BakeVertKey key = BakeKeyOf(&model->meshes[t.mesh].vertices[t.i[k]]);
+      auto it = slotOf.find(key);
+      if (it == slotOf.end()) {
+        it = slotOf.insert({key, (int)corners.size()}).first;
+        corners.push_back({});
+      }
+      corners[it->second].push_back({i, k});
+    }
+  }
+  printf(" %zu vertex sites...", corners.size());
+  fflush(stdout);
+
+  std::vector<std::array<float, 3>> siteLight(corners.size());
+  #pragma omp parallel for schedule(dynamic, 64)
+  for (int s = 0; s < (int)corners.size(); s++) {
+    std::vector<Corner> &list = corners[s];
+    if ((int)list.size() > BAKE_VERTEX_FACES) {
+      std::stable_sort(list.begin(), list.end(), [](const Corner &a, const Corner &b) {
+        return g_bakeTris[a.tri].area > g_bakeTris[b.tri].area;
+      });
+      list.resize(BAKE_VERTEX_FACES);
+    }
+    int faces = (int)list.size();
+    int gather = std::max(32, BAKE_GATHER_SAMPLES / faces);
+    int shadowRays = std::max(8, BAKE_SHADOW_SAMPLES / faces);
+
+    float sum[3] = {0, 0, 0}, weight = 0;
+    for (const Corner &c : list) {
+      const BakeTri &t = g_bakeTris[c.tri];
+      const Mesh *mesh = &model->meshes[t.mesh];
+      const Vertex *v0 = &mesh->vertices[t.i[c.corner]];
+      const Vertex *v1 = &mesh->vertices[t.i[(c.corner + 1) % 3]];
+      const Vertex *v2 = &mesh->vertices[t.i[(c.corner + 2) % 3]];
+      float p[3] = {0.6f * v0->x + 0.2f * (v1->x + v2->x),
+                    0.6f * v0->y + 0.2f * (v1->y + v2->y),
+                    0.6f * v0->z + 0.2f * (v1->z + v2->z)};
+      /* The vertex's own normal: blending in the neighbours' normals tilts the
+       * shading towards the bigger faces and shows up as stripes. */
+      float n[3] = {(float)v0->nx, (float)v0->ny, (float)v0->nz};
+      float len = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+      if (len > 1e-6f) {
+        n[0] /= len; n[1] /= len; n[2] /= len;
+      } else {
+        n[0] = t.n[0]; n[1] = t.n[1]; n[2] = t.n[2];
+      }
+      float light[3];
+      BakeLightAt(p, n, t.n, t.edge, gather, shadowRays, true, light);
+      for (int k = 0; k < 3; k++) sum[k] += light[k] * t.area;
+      weight += t.area;
+    }
+    for (int k = 0; k < 3; k++) siteLight[s][k] = sum[k] / weight;
+  }
 
   // Rim
   float rimX = -0.3f, rimY = 0.2f, rimZ = -0.9f;
   float rlen = sqrtf(rimX * rimX + rimY * rimY + rimZ * rimZ);
-  float rim =
-      fmaxf(0.0f, -(nx * rimX / rlen + ny * rimY / rlen + nz * rimZ / rlen));
-  rim = powf(rim, 2.0f) * 0.2f;
 
-  // Combine (multiply source vertex color with baked lighting)
-  float srcR = vertR / 255.0f;
-  float srcG = vertG / 255.0f;
-  float srcB = vertB / 255.0f;
+  for (int m = 0; m < model->meshCount; m++) {
+    const Mesh *mesh = &model->meshes[m];
+    if (mesh->collisionOnly)
+      continue;
+    float base[3] = {((mesh->materialColor >> 16) & 0xFF) / 255.0f,
+                     ((mesh->materialColor >> 8) & 0xFF) / 255.0f,
+                     (mesh->materialColor & 0xFF) / 255.0f};
+    float emit[3] = {0, 0, 0};
+    auto glow = g_emissive.find({mesh->textureId, mesh->materialColor});
+    if (glow != g_emissive.end())
+      for (int c = 0; c < 3; c++) emit[c] = glow->second[c];
 
-  float r =
-      srcR * (baseR / 255.0f) *
-          (ambR * 0.35f * ao + keyWrap * 0.7f * shadow + fillDiffuse * 0.25f) +
-      rim;
-  float g =
-      srcG * (baseG / 255.0f) *
-          (ambG * 0.35f * ao + keyWrap * 0.65f * shadow + fillDiffuse * 0.3f) +
-      rim;
-  float b =
-      srcB * (baseB / 255.0f) *
-          (ambB * 0.35f * ao + keyWrap * 0.55f * shadow + fillDiffuse * 0.35f) +
-      rim;
+    for (int i = 0; i < mesh->vertexCount; i++) {
+      Vertex *v = &mesh->vertices[i];
+      auto it = slotOf.find(BakeKeyOf(v));
+      if (it == slotOf.end())
+        continue;               /* not used by any triangle */
+      const std::array<float, 3> &light = siteLight[it->second];
 
-  // Saturation boost
-  float gray = (r + g + b) / 3.0f;
-  r = gray + (r - gray) * 1.15f;
-  g = gray + (g - gray) * 1.15f;
-  b = gray + (b - gray) * 1.15f;
+      float nx = v->nx / 127.0f, ny = v->ny / 127.0f, nz = v->nz / 127.0f;
+      float rim = fmaxf(0.0f, -(nx * rimX + ny * rimY + nz * rimZ) / rlen);
+      rim = rim * rim * 0.2f;
 
-  return {(uint8_t)(fminf(1.0f, fmaxf(0.0f, r)) * 255.0f),
-          (uint8_t)(fminf(1.0f, fmaxf(0.0f, g)) * 255.0f),
-          (uint8_t)(fminf(1.0f, fmaxf(0.0f, b)) * 255.0f)};
+      // Multiply the source vertex colour by the baked light. A glowing
+      // surface shows at least its own light.
+      float src[3] = {v->r / 255.0f, v->g / 255.0f, v->b / 255.0f};
+      float out[3];
+      for (int c = 0; c < 3; c++)
+        out[c] = src[c] * base[c] * (light[c] + emit[c]) + rim;
+
+      // Saturation boost
+      float gray = (out[0] + out[1] + out[2]) / 3.0f;
+      for (int c = 0; c < 3; c++) {
+        out[c] = gray + (out[c] - gray) * 1.15f;
+        out[c] = fminf(1.0f, fmaxf(0.0f, out[c])) * 255.0f;
+      }
+      v->r = (uint8_t)out[0];
+      v->g = (uint8_t)out[1];
+      v->b = (uint8_t)out[2];
+    }
+  }
+  printf(" done.\n");
 }
 
 void ExportTristrippedModel(const Model *model, const char *filename,
@@ -3098,10 +3460,8 @@ void ExportTristrippedModel(const Model *model, const char *filename,
   // Write mesh data
   printf("Writing %d meshes at %ld\n", meshCount, ftell(file));
 
-  if (bakeLighting) {
-    BuildRTScene(model);
-    printf("Baking lighting (AO/Shadows)...\n");
-  }
+  if (bakeLighting)
+    BakeModelLighting(model);
 
   for (uint32_t m = 0; m < meshCount; m++) {
     const Mesh *mesh = &model->meshes[meshOrder[m]];
@@ -3116,24 +3476,9 @@ void ExportTristrippedModel(const Model *model, const char *filename,
     uint8_t baseB = (mesh->materialColor) & 0xFF;
 
     if (bakeLighting) {
-      printf("    Computing lighting (%d threads)...", omp_get_max_threads());
-      fflush(stdout);
-      std::vector<float> edgeLen = MeshVertexEdgeLengths(mesh);
-      #pragma omp parallel for schedule(dynamic, 64)
-      for (int i = 0; i < mesh->vertexCount; i++) {
-        Vertex *v = &mesh->vertices[i];
-        float vnx = v->nx / 127.0f;
-        float vny = v->ny / 127.0f;
-        float vnz = v->nz / 127.0f;
-        LitColor lit =
-            CalculateVertexLighting(v->x, v->y, v->z, vnx, vny, vnz, edgeLen[i],
-                                    baseR, baseG, baseB, v->r, v->g, v->b);
-        v->r = lit.r;
-        v->g = lit.g;
-        v->b = lit.b;
-        v->a = (uint8_t)((v->a * baseA) / 255);
-      }
-      printf(" done.\n");
+      /* BakeModelLighting has set the colours already */
+      for (int i = 0; i < mesh->vertexCount; i++)
+        mesh->vertices[i].a = (uint8_t)((mesh->vertices[i].a * baseA) / 255);
     } else {
       for (int i = 0; i < mesh->vertexCount; i++) {
         Vertex *v = &mesh->vertices[i];
