@@ -76,9 +76,14 @@ Credits:
 - Level: [City Escape - Sonic Adventure 2](https://models.spriters-resource.com/dreamcast/sonicadventure2/asset/297940/)
   ripped by dshaynie, The Models Resource
 
-### highpoly_stresstest
+### highpoly
 
-Free camera over a high-poly model, to find the polygon rate limit. This one is
-limited by the PVR, not the CPU. To be replaced.
+![highpoly](highpoly/resources/example.png)
 
-Credits: to add
+Free camera over a high-poly model (about 40,000 triangles on screen), to find
+the polygon rate limit: about 2.3 million polygons a second. 
+
+
+Credits:
+- Model: [[Free] Ugandan Tails](https://sketchfab.com/3d-models/free-ugandan-tails-cd6dca09d7ed4838b6c0d71c5adc448c)
+  by [LuAnton](https://sketchfab.com/LuAnton)
