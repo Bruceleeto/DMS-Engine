@@ -27,6 +27,10 @@
  * until dc_frame_end(). Use one DCCamera per view for split screen. */
 void dc_set_camera(const DCCamera* cam);
 
+/* Engine use: the camera the draws are using (what dc_set_camera() was
+ * last given) */
+const DCCamera* dc_get_camera(void);
+
 /* As it is: no turn, full size */
 void dc_draw(DMSModel* model, shz_vec3_t pos);
 

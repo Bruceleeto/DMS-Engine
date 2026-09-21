@@ -46,6 +46,10 @@ float dc_fps(void);
 /* Milliseconds since boot. */
 uint64_t dc_time_ms(void);
 
+/* Frames since dc_init(). Use it to do a thing once a frame when a call can
+ * happen more than once (drawing into a target as well as the screen). */
+uint32_t dc_frame_count(void);
+
 /* ================================================================
  * Frame statistics (shown by dc_debug_stats)
  * ================================================================ */

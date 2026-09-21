@@ -1311,6 +1311,44 @@ DMSModel* dc_model_load(const char* filename) {
     return model;
 }
 
+void dc_model_submit_quads(const DMSVertex* verts, int quads, pvr_dr_state_t* dr) {
+    if (quads <= 0) return;
+    vtxbuf_sync();
+
+    for (int q = 0; q < quads; q++) {
+        const DMSVertex* src = &verts[q * 4];
+        if (g_vtx_left < 4 * 32) { vtxbuf_warn(); return; }
+
+        /* No clipping: a square with a corner behind the near plane is
+         * dropped whole. One of four vertices is not worth a clip path, and
+         * a particle vanishing as it reaches the camera is not seen. */
+        shz_vec4_t t[4];
+        float behind = 0.0f;
+        for (int i = 0; i < 4; i++) {
+            t[i] = shz_vec4_swizzle(shz_xmtrx_transform_vec4(
+                       shz_vec4_init(src[i].x, src[i].y, -src[i].z, 1.0f)), 1, 2, 3, 0);
+            if (t[i].w < NEAR_Z) behind = 1.0f;
+        }
+        if (behind != 0.0f) continue;
+
+        g_vtx_left -= 4 * 32;
+        for (int i = 0; i < 4; i++) {
+            float inv_w = shz_invf_fsrra(t[i].w);
+            pvr_vertex_t* pv = pvr_dr_target(*dr);
+            pv->flags = src[i].flags;
+            pv->x     = t[i].x * inv_w;
+            pv->y     = t[i].y * inv_w;
+            pv->z     = inv_w;
+            pv->u     = src[i].u;
+            pv->v     = src[i].v;
+            pv->argb  = src[i].argb;
+            pvr_dr_commit(pv);
+        }
+        g_stats.tris_drawn += 2;
+        g_stats.verts_xformed += 4;
+    }
+}
+
 /* ================================================================
  * Flat shadows
  *

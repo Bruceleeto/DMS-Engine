@@ -74,6 +74,10 @@ static DrawEntry* queue_model(DMSModel* model, shz_vec3_t pos, float scale) {
     return e;
 }
 
+const DCCamera* dc_get_camera(void) {
+    return current_cam;
+}
+
 void dc_set_camera(const DCCamera* cam) {
     current_cam = cam;
 }

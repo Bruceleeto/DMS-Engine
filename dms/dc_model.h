@@ -47,6 +47,11 @@ void dc_model_draw_shadow(DMSModel* model, shz_vec3_t pos, float scale, float ya
                           const float* rot, const DCCamera* cam,
                           shz_vec3_t light, bool sun, float floor_y, float dark);
 
+/* Engine use (dc_particles): squares of 4 world-space vertices, submitted
+ * with the matrix now in xmtrx. A square that reaches the near plane is
+ * dropped whole, not clipped. Stops if the vertex buffer is full. */
+void dc_model_submit_quads(const DMSVertex* verts, int quads, pvr_dr_state_t* dr);
+
 /* Engine use (dc_draw_ex .add): model draws that follow are additive, all in
  * the transparent list, until set back to false */
 void dc_model_set_add(bool add);

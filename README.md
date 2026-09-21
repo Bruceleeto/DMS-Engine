@@ -167,6 +167,26 @@ field on the draw (`.shadow`), for any model, moving or not.
 
 Credits: to add
 
+### particles
+
+![particles](particles/resources/example.png)
+
+A fountain of fire over a marble floor: 600 particles thrown up from a spot,
+pulled back down and bouncing when they land, grey-pink as they are born, red
+at their height, out as they die. After Particles from the PowerVR SDK. The
+whole thing is one `dc_particles_create` and one `dc_particles_draw` a frame.
+
+Still a work in progress.. Needs speeding up. 
+
+| Button | Action |
+|---|---|
+| Stick | Turn the camera around the fountain |
+| L / R | Zoom |
+| A | Throw a burst of 200 |
+| Start | Exit |
+
+Credits:
+
 ## Blender settings
 
 Export as `.glb`. The converter reads these from the material (Principled
@@ -265,3 +285,33 @@ shadow lies over itself it does not get darker. It only looks right on flat
 ground, and it costs about as much as drawing the model again: more when the
 shadow fills the screen. It shows on a real Dreamcast; Flycast draws a black
 square around it. See `shady`.
+
+### Particles
+
+Fire, smoke, sparks, dust, a fountain. Say once what they look like and how
+they move, then draw them every frame:
+
+```c
+DCParticles* fire = dc_particles_create(600, &(DCParticleOpts){
+    .pos    = fire_place,
+    .speed  = { 0, 14, 0 }, .speed_spread = { 2.5f, 6, 2.5f },
+    .gravity = 9.8f,
+    .life   = 4.0f, .size = 1.2f,
+    .start  = 0x998080, .middle = 0xFF2000, .end = 0x000000,
+    .rate   = 150.0f, .bounce = true,
+});
+
+/* every frame */
+dc_particles_draw(fire);        /* moves them and draws them */
+```
+
+Each one is a flat square that faces the camera, added over what is behind it,
+so black is invisible. `.smoke` mixes them in instead, for dark smoke and
+dust. Without `.texture` they get a soft round glow made in code, which is
+white, so `.start`, `.middle` and `.end` colour them. `dc_particles_burst()`
+throws a lot at once (an explosion), `dc_particles_move()` moves where they
+come from (an emitter that follows something).
+
+The whole puff is left out when it is off screen. They cost four vertices
+each, so the count is cheap; what costs is the screen they cover, and a camera
+inside a cloud of big ones is the slow case. See `particles`.

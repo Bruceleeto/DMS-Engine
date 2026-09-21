@@ -222,6 +222,10 @@ uint64_t dc_time_ms(void) {
     return timer_ms_gettime64();
 }
 
+uint32_t dc_frame_count(void) {
+    return g_engine.frame_count;
+}
+
 /* ================================================================
  * Display
  * ================================================================ */
