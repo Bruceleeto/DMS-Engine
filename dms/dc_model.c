@@ -1312,6 +1312,243 @@ DMSModel* dc_model_load(const char* filename) {
 }
 
 /* ================================================================
+ * Flat shadows
+ *
+ * The model squashed onto a floor, away from a light. The squash is a matrix
+ * put between the camera and the model, so the usual vertex loops draw it and
+ * nothing is copied.
+ *
+ * A squashed model lies over itself many times, and plain blending would
+ * darken those places again and again. So it goes through the PVR's second
+ * (accumulation) buffer, which is what works with a sorted transparent list:
+ *   1. a white square on the floor, under the whole shadow, into the buffer
+ *   2. the squashed model, one flat grey, over it (replacing, not blending)
+ *   3. the square again, multiplying the screen by what the buffer holds
+ * The grey comes from a tiny texture that replaces the vertex colours.
+ *
+ * The transparent list is sorted by depth by the PVR, far to near, so the
+ * three steps are kept in order by depth alone: all three lie at the same
+ * height, and each is given a depth a little nearer than the one before
+ * (SHADOW_SORT_GAP). For that the shadow's depth must be exact,
+ * which a squash away from a point cannot give (it needs a divide the vertex
+ * loops do not do). So a light is treated as a far away one shining from
+ * where it is towards the model, and the spread it would give is put back as
+ * a plain scale about the middle of the shadow.
+ *
+ * All three must pass the depth test against the floor: a sorted list tests
+ * "nearer or equal" whatever the header asks for. Where the first square
+ * loses to the floor and the last does not, the floor is multiplied by
+ * whatever the buffer held (the square shimmers). So even the first is nearer
+ * than the floor by a whole gap.
+ * ================================================================ */
+
+#define SHADOW_TEX_SIZE 8
+#define SHADOW_LIFT     0.01f   /* of the model's radius, above the floor (z fighting) */
+#define SHADOW_SORT_GAP 0.01f   /* of the depth: floor, square, shadow, square */
+#define SHADOW_MAX_SIZE 8.0f    /* the square, in model radii: a low light throws long shadows */
+
+static pvr_ptr_t      g_shadow_tex;
+static float          g_shadow_dark = -1.0f;
+static pvr_poly_hdr_t g_shadow_clean_hdr __attribute__((aligned(32)));
+static pvr_poly_hdr_t g_shadow_grey_hdr  __attribute__((aligned(32)));
+static pvr_poly_hdr_t g_shadow_flush_hdr __attribute__((aligned(32)));
+
+static bool shadow_setup(float dark) {
+    if (!g_shadow_tex) {
+        g_shadow_tex = pvr_mem_malloc(SHADOW_TEX_SIZE * SHADOW_TEX_SIZE * 2);
+        if (!g_shadow_tex) return false;
+
+        pvr_poly_cxt_t cxt;
+        pvr_poly_cxt_col(&cxt, PVR_LIST_TR_POLY);
+        cxt.gen.culling = PVR_CULLING_NONE;
+        cxt.blend.src = PVR_BLEND_ONE;
+        cxt.blend.dst = PVR_BLEND_ZERO;
+        cxt.blend.dst_enable = PVR_BLEND_ENABLE;
+        cxt.depth.write = PVR_DEPTHWRITE_DISABLE;
+        pvr_poly_compile(&g_shadow_clean_hdr, &cxt);
+
+        pvr_poly_cxt_txr(&cxt, PVR_LIST_TR_POLY, PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED,
+                         SHADOW_TEX_SIZE, SHADOW_TEX_SIZE, g_shadow_tex, PVR_FILTER_NONE);
+        cxt.gen.culling = PVR_CULLING_NONE;
+        cxt.txr.env = PVR_TXRENV_REPLACE;
+        cxt.blend.src = PVR_BLEND_ONE;
+        cxt.blend.dst = PVR_BLEND_ZERO;
+        cxt.blend.dst_enable = PVR_BLEND_ENABLE;
+        cxt.depth.write = PVR_DEPTHWRITE_DISABLE;
+        pvr_poly_compile(&g_shadow_grey_hdr, &cxt);
+
+        pvr_poly_cxt_col(&cxt, PVR_LIST_TR_POLY);
+        cxt.gen.culling = PVR_CULLING_NONE;
+        cxt.blend.src = PVR_BLEND_DESTCOLOR;
+        cxt.blend.dst = PVR_BLEND_ZERO;
+        cxt.blend.src_enable = PVR_BLEND_ENABLE;
+        pvr_poly_compile(&g_shadow_flush_hdr, &cxt);
+    }
+    if (dark != g_shadow_dark) {
+        /* The shadow multiplies the floor by this grey */
+        uint32_t g = (uint32_t)((1.0f - dark) * 255.0f);
+        uint16_t texel = (uint16_t)(((g >> 3) << 11) | ((g >> 2) << 5) | (g >> 3));
+        uint16_t* t = (uint16_t*)g_shadow_tex;
+        for (int i = 0; i < SHADOW_TEX_SIZE * SHADOW_TEX_SIZE; i++) t[i] = texel;
+        g_shadow_dark = dark;
+    }
+    return true;
+}
+
+void dc_model_draw_shadow(DMSModel* model, shz_vec3_t pos, float scale, float yaw,
+                          const float* rot, const DCCamera* cam,
+                          shz_vec3_t light, bool sun, float floor_y, float dark) {
+    if (!model || !model->mesh_count || !cam) return;
+    if (model->skeleton && rot) return;
+    if (dark <= 0.0f) dark = 0.5f;
+    if (dark > 1.0f) dark = 1.0f;
+
+    /* The model's bounds in the world */
+    shz_sincos_t sc = shz_sincosf(yaw);
+    shz_vec3_t c;
+    float r;
+    if (model->skeleton) {
+        c = turn_centre(NULL, yaw, sc, model->anim_bound_cx, model->anim_bound_cy,
+                        model->anim_bound_cz);
+        r = model->anim_bound_radius;
+    } else {
+        /* Around the meshes' own spheres */
+        float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
+        for (uint32_t m = 0; m < model->mesh_count; m++) {
+            const DMSMesh* mesh = &model->meshes[m];
+            if (mesh->material_flags & DMS_MAT_COLLISION_ONLY) continue;
+            float mc[3] = { mesh->bound_cx, mesh->bound_cy, mesh->bound_cz };
+            for (int k = 0; k < 3; k++) {
+                if (mc[k] - mesh->bound_radius < lo[k]) lo[k] = mc[k] - mesh->bound_radius;
+                if (mc[k] + mesh->bound_radius > hi[k]) hi[k] = mc[k] + mesh->bound_radius;
+            }
+        }
+        if (lo[0] > hi[0]) return;
+        float dx = hi[0] - lo[0], dy = hi[1] - lo[1], dz = hi[2] - lo[2];
+        c = turn_centre(rot, yaw, sc, (lo[0] + hi[0]) * 0.5f, (lo[1] + hi[1]) * 0.5f,
+                        (lo[2] + hi[2]) * 0.5f);
+        r = 0.5f * shz_sqrtf_fsrra(dx * dx + dy * dy + dz * dz);
+    }
+    c = shz_vec3_init(pos.x + c.x * scale, pos.y + c.y * scale, pos.z + c.z * scale);
+    r *= scale;
+
+    float h = floor_y + r * SHADOW_LIFT;
+    if (c.y + r <= h) return;                   /* all of it is under the floor */
+
+    /* Where the middle of the shadow lands, and how far it spreads */
+    shz_vec3_t dir = sun ? light : shz_vec3_init(c.x - light.x, c.y - light.y, c.z - light.z);
+    float len = shz_sqrtf_fsrra(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+    if (len < 1e-6f || dir.y >= 0.0f) return;   /* the light is not above it */
+    float t = (h - c.y) / dir.y;                /* along dir from the centre to the floor */
+    shz_vec3_t mid = shz_vec3_init(c.x + dir.x * t, h, c.z + dir.z * t);
+    float slant = len / -dir.y;                 /* 1 straight down, more for a low light */
+    float spread = sun ? 1.0f : (len + t * len) / len;
+    if (spread > 3.0f) spread = 3.0f;
+    float half = r * slant * spread;
+    if (half > r * SHADOW_MAX_SIZE) half = r * SHADOW_MAX_SIZE;
+
+    /* Skinned models have no clip path: their shadow must be clear of the
+     * near plane */
+    if (model->skeleton) {
+        if (dc_frustum_near_intersect(cam, mid, half * 1.5f)) return;
+    }
+    if (dc_frustum_cull_sphere(cam, mid, half * 1.5f) < 0) return;
+
+    if (!shadow_setup(dark)) return;
+
+    /* The squash, in the space right after the camera matrix: relative to
+     * the camera, z negated. Along d onto the plane y = hc:
+     *   v' = v - d (v.y - hc) / d.y
+     * then x and z spread about the middle of the shadow by g. */
+    float d[3] = { dir.x / len, dir.y / len, -dir.z / len };
+    float hc = h - cam->pos.y;
+    float mx = mid.x - cam->pos.x, mz = -(mid.z - cam->pos.z);
+    float g = spread > 3.0f ? 3.0f : spread;
+    alignas(32) shz_mat4x4_t squash;
+    memset(&squash, 0, sizeof(squash));
+    squash.elem2D[0][0] = g;
+    squash.elem2D[2][2] = g;
+    squash.elem2D[3][3] = 1.0f;
+    squash.elem2D[1][0] = -g * d[0] / d[1];
+    squash.elem2D[1][2] = -g * d[2] / d[1];
+    squash.elem2D[3][0] = g * d[0] * hc / d[1] + mx * (1.0f - g);
+    squash.elem2D[3][1] = hc;
+    squash.elem2D[3][2] = g * d[2] * hc / d[1] + mz * (1.0f - g);
+
+    vtxbuf_sync();
+    dc_list_begin(PVR_LIST_TR_POLY);
+    pvr_dr_state_t* dr = dc_dr_state();
+
+    /* The square on the floor, in world coordinates. The whole matrix times k
+     * leaves it where it is on the screen and makes its depth k times as far. */
+    alignas(32) DMSVertex quad[4];
+    static const float corner[4][2] = { {-1, -1}, {1, -1}, {-1, 1}, {1, 1} };
+    for (int i = 0; i < 4; i++) {
+        memset(&quad[i], 0, sizeof(quad[i]));
+        quad[i].x = mid.x + corner[i][0] * half;
+        quad[i].y = h;
+        quad[i].z = mid.z + corner[i][1] * half;
+        quad[i].argb = 0xFFFFFFFFu;
+        quad[i].flags = (i == 3) ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
+    }
+    alignas(32) shz_mat4x4_t world_mvp;
+    shz_xmtrx_load_4x4((shz_mat4x4_t*)dc_camera_get_pv(cam));
+    shz_xmtrx_translate(-cam->pos.x, -cam->pos.y, cam->pos.z);
+    shz_xmtrx_store_4x4(&world_mvp);
+    alignas(32) shz_mat4x4_t clean_mvp, flush_mvp;
+    for (int i = 0; i < 16; i++) {
+        clean_mvp.elem[i] = world_mvp.elem[i] * (1.0f - SHADOW_SORT_GAP);
+        flush_mvp.elem[i] = world_mvp.elem[i] * (1.0f - 3.0f * SHADOW_SORT_GAP);
+    }
+
+    /* 1. clean the buffer under the shadow */
+    shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &g_shadow_clean_hdr);
+    shz_xmtrx_load_4x4(&clean_mvp);
+    render_clipped(quad, 4, dr);
+
+    /* 2. the model, squashed, in grey */
+    shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &g_shadow_grey_hdr);
+    shz_xmtrx_load_4x4((shz_mat4x4_t*)dc_camera_get_pv(cam));
+    shz_xmtrx_apply_4x4(&squash);
+    shz_xmtrx_translate(pos.x - cam->pos.x, pos.y - cam->pos.y, -(pos.z - cam->pos.z));
+    if (rot) {
+        alignas(32) shz_mat4x4_t rm;
+        rm.elem2D[0][0] =  rot[0]; rm.elem2D[0][1] =  rot[1]; rm.elem2D[0][2] = -rot[2]; rm.elem2D[0][3] = 0.0f;
+        rm.elem2D[1][0] =  rot[3]; rm.elem2D[1][1] =  rot[4]; rm.elem2D[1][2] = -rot[5]; rm.elem2D[1][3] = 0.0f;
+        rm.elem2D[2][0] = -rot[6]; rm.elem2D[2][1] = -rot[7]; rm.elem2D[2][2] =  rot[8]; rm.elem2D[2][3] = 0.0f;
+        rm.elem2D[3][0] = 0.0f;    rm.elem2D[3][1] = 0.0f;    rm.elem2D[3][2] = 0.0f;    rm.elem2D[3][3] = 1.0f;
+        shz_xmtrx_apply_4x4(&rm);
+    } else if (yaw != 0.0f) {
+        shz_xmtrx_apply_rotation_y(yaw);
+    }
+    /* Skinned vertices go in as they are, so z is negated here */
+    shz_xmtrx_apply_scale(scale, scale, model->skeleton ? -scale : scale);
+    alignas(32) shz_mat4x4_t mvp;
+    shz_xmtrx_store_4x4(&mvp);
+    for (int i = 0; i < 16; i++) mvp.elem[i] *= 1.0f - 2.0f * SHADOW_SORT_GAP;
+
+    for (uint32_t m = 0; m < model->mesh_count; m++) {
+        DMSMesh* mesh = &model->meshes[m];
+        if (mesh->material_flags & DMS_MAT_COLLISION_ONLY) continue;
+        if (vtxbuf_full(mesh, !model->skeleton)) break;
+        g_stats.tris_drawn += mesh->tri_count;
+        if (model->skeleton) {
+            g_stats.verts_xformed += mesh->vertex_count;
+            render_skinned(mesh->vertices, mesh->vertex_count, model->skeleton, &mvp, dr);
+        } else {
+            g_stats.verts_clipped += mesh->vertex_count;
+            shz_xmtrx_load_4x4(&mvp);
+            render_clipped(mesh->vertices, mesh->vertex_count, dr);
+        }
+    }
+
+    /* 3. the buffer onto the screen */
+    shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &g_shadow_flush_hdr);
+    shz_xmtrx_load_4x4(&flush_mvp);
+    render_clipped(quad, 4, dr);
+}
+
+/* ================================================================
  * Mesh header
  * ================================================================ */
 

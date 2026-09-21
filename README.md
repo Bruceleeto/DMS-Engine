@@ -150,6 +150,23 @@ what moves leaves a trail. Shots are a flat glow drawn additive
 Credits:
 - Model and textures: DragonFly demo, Sega Katana SDK (PowerVR / VideoLogic)
 
+### shady
+
+![shady](shady/resources/example.png)
+
+A wooden knot turning over a marble floor, with a flat shadow thrown away from
+a light you can move. After Shady from Sega's Katana SDK. The shadow is one
+field on the draw (`.shadow`), for any model, moving or not.
+
+| Button | Action |
+|---|---|
+| Stick | Turn the camera around the knot |
+| L / R | Zoom |
+| D-pad | Move the light |
+| Start | Exit |
+
+Credits: to add
+
 ## Blender settings
 
 Export as `.glb`. The converter reads these from the material (Principled
@@ -232,3 +249,19 @@ dc_draw_target_ex(trail, &(DCTargetOpts){ .add = true });      /* added over the
 Only what is drawn into the trail is blurred. While a trail exists the PVR's
 dithering is off (with it on, the trail never fades out fully). See
 `dragonfly`.
+
+### Flat shadows
+
+A model's shadow on a level floor, thrown away from a light:
+
+```c
+DCShadow shadow = { .light = lamp_pos, .floor_y = 0.0f };
+dc_draw_ex(knot, &(DCDrawOpts){ .pos = pos, .yaw = yaw, .shadow = &shadow });
+```
+
+`.sun = true` makes `light` the way the light shines instead of where it is.
+`.dark` is how dark the shadow is (0 to 1, left out it is 0.5). Where the
+shadow lies over itself it does not get darker. It only looks right on flat
+ground, and it costs about as much as drawing the model again: more when the
+shadow fills the screen. It shows on a real Dreamcast; Flycast draws a black
+square around it. See `shady`.

@@ -30,6 +30,15 @@ void dc_set_camera(const DCCamera* cam);
 /* As it is: no turn, full size */
 void dc_draw(DMSModel* model, shz_vec3_t pos);
 
+/* A flat shadow on a level floor, thrown away from a light. Any model, moving
+ * or not. It only looks right on flat ground: it does not bend over steps. */
+typedef struct {
+    shz_vec3_t light;       /* where the light is */
+    bool       sun;         /* light is the way it shines instead (far away light) */
+    float      floor_y;     /* height of the floor under the model */
+    float      dark;        /* 0 to 1, how dark. 0 means 0.5 */
+} DCShadow;
+
 /* Everything else. Fields left out are zero, which means "as it is". */
 typedef struct {
     shz_vec3_t   pos;
@@ -38,6 +47,7 @@ typedef struct {
     const float* rot;       /* turned any way, used instead of yaw (static models
                              * only): 9 floats, 3 columns, where the model's x, y
                              * and z axes point in the world. It is copied. */
+    const DCShadow* shadow; /* also draw its shadow. It is copied. */
     bool         add;       /* added to what is behind it, so black adds nothing:
                              * flashes, glows, fire. Draw it after the solid things. */
 } DCDrawOpts;

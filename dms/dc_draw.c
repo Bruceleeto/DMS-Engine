@@ -23,6 +23,8 @@ typedef struct {
     bool            has_rot;
     float           rot[9];
     bool            add;
+    bool            has_shadow;
+    DCShadow        shadow;
     int             call_list;
     void          (*call_fn)(void* user);
     void*           call_user;
@@ -68,6 +70,7 @@ static DrawEntry* queue_model(DMSModel* model, shz_vec3_t pos, float scale) {
     e->yaw = 0.0f;
     e->has_rot = false;
     e->add = false;
+    e->has_shadow = false;
     return e;
 }
 
@@ -85,6 +88,10 @@ void dc_draw_ex(DMSModel* model, const DCDrawOpts* opts) {
     if (!e) return;
     e->yaw = opts->yaw;
     e->add = opts->add;
+    if (opts->shadow) {
+        e->has_shadow = true;
+        e->shadow = *opts->shadow;
+    }
     if (opts->rot) {
         e->has_rot = true;
         memcpy(e->rot, opts->rot, sizeof(e->rot));
@@ -379,7 +386,8 @@ static void flush_scene(const DCTarget* target) {
                 dc_list_begin(lists[l]);
                 e->call_fn(e->call_user);
             } else if (e->add ? lists[l] == PVR_LIST_TR_POLY
-                              : model_uses_list(e->model, lists[l])) {
+                              : model_uses_list(e->model, lists[l]) ||
+                                (e->has_shadow && lists[l] == PVR_LIST_TR_POLY)) {
                 const DCCamera* cam = e->cam;
                 if (target) {
                     if (squeezed_from != cam) {
@@ -392,6 +400,10 @@ static void flush_scene(const DCTarget* target) {
                     }
                     cam = &squeezed;
                 }
+                if (e->has_shadow && lists[l] == PVR_LIST_TR_POLY)
+                    dc_model_draw_shadow(e->model, e->pos, e->scale, e->yaw,
+                                         e->has_rot ? e->rot : NULL, cam, e->shadow.light,
+                                         e->shadow.sun, e->shadow.floor_y, e->shadow.dark);
                 if (e->add) dc_model_set_add(true);
                 if (e->has_rot)
                     dc_model_draw_list_oriented(e->model, e->pos, e->scale, e->rot,

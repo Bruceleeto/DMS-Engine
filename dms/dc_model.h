@@ -41,6 +41,12 @@ void dc_model_draw_list_rotated(DMSModel* model, shz_vec3_t pos, float scale,
 void dc_model_draw_list_oriented(DMSModel* model, shz_vec3_t pos, float scale,
                                  const float rot[9], const DCCamera* cam, int target_list);
 
+/* Engine use (dc_draw_ex .shadow): the model's flat shadow on the floor at
+ * floor_y. light is where the light is, or with sun the way it shines. */
+void dc_model_draw_shadow(DMSModel* model, shz_vec3_t pos, float scale, float yaw,
+                          const float* rot, const DCCamera* cam,
+                          shz_vec3_t light, bool sun, float floor_y, float dark);
+
 /* Engine use (dc_draw_ex .add): model draws that follow are additive, all in
  * the transparent list, until set back to false */
 void dc_model_set_add(bool add);
