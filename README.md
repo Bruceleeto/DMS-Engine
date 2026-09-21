@@ -51,12 +51,12 @@ Credits:
   by [amogusstrikesback2](https://sketchfab.com/amogusstrikesback2)
 - Car: to add
 
-### clipping_stresstest
+### 1st_person
+
+![1st_person](1st_person/resources/example.png)
 
 First-person walk through a level with collision. Stresses the near-plane
 clipper, since walls and floors are always crossing the camera.
-
-Credits: to add
 
 ### animation
 
@@ -68,7 +68,6 @@ third-person camera and collision.
 Credits:
 - Character: [D.Va Base Default - HotS](https://sketchfab.com/3d-models/dva-base-default-hots-ead4a55a18e145338196e10ce4193820)
   by [Catholomew](https://sketchfab.com/Catholomew)
-- Level: to add
 
 ### sonic_streets
 
