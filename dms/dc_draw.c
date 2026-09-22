@@ -23,6 +23,7 @@ typedef struct {
     bool            has_rot;
     float           rot[9];
     bool            add;
+    bool            glow;       /* the bloom pass: only what gives off light */
     bool            has_shadow;
     DCShadow        shadow;
     int             call_list;
@@ -70,6 +71,7 @@ static DrawEntry* queue_model(DMSModel* model, shz_vec3_t pos, float scale) {
     e->yaw = 0.0f;
     e->has_rot = false;
     e->add = false;
+    e->glow = false;
     e->has_shadow = false;
     return e;
 }
@@ -122,7 +124,7 @@ void dc_draw_call(int pvr_list, void (*fn)(void* user), void* user) {
 
 #define TARGET_WEARERS 16
 #define TARGETS_A_FRAME 8
-#define TARGET_QUADS 8
+#define TARGET_QUADS 16     /* bloom takes nine of them */
 #define TARGET_BACK_DEPTH 0.0001f   /* 1/w: behind everything (FAR_Z is 0.001) */
 #define TARGET_QUAD_DEPTH 50.0f     /* 1/w: in front of anything past 0.02 units */
 
@@ -366,6 +368,190 @@ void dc_draw_target_ex(DCTarget* target, const DCTargetOpts* opts) {
     dc_draw_call(q->see_through ? PVR_LIST_TR_POLY : PVR_LIST_OP_POLY, target_quad_draw, q);
 }
 
+/* ================================================================
+ * Bloom
+ *
+ * Three steps, all on what is already queued:
+ *
+ *   glow    the whole scene into a small square picture, with everything that
+ *           does not give off light drawn in black. The camera is squeezed to
+ *           it the same way any render target is, so a mesh lands where it is
+ *           on screen, and the black takes the depth test, so a lamp behind a
+ *           wall does not come through it.
+ *   soften  across, then down, into two pictures half that size again. Four
+ *           taps a pass, a texel apart, a quarter strength each, added. Half
+ *           the size doubles how far a tap reaches for a quarter of the work,
+ *           and going down to it is a 2x2 box the filtering does for free.
+ *   add     the last picture over the frame, stretched back to full size.
+ *           Magnifying it is the rest of the softening and costs nothing.
+ *
+ * Blurring across and then down rather than in one go is what keeps the edge
+ * of a glow smooth: a single pass of taps set out on the diagonal leaves the
+ * grid of the small picture showing once it is magnified ten times.
+ *
+ * The glow picture is 128x128 by default and the two soften pictures 64x64, so
+ * a soften pass is 4k pixels. The cost of the effect is the second pass over
+ * the geometry and the three renders, so the first three steps are done every
+ * other frame and the picture they leave is added over both. The frame it goes
+ * over is always this frame's, and what is held is a blob a few texels across.
+ * ================================================================ */
+
+#define BLOOM_TAPS 4
+
+static DCBloom   g_bloom;
+static bool      g_bloom_on;
+static DCTarget* g_bloom_glow;      /* the scene, black but for what glows */
+static DCTarget* g_bloom_x;         /* softened across */
+static DCTarget* g_bloom_y;         /* and then down: what goes over the frame */
+static int       g_bloom_size;      /* what the glow picture was made at */
+static int       g_bloom_soft;      /* and the two softened ones: half of it */
+static bool      g_bloom_held;      /* g_bloom_y holds last frame's glow, and
+                                     * this frame shows it again instead of
+                                     * drawing a new one */
+
+/* Black over the whole of what is being drawn into, at the far depth. The
+ * background the PVR fills in is the colour the screen clears to, which for
+ * these two pictures would come out as a glow over the whole frame. Covering
+ * it costs 16k opaque pixels and does not depend on when the PVR reads that
+ * colour. */
+static void bloom_black_draw(void* user) {
+    pvr_dr_state_t* dr = dc_dr_state();
+    (void)user;
+    (void)dr;   /* this KOS's pvr_dr_target() does not use it */
+
+    float w, h;
+    dc_render_size(&w, &h);
+
+    pvr_poly_cxt_t cxt;
+    pvr_poly_cxt_col(&cxt, PVR_LIST_OP_POLY);
+    cxt.gen.culling = PVR_CULLING_NONE;
+    pvr_poly_hdr_t* hdr = (pvr_poly_hdr_t*)pvr_dr_target(*dr);
+    pvr_poly_compile(hdr, &cxt);
+    pvr_dr_commit(hdr);
+
+    static const float corner[4][2] = {{0, 0}, {1, 0}, {0, 1}, {1, 1}};
+    for (int i = 0; i < 4; i++) {
+        pvr_vertex_t* v = (pvr_vertex_t*)pvr_dr_target(*dr);
+        v->flags = (i == 3) ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
+        v->x = corner[i][0] * w;
+        v->y = corner[i][1] * h;
+        v->z = TARGET_BACK_DEPTH;
+        v->u = v->v = 0.0f;
+        v->argb = 0xFF000000;
+        v->oargb = 0;
+        pvr_dr_commit(v);
+    }
+}
+
+void dc_set_bloom(const DCBloom* bloom) {
+    g_bloom_on = bloom != NULL;
+    /* Turned off, what is in the pictures is nothing to do with the next
+     * frame that turns it back on */
+    if (!bloom) { g_bloom_held = false; return; }
+    g_bloom = *bloom;
+    if (g_bloom.strength <= 0.0f) g_bloom.strength = 1.0f;
+    if (g_bloom.strength > 1.0f)  g_bloom.strength = 1.0f;
+    if (g_bloom.spread <= 0.0f)   g_bloom.spread = 1.0f;
+    if (g_bloom.size <= 0)        g_bloom.size = 128;
+    if (g_bloom.size > 256)       g_bloom.size = 256;
+
+    if (g_bloom_size != g_bloom.size) {
+        if (g_bloom_glow) dc_target_free(g_bloom_glow);
+        if (g_bloom_x)    dc_target_free(g_bloom_x);
+        if (g_bloom_y)    dc_target_free(g_bloom_y);
+        g_bloom_size = g_bloom.size;
+        g_bloom_soft = g_bloom_size > 8 ? g_bloom_size / 2 : 8;
+        g_bloom_glow = dc_target_create(g_bloom_size, g_bloom_size);
+        g_bloom_x    = dc_target_create(g_bloom_soft, g_bloom_soft);
+        g_bloom_y    = dc_target_create(g_bloom_soft, g_bloom_soft);
+        g_bloom_held = false;   /* nothing in the new ones yet */
+    }
+}
+
+/* One softening pass: `from` laid over what is being drawn into, four times,
+ * spread out along one axis. A quarter each, so the four together are the
+ * average of what they cover. Offsets are in texels of the picture being drawn
+ * into, which on the way across is half the size of the one being read. */
+static void bloom_soften(DCTarget* from, float dx, float dy) {
+    static const float at[BLOOM_TAPS] = { -1.5f, -0.5f, 0.5f, 1.5f };
+    float n = (float)g_bloom_soft;
+    for (int i = 0; i < BLOOM_TAPS; i++)
+        dc_draw_target_ex(from, &(DCTargetOpts){
+            .x = at[i] * dx, .y = at[i] * dy,
+            .width = n, .height = n,
+            .alpha = 1.0f / BLOOM_TAPS, .add = true });
+}
+
+/* Queue the two extra pictures and the add, off the draws already queued.
+ * Called from dc_draw_flush() before anything is rendered, so the targets it
+ * adds are picked up by the same loop that renders the caller's own. */
+static void bloom_queue(void) {
+    if (!g_bloom_on || !g_bloom_glow || !g_bloom_glow->txr[0] ||
+        !g_bloom_x || !g_bloom_x->txr[0] || !g_bloom_y || !g_bloom_y->txr[0]) return;
+
+    /* Nothing in the frame gives off light: the whole pass is one walk of the
+     * queue and then nothing, so bloom left on over a scene without a lamp in
+     * it costs next to nothing */
+    int said = queue_count;
+    bool any = false;
+    for (int i = 0; i < said; i++)
+        any |= queue[i].kind == ENTRY_MODEL && !queue[i].target &&
+               queue[i].model->glow_count != 0;
+    if (!any) { g_bloom_held = false; return; }
+
+    /* A new glow every other frame. What it costs is the second walk over the
+     * geometry and three renders, and between them those are the whole of the
+     * effect; what it buys is sharpness the picture does not have. The glow is
+     * a blob a few texels across by the time it is softened, so holding it for
+     * one frame only shows on a whip pan, and the frame it goes over is still
+     * this frame's. */
+    if (g_bloom_held) {
+        g_bloom_held = false;
+        dc_set_target(NULL);
+        dc_draw_target_ex(g_bloom_y, &(DCTargetOpts){
+            .alpha = g_bloom.strength, .add = true });
+        return;
+    }
+    g_bloom_held = true;
+
+    /* Everything headed for the screen, not only what glows: a model with no
+     * lamp in it is still drawn, in black, so a wall keeps the lamp behind it
+     * out of the picture. That is the second walk over the geometry, and the
+     * cost of the effect. */
+    for (int i = 0; i < said; i++) {
+        const DrawEntry* src = &queue[i];
+        if (src->kind != ENTRY_MODEL || src->target) continue;
+        DrawEntry* e = queue_push();
+        if (!e) break;
+        *e = *src;
+        e->target = g_bloom_glow;
+        e->glow = true;
+        e->has_shadow = false;   /* a shadow gives off nothing */
+    }
+
+    /* Every picture starts black: the first so that only what glows is in it,
+     * the other two because the taps are added to what is already there */
+    dc_set_target(g_bloom_glow);
+    dc_draw_call(PVR_LIST_OP_POLY, bloom_black_draw, NULL);
+
+    /* Across, then down. The sideways step is cut by the shape of the screen,
+     * since a square picture holds a 4:3 view: a texel is wider than it is
+     * tall once it is stretched back, and an even spread has to allow for it. */
+    float s = g_bloom.spread;
+    dc_set_target(g_bloom_x);
+    dc_draw_call(PVR_LIST_OP_POLY, bloom_black_draw, NULL);
+    bloom_soften(g_bloom_glow, s * (SCR_H / SCR_W), 0.0f);
+
+    dc_set_target(g_bloom_y);
+    dc_draw_call(PVR_LIST_OP_POLY, bloom_black_draw, NULL);
+    bloom_soften(g_bloom_x, 0.0f, s);
+
+    /* And over the frame */
+    dc_set_target(NULL);
+    dc_draw_target_ex(g_bloom_y, &(DCTargetOpts){
+        .alpha = g_bloom.strength, .add = true });
+}
+
 /* Does the model have anything for this list? Saves a walk over its blocks. */
 static bool model_uses_list(const DMSModel* model, int pvr_list) {
     if (pvr_list == PVR_LIST_OP_POLY) return model->opaque_count != 0;
@@ -418,24 +604,29 @@ static void flush_scene(const DCTarget* target) {
                     cam = &squeezed;
                 }
                 /* Shape into the modifier list, then the mesh it works on;
-                 * the normal draw below leaves that mesh out */
+                 * the normal draw below leaves that mesh out. The glow pass
+                 * wants none of it: a volume and a shadow both take light
+                 * away rather than give it off. */
                 if (e->model->vol_shape && lists[l] == VOL_MOD_LIST) {
-                    dc_model_draw_volume(e->model, e->pos, e->scale, e->yaw, cam);
+                    if (!e->glow)
+                        dc_model_draw_volume(e->model, e->pos, e->scale, e->yaw, cam);
                     continue;
                 }
-                if (e->model->vol_on && lists[l] == VOL_POLY_LIST)
+                if (e->model->vol_on && lists[l] == VOL_POLY_LIST && !e->glow)
                     dc_model_draw_modified(e->model, e->pos, e->scale, e->yaw, cam);
                 if (e->has_shadow && lists[l] == PVR_LIST_TR_POLY)
                     dc_model_draw_shadow(e->model, e->pos, e->scale, e->yaw,
                                          e->has_rot ? e->rot : NULL, cam, e->shadow.light,
                                          e->shadow.sun, e->shadow.floor_y, e->shadow.dark);
                 if (e->add) dc_model_set_add(true);
+                if (e->glow) dc_model_set_glow_only(true);
                 if (e->has_rot)
                     dc_model_draw_list_oriented(e->model, e->pos, e->scale, e->rot,
                                                 cam, lists[l]);
                 else
                     dc_model_draw_list_rotated(e->model, e->pos, e->scale, e->yaw,
                                                cam, lists[l]);
+                if (e->glow) dc_model_set_glow_only(false);
                 if (e->add) dc_model_set_add(false);
             }
         }
@@ -443,6 +634,9 @@ static void flush_scene(const DCTarget* target) {
 }
 
 void dc_draw_flush(void) {
+    /* Adds its own targets to the queue, so it goes before the loop below */
+    bloom_queue();
+
     /* Targets first, in the order they were first used, then the screen */
     DCTarget* done[TARGETS_A_FRAME];
     int done_count = 0;

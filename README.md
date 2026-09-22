@@ -253,6 +253,14 @@ them.
 Credits:
 - Model and textures: Fire demo, Sega Katana SDK (`Kamui2/k2Gasfl`)
 
+### bloom
+
+![bloom](bloom/resources/example.png)
+
+Credits:
+- Level: [Mine Dungeon - Game Level](https://sketchfab.com/3d-models/mine-dungeon-game-level-7f40ddc776454ebb820be19110ed0403)
+  by [Karthik Naidu](https://sketchfab.com/Karthiknaidu97)
+
 ## Blender settings
 
 Export as `.glb`. The converter reads these from the material (Principled

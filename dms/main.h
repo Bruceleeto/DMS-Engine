@@ -87,6 +87,10 @@ typedef struct __attribute__((aligned(32))) {
 /* material_flags bit 15: set by dc_model_points(). The mesh marks a place
  * rather than being something to look at, so it is not drawn */
 #define DMS_MAT_MARKER         (1u << 15)
+/* material_flags bit 16: the glTF material has an Emission colour, so the mesh
+ * gives off light rather than only catching it. dc_set_bloom() makes those
+ * meshes glow into the picture around them */
+#define DMS_MAT_GLOW           (1u << 16)
 
 typedef struct {
     uint32_t vertex_count;
@@ -133,6 +137,7 @@ typedef struct {
     float        max_bind_radius;
     uint32_t     metallic_count;    /* meshes that reflect the environment */
     uint32_t     mirror_count;      /* of those, mirrors */
+    uint32_t     glow_count;        /* meshes that give off light (bloom) */
     char       (*material_names)[32]; /* glTF material name of each mesh, or NULL */
     /* dc_model_volume(). Mesh or texture number plus one, so 0 is "not asked for" */
     void        *mod_headers;       /* the two-parameter header, built on first use */

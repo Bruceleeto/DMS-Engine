@@ -84,7 +84,9 @@ bool dc_model_volume(DMSModel* model, const char* shape, const char* on,
  * none. The default is a light blue wash at a quarter strength. */
 void dc_model_volume_inside(DMSModel* model, uint8_t alpha, uint32_t rgb);
 
-/* Engine use (dc_frame_begin): give the vertex buffer guard its budget back */
+/* Engine use: give the vertex buffer guard its budget back. The PVR winds the
+ * buffer back at the start of every scene, not every frame, so a frame drawing
+ * render targets calls this once per target as well as once for the screen. */
 void dc_model_frame_begin(void);
 
 /* Engine use (dc_draw flush): the mesh the volume works on, two-parameter,
@@ -111,6 +113,10 @@ void dc_model_compile_header(const DMSMesh* mesh, pvr_poly_hdr_t* out, int pvrfo
 
 /* Engine use (dc_set_environment): the image metallic meshes reflect, or NULL */
 void dc_model_set_environment(const dttex_info_t* tex);
+
+/* Engine use (dc_set_bloom): while on, model draws leave out every mesh but
+ * the ones that give off light (DMS_MAT_GLOW) */
+void dc_model_set_glow_only(bool on);
 
 /* ================================================================
  * Light

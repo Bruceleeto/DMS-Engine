@@ -80,6 +80,8 @@ typedef struct {
   char materialName[32];  // glTF material name, so code can find the mesh
   int metallic;           // glTF metallicFactor of 0.5 or more: 1 = reflects the
                           // environment, 2 = a mirror (roughness near 0)
+  int glow;               // glTF emissiveFactor is not black: the material gives
+                          // off light, so dc_set_bloom() blooms it
 
 } Mesh;
 
@@ -1701,6 +1703,11 @@ bool LoadGLTF(const char *filename) {
               e[0] *= avg[0]; e[1] *= avg[1]; e[2] *= avg[2];
             }
             if (e[0] + e[1] + e[2] > 0.01f) {
+              /* On the mesh, for the glow bit: this is the material being read,
+               * so it is the one place the answer is certain. The table below
+               * is the bake's, and is keyed by look rather than by material,
+               * so two materials that look alike share an entry. */
+              dstMesh->glow = 1;
               g_emissive[{dstMesh->textureId, dstMesh->materialColor}] = {e[0], e[1], e[2]};
               printf("Mesh %d material glows: %.2f %.2f %.2f\n", meshIndex, e[0], e[1], e[2]);
             }
@@ -2064,7 +2071,7 @@ static bool SameMaterial(const Mesh &a, const Mesh &b) {
          a.alphaMode == b.alphaMode && a.alphaCutoff == b.alphaCutoff &&
          a.doubleSided == b.doubleSided && a.wrapU == b.wrapU &&
          a.wrapV == b.wrapV && a.collisionOnly == b.collisionOnly &&
-         a.metallic == b.metallic;
+         a.metallic == b.metallic && a.glow == b.glow;
 }
 
 void BuildBlocks(Model *m) {
@@ -2302,6 +2309,7 @@ void CreateTristrippedModel(const Model *sourceModel, Model *destModel) {
     dstMesh->blockId = srcMesh->blockId;
     dstMesh->collisionOnly = srcMesh->collisionOnly;
     dstMesh->metallic = srcMesh->metallic;
+    dstMesh->glow = srcMesh->glow;
     memcpy(dstMesh->materialName, srcMesh->materialName,
            sizeof(dstMesh->materialName));
 
@@ -3580,6 +3588,9 @@ void ExportTristrippedModel(const Model *model, const char *filename,
     // bit  13:   metallic (reflects the environment image)
     // bit  14:   mirror (solid, metallic, roughness near 0: shows only the
     //            environment image, tinted by its vertex colours)
+    // bit  15:   marker (set at runtime by dc_model_points, never written here)
+    // bit  16:   glow (the material has an Emission colour: it gives off light
+    //            rather than only catching it, and blooms)
     uint32_t material_flags = 0;
     material_flags |= (mesh->alphaMode & 0x3);
     material_flags |= (mesh->doubleSided & 0x1) << 2;
@@ -3594,6 +3605,7 @@ void ExportTristrippedModel(const Model *model, const char *filename,
     material_flags |= (mesh->collisionOnly & 0x1) << 12;
     material_flags |= (mesh->metallic != 0) << 13;
     material_flags |= (mesh->metallic == 2 && mesh->alphaMode == 0) << 14;
+    material_flags |= (mesh->glow != 0) << 16;
 
     float alphaCutoff = mesh->alphaCutoff;
     fwrite(&material_flags, sizeof(uint32_t), 1, file);

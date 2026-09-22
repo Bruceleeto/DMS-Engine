@@ -73,6 +73,40 @@ void dc_draw_ex(DMSModel* model, const DCDrawOpts* opts);
 void dc_set_light(const DCLight* light);
 
 /* ================================================================
+ * Bloom
+ * ================================================================ */
+
+/* Bright things bleeding into the picture around them: a lamp, a neon sign, a
+ * fire, a screen in a dark room. Asked for in Blender -- any material with an
+ * Emission colour gives off light -- and switched on with one call:
+ *
+ *     dc_set_bloom(&(DCBloom){ .strength = 1.0f });
+ *
+ * NULL turns it off, which is how it starts, and off it costs nothing. On, the
+ * engine draws the glowing meshes a second time into a small picture, softens
+ * it, and adds it over the frame. It works off the draws already queued, so
+ * the models need no handling and nothing is said twice.
+ *
+ * The small picture is redrawn every other frame and added over both, which is
+ * half the cost for a lag you would have to whip the camera round to see.
+ *
+ * Only the glowing meshes go into that picture, so a lamp behind a wall still
+ * bleeds a little through the wall. In a dark scene it does not show.
+ *
+ * Fields left out are zero, which means "as it is". */
+typedef struct {
+    float strength;   /* how strong the glow is, 0 to 1. 0 means 1 */
+    float spread;     /* how far it bleeds, in texels of the small picture.
+                       * 0 means 1; over about 3 the taps start to show */
+    int   size;       /* the small picture, a power of two from 8 to 256.
+                       * 0 means 128, which costs 96KB of VRAM; 256 costs
+                       * 384KB. Without the VRAM for it, it says so and
+                       * nothing glows. Bigger is sharper, not smoother */
+} DCBloom;
+
+void dc_set_bloom(const DCBloom* bloom);
+
+/* ================================================================
  * Render targets
  *
  * A texture the engine draws into, for a screen inside the level, a mirror, a

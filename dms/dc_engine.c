@@ -283,6 +283,7 @@ bool dc_scene_begin_texture(pvr_ptr_t txr, int w, int h) {
     }
     if (pvr_scene_begin_rtt(txr, w, h, w) < 0) return false;
     g_engine.current_list = -1;
+    dc_model_frame_begin();   /* a new scene: buffer wound back, budget back */
     g_engine.render_w = (float)w;
     g_engine.render_h = (float)h;
     return true;
@@ -295,6 +296,7 @@ void dc_scene_end_texture(void) {
     /* Back to the screen. No wait: KOS renders the texture before the scene
      * that uses it */
     pvr_scene_begin();
+    dc_model_frame_begin();   /* likewise */
     g_engine.current_list = -1;
     g_engine.list_opened = false;
     g_engine.render_w = SCR_W;

@@ -32,6 +32,10 @@ static int32_t g_vtx_left;
 
 static uint32_t g_vtxbuf_size;   /* constant; a PVR register read is ~0.5us */
 
+/* Once a scene, not once a frame: the PVR hands the whole buffer back at the
+ * start of each one. A frame that draws render targets is several scenes, and
+ * charging the screen for what a target used would have it skip meshes with
+ * most of the buffer free. */
 void dc_model_frame_begin(void) {
     if (SHZ_UNLIKELY(!g_vtxbuf_size))
         g_vtxbuf_size = PVR_GET(PVR_TA_VERTBUF_END) - PVR_GET(PVR_TA_VERTBUF_START);
@@ -151,6 +155,9 @@ static DCLight    g_light;
 static bool       g_light_set;
 static ModelLight g_ml;      /* g_light in the space of the model being drawn */
 static int        g_lit;     /* this draw call shades instead of copying argb */
+/* This mesh is drawn only to block the glow behind it (the bloom pass), so it
+ * goes out black. Set per mesh, and only while dc_model_set_glow_only(). */
+static int        g_flat;
 
 void dc_model_set_light(const DCLight* light) {
     g_light_set = light != NULL;
@@ -344,6 +351,76 @@ static void render_fast(const DMSVertex* src, int count,
     pvr_dr_commit(pv);
 }
 
+/* The same, in black. It is how the bloom pass stops a lamp shining through
+ * the wall in front of it: everything that is not a lamp is drawn into the
+ * small picture too, in black, so it takes the depth test and leaves nothing
+ * behind. The mesh keeps its own header, so a cutout still cuts out and a
+ * texture still multiplies -- by black, which is black. */
+static void render_fast_flat(const DMSVertex* src, int count,
+                             pvr_dr_state_t* dr) {
+    if (count < 1) return;
+
+    SHZ_PREFETCH(&src[0]);
+    SHZ_PREFETCH(&src[1]);
+    SHZ_PREFETCH(&src[2]);
+    SHZ_PREFETCH(&src[3]);
+
+    shz_vec4_t t0 = shz_xmtrx_transform_vec4(
+        shz_vec4_init(src[0].x, src[0].y, -src[0].z, 1.0f)
+    );
+    t0 = shz_vec4_swizzle(t0, 1, 2, 3, 0);
+
+    float    cur_invw  = shz_invf_fsrra(t0.w);
+    float    cur_sx    = t0.x * cur_invw;
+    float    cur_sy    = t0.y * cur_invw;
+    uint32_t cur_flags = src[0].flags;
+    float    cur_u     = src[0].u;
+    float    cur_v     = src[0].v;
+
+    for (int i = 1; i < count; i++) {
+        SHZ_PREFETCH(&src[i + 4]);
+
+        float    nx     = src[i].x;
+        float    ny     = src[i].y;
+        float    nz     = -src[i].z;
+        uint32_t nflags = src[i].flags;
+        float    nu     = src[i].u;
+        float    nv     = src[i].v;
+
+        shz_vec4_t next_t = shz_xmtrx_transform_vec4(
+            shz_vec4_init(nx, ny, nz, 1.0f)
+        );
+
+        pvr_vertex_t* pv = pvr_dr_target(*dr);
+        pv->flags = cur_flags;
+        pv->x     = cur_sx;
+        pv->y     = cur_sy;
+        pv->z     = cur_invw;
+        pv->u     = cur_u;
+        pv->v     = cur_v;
+        pv->argb  = 0xFF000000u;
+        pvr_dr_commit(pv);
+
+        next_t = shz_vec4_swizzle(next_t, 1, 2, 3, 0);
+        cur_invw  = shz_invf_fsrra(next_t.w);
+        cur_sx    = next_t.x * cur_invw;
+        cur_sy    = next_t.y * cur_invw;
+        cur_flags = nflags;
+        cur_u     = nu;
+        cur_v     = nv;
+    }
+
+    pvr_vertex_t* pv = pvr_dr_target(*dr);
+    pv->flags = cur_flags;
+    pv->x     = cur_sx;
+    pv->y     = cur_sy;
+    pv->z     = cur_invw;
+    pv->u     = cur_u;
+    pv->v     = cur_v;
+    pv->argb  = 0xFF000000u;
+    pvr_dr_commit(pv);
+}
+
 /* ================================================================
  * Render: clipped path (near-plane intersection)
  * ================================================================ */
@@ -368,7 +445,9 @@ static void render_clipped(const DMSVertex* src, int count,
         g_clip_buffer[i].w = t.w;
         g_clip_buffer[i].u = src[i].u;
         g_clip_buffer[i].v = src[i].v;
-        g_clip_buffer[i].argb = lit ? shade(&src[i]) : src[i].argb;
+        g_clip_buffer[i].argb = g_flat ? (src[i].argb & 0xff000000u)
+                              : lit    ? shade(&src[i])
+                                       : src[i].argb;
         g_clip_buffer[i].flags = compute_outcode(&g_clip_buffer[i]);
         combined_or |= g_clip_buffer[i].flags;
     }
@@ -664,6 +743,12 @@ static inline int sphere_visible(const WorldFrustum* fr, shz_vec3_t c, float r, 
  * left out of the normal draw while it is set: draw_reflections draws them. */
 static const dttex_info_t* g_env;
 
+/* The bloom pass (dc_set_bloom): only meshes that give off light are drawn,
+ * so what lands in the small picture is the glow and nothing else */
+static bool g_glow_only;
+
+void dc_model_set_glow_only(bool on) { g_glow_only = on; g_flat = 0; }
+
 static void draw_reflections(DMSModel* model, shz_vec3_t pos, float scale, float yaw,
                              const float* rot, const DCCamera* cam, int target_list);
 
@@ -699,6 +784,8 @@ static void draw_blocks_list(DMSModel* model, shz_vec3_t pos, float scale,
     shz_sincos_t sc = shz_sincosf(yaw);
     float yaw_cols[9] = { sc.cos, 0.0f, sc.sin,  0.0f, 1.0f, 0.0f,  -sc.sin, 0.0f, sc.cos };
     light_to_model(pos, scale, rot ? rot : yaw_cols);
+    /* The glow pass draws what a mesh gives off, which a light cannot change */
+    if (g_glow_only) g_lit = 0;
     const shz_mat4x4_t* pv = dc_camera_get_pv(cam);
     const WorldFrustum* fr = dc_camera_get_frustum(cam);
     alignas(32) shz_mat4x4_t mvp;
@@ -804,13 +891,17 @@ static void draw_blocks_list(DMSModel* model, shz_vec3_t pos, float scale,
                     shz_xmtrx_load_4x4(&mvp);
                     xm = XM_MVP;
                 }
+                /* In the glow pass everything that is not a lamp is still
+                 * drawn, in black, so it blocks what is behind it */
+                g_flat = g_glow_only && !(mesh->material_flags & DMS_MAT_GLOW);
                 if (batch[i] & 0x80000000u) {
                     g_stats.verts_clipped += mesh->vertex_count;
                     render_clipped(mesh->vertices, mesh->vertex_count, dr, g_lit);
                 } else {
                     g_stats.verts_xformed += mesh->vertex_count;
-                    if (g_lit) render_fast_lit(mesh->vertices, mesh->vertex_count, dr);
-                    else       render_fast(mesh->vertices, mesh->vertex_count, dr);
+                    if (g_flat)     render_fast_flat(mesh->vertices, mesh->vertex_count, dr);
+                    else if (g_lit) render_fast_lit(mesh->vertices, mesh->vertex_count, dr);
+                    else            render_fast(mesh->vertices, mesh->vertex_count, dr);
                 }
             }
         }
@@ -829,6 +920,10 @@ static void draw_skinned_list(DMSModel* model, shz_vec3_t pos, float scale,
                      : alpha_mode == 1 ? PVR_LIST_PT_POLY : PVR_LIST_TR_POLY;
         if (g_add ? target_list != PVR_LIST_TR_POLY : pvr_list != target_list) continue;
         if (mesh->material_flags & (DMS_MAT_COLLISION_ONLY | DMS_MAT_MARKER)) continue;
+        /* The skinned path writes its own vertices and has no black mode, so
+         * in the glow pass a skinned model puts its lamps in but does not
+         * block anything: it is left out rather than drawn in its own colours */
+        if (g_glow_only && !(mesh->material_flags & DMS_MAT_GLOW)) continue;
         if (model->vol_on == m + 1) continue;   /* drawn by the volume path */
 
         if (!dr) {
@@ -964,6 +1059,7 @@ static const DMSVertex* env_vertices(const DMSMesh* mesh, const float* right,
 static void draw_reflections(DMSModel* model, shz_vec3_t pos, float scale, float yaw,
                              const float* rot, const DCCamera* cam, int target_list) {
     if (!g_env || !model->metallic_count) return;
+    if (g_glow_only) return;   /* a reflection is caught light, not given off */
     g_lit = 0;   /* the reflection passes carry their own colour */
     if (target_list == PVR_LIST_PT_POLY) return;
     /* Same fallthrough as draw_blocks_list */
@@ -1461,6 +1557,9 @@ DMSModel* dc_model_load(const char* filename) {
             model->metallic_count++;
             if (mesh->material_flags & DMS_MAT_MIRROR) model->mirror_count++;
         }
+        if ((mesh->material_flags & DMS_MAT_GLOW) &&
+            !(mesh->material_flags & DMS_MAT_COLLISION_ONLY))
+            model->glow_count++;
     }
 
     fclose(f);
@@ -1483,7 +1582,7 @@ void dc_model_materials(const DMSModel* model) {
     for (uint32_t m = 0; m < model->mesh_count; m++) {
         const DMSMesh* mesh = &model->meshes[m];
         uint32_t mode = mesh->material_flags & 0x3;
-        printf("  [%2lu] %-24s %6lu verts %5lu tris  tex %2ld  %s%s%s%s\n",
+        printf("  [%2lu] %-24s %6lu verts %5lu tris  tex %2ld  %s%s%s%s%s\n",
                (unsigned long)m,
                model->material_names ? model->material_names[m] : "(no name)",
                (unsigned long)mesh->vertex_count,
@@ -1492,7 +1591,8 @@ void dc_model_materials(const DMSModel* model) {
                mode == 0 ? "opaque" : mode == 1 ? "cutout" : "transparent",
                (mesh->material_flags & DMS_MAT_COLLISION_ONLY) ? " collision-only" : "",
                (mesh->material_flags & DMS_MAT_MIRROR)   ? " mirror"   : "",
-               (mesh->material_flags & DMS_MAT_METALLIC) ? " metallic" : "");
+               (mesh->material_flags & DMS_MAT_METALLIC) ? " metallic" : "",
+               (mesh->material_flags & DMS_MAT_GLOW)     ? " glow"     : "");
     }
 }
 
