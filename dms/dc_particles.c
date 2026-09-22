@@ -39,6 +39,7 @@ struct DCParticles {
     Particle*      p;
     int            most, live;
     float          carry;       /* part of a particle left over from last frame */
+    float          scale;       /* dc_particles_scale() */
     bool           paused;
     uint32_t       seed;
     const DCCamera* cam;        /* the camera it was last drawn with */
@@ -127,6 +128,7 @@ DCParticles* dc_particles_create(int most, const DCParticleOpts* opts) {
     /* Fields left out mean "as it is" */
     if (s->o.life <= 0.0f)   s->o.life = 2.0f;
     if (s->o.size <= 0.0f)   s->o.size = 1.0f;
+    s->scale = 1.0f;
     if (s->o.grow <= 0.0f)   s->o.grow = 1.0f;
     if (s->o.start == 0)     s->o.start = 0xFFFFFF;
     if (s->o.middle == 0)    s->o.middle = s->o.start;
@@ -175,6 +177,10 @@ void dc_particles_pause(DCParticles* s, bool paused) {
     if (s) s->paused = paused;
 }
 
+void dc_particles_scale(DCParticles* p, float scale) {
+    if (p) p->scale = scale > 0.0f ? scale : 0.0f;
+}
+
 int dc_particles_count(const DCParticles* s) {
     return s ? s->live : 0;
 }
@@ -184,16 +190,19 @@ int dc_particles_count(const DCParticles* s) {
 static void spawn(DCParticles* s, int how_many) {
     for (int i = 0; i < how_many && s->live < s->most; i++) {
         Particle* p = &s->p[s->live++];
-        p->x = s->o.pos.x + rnd_signed(s) * s->o.spread.x;
-        p->y = s->o.pos.y + rnd_signed(s) * s->o.spread.y;
-        p->z = s->o.pos.z + rnd_signed(s) * s->o.spread.z;
-        p->vx = s->o.speed.x + rnd_signed(s) * s->o.speed_spread.x;
-        p->vy = s->o.speed.y + rnd_signed(s) * s->o.speed_spread.y;
-        p->vz = s->o.speed.z + rnd_signed(s) * s->o.speed_spread.z;
+        /* Everything measured in world units is scaled together, so the
+         * whole puff grows and shrinks keeping its shape */
+        float k = s->scale;
+        p->x = s->o.pos.x + rnd_signed(s) * s->o.spread.x * k;
+        p->y = s->o.pos.y + rnd_signed(s) * s->o.spread.y * k;
+        p->z = s->o.pos.z + rnd_signed(s) * s->o.spread.z * k;
+        p->vx = (s->o.speed.x + rnd_signed(s) * s->o.speed_spread.x) * k;
+        p->vy = (s->o.speed.y + rnd_signed(s) * s->o.speed_spread.y) * k;
+        p->vz = (s->o.speed.z + rnd_signed(s) * s->o.speed_spread.z) * k;
         p->age = 0.0f;
         p->life = s->o.life + rnd_signed(s) * s->o.life_spread;
         if (p->life < 0.05f) p->life = 0.05f;
-        p->size = s->o.size + rnd_signed(s) * s->o.size_spread;
+        p->size = (s->o.size + rnd_signed(s) * s->o.size_spread) * k;
         if (p->size < 0.0f) p->size = 0.0f;
         p->spin_angle = s->o.spin != 0.0f ? rnd_unit(s) * F_PI * 2.0f : 0.0f;
         p->bright = 0.7f + rnd_unit(s) * 0.3f;

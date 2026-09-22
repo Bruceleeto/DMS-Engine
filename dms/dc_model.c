@@ -131,8 +131,150 @@ static inline void submit_vert(ClipVertex* v, uint32_t flags) {
 }
 
 /* ================================================================
+ * Runtime light
+ *
+ * One light, multiplied over the colours already baked into the vertices. It
+ * is moved into the space the model's vertices are stored in once per draw
+ * call, so the vertex loop dots it straight against the int8 normal each
+ * vertex already carries and nothing is rotated per vertex.
+ * ================================================================ */
+
+typedef struct {
+    float x, y, z;       /* the light, in the model's own space */
+    float pos_w;         /* 1 for a light in a place, 0 for a sun */
+    float r, g, b;       /* colour, times 256/127 for the byte multiply below */
+    float ambient;       /* times 127, to match the length of an int8 normal */
+    float inv_range;     /* 0 for a sun, which never fades */
+} ModelLight;
+
+static DCLight    g_light;
+static bool       g_light_set;
+static ModelLight g_ml;      /* g_light in the space of the model being drawn */
+static int        g_lit;     /* this draw call shades instead of copying argb */
+
+void dc_model_set_light(const DCLight* light) {
+    g_light_set = light != NULL;
+    if (light) g_light = *light;
+}
+
+int dc_model_points(DMSModel* model, const char* material,
+                    shz_vec3_t* out, int max) {
+    if (!model || !material || !model->material_names) return 0;
+    int found = 0;
+    for (uint32_t m = 0; m < model->mesh_count; m++) {
+        if (strcmp(model->material_names[m], material)) continue;
+        DMSMesh* mesh = &model->meshes[m];
+        mesh->material_flags |= DMS_MAT_MARKER;
+        for (uint32_t i = 0; i < mesh->vertex_count; i++) {
+            const DMSVertex* v = &mesh->vertices[i];
+            /* A strip repeats its corners, so only the new ones are kept */
+            int seen = 0;
+            for (int j = 0; j < found && j < max; j++)
+                if (out[j].x == v->x && out[j].y == v->y && out[j].z == v->z) {
+                    seen = 1;
+                    break;
+                }
+            if (seen) continue;
+            if (found < max) out[found] = shz_vec3_init(v->x, v->y, v->z);
+            found++;
+        }
+    }
+    return found;
+}
+
+/* Move the light into the space the vertices are stored in. cols is where the
+ * model's x, y and z axes point in the world (the rot[9] of the public call),
+ * so its transpose brings a world direction back the other way. */
+static void light_to_model(shz_vec3_t pos, float scale, const float* cols) {
+    g_lit = g_light_set && scale > 0.0f;
+    if (!g_lit) return;
+
+    float w[3];
+    if (g_light.sun) {
+        w[0] = -g_light.pos.x; w[1] = -g_light.pos.y; w[2] = -g_light.pos.z;
+        float n = shz_inv_sqrtf(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+        w[0] *= n; w[1] *= n; w[2] *= n;
+        g_ml.pos_w = 0.0f;
+        g_ml.inv_range = 0.0f;
+    } else {
+        float inv_scale = 1.0f / scale;
+        w[0] = (g_light.pos.x - pos.x) * inv_scale;
+        w[1] = (g_light.pos.y - pos.y) * inv_scale;
+        w[2] = (g_light.pos.z - pos.z) * inv_scale;
+        g_ml.pos_w = 1.0f;
+        g_ml.inv_range = scale / (g_light.range > 0.0f ? g_light.range : 500.0f);
+    }
+    g_ml.x = cols[0] * w[0] + cols[1] * w[1] + cols[2] * w[2];
+    g_ml.y = cols[3] * w[0] + cols[4] * w[1] + cols[5] * w[2];
+    g_ml.z = cols[6] * w[0] + cols[7] * w[1] + cols[8] * w[2];
+
+    const float k = 256.0f / 127.0f;
+    int white = g_light.r <= 0.0f && g_light.g <= 0.0f && g_light.b <= 0.0f;
+    g_ml.r = (white ? 1.0f : g_light.r) * k;
+    g_ml.g = (white ? 1.0f : g_light.g) * k;
+    g_ml.b = (white ? 1.0f : g_light.b) * k;
+    g_ml.ambient = (g_light.ambient > 0.0f ? g_light.ambient : 0.25f) * 127.0f;
+}
+
+/* The vertex's baked colour with the light over it. pos_w is what lets a sun
+ * use the same arithmetic: the difference below collapses to the light
+ * direction, which is already unit length, and nothing fades. */
+static inline uint32_t shade(const DMSVertex* s) {
+    float dx = g_ml.x - s->x * g_ml.pos_w;
+    float dy = g_ml.y - s->y * g_ml.pos_w;
+    float dz = g_ml.z - s->z * g_ml.pos_w;
+    float d2 = dx * dx + dy * dy + dz * dz;
+    float inv = shz_inv_sqrtf(d2);
+
+    float ndl = (s->nx * dx + s->ny * dy + s->nz * dz) * inv;
+    float att = 1.0f - (d2 * inv) * g_ml.inv_range;
+    if (ndl < 0.0f) ndl = 0.0f;
+    if (att < 0.0f) att = 0.0f;
+    float lit = g_ml.ambient + ndl * att;
+
+    uint32_t c = s->argb;
+    uint32_t r = (((c >> 16) & 0xff) * (uint32_t)(lit * g_ml.r)) >> 8;
+    uint32_t g = (((c >>  8) & 0xff) * (uint32_t)(lit * g_ml.g)) >> 8;
+    uint32_t b = (( c        & 0xff) * (uint32_t)(lit * g_ml.b)) >> 8;
+    if (r > 255) r = 255;
+    if (g > 255) g = 255;
+    if (b > 255) b = 255;
+    return (c & 0xff000000u) | (r << 16) | (g << 8) | b;
+}
+
+/* ================================================================
  * Render: fast path (static mesh, fully inside frustum)
  * ================================================================ */
+
+/* The lit copy of the loop below. The shading goes between the matrix multiply
+ * and the divide that wants its result, which is where the unlit loop stalls,
+ * so this one has no software pipeline to keep it busy. */
+static void render_fast_lit(const DMSVertex* src, int count,
+                            pvr_dr_state_t* dr) {
+    SHZ_PREFETCH(&src[0]);
+    SHZ_PREFETCH(&src[1]);
+
+    for (int i = 0; i < count; i++) {
+        SHZ_PREFETCH(&src[i + 2]);
+
+        shz_vec4_t t = shz_xmtrx_transform_vec4(
+            shz_vec4_init(src[i].x, src[i].y, -src[i].z, 1.0f)
+        );
+        uint32_t argb = shade(&src[i]);
+        t = shz_vec4_swizzle(t, 1, 2, 3, 0);
+
+        float inv_w = shz_invf_fsrra(t.w);
+        pvr_vertex_t* pv = pvr_dr_target(*dr);
+        pv->flags = src[i].flags;
+        pv->x     = t.x * inv_w;
+        pv->y     = t.y * inv_w;
+        pv->z     = inv_w;
+        pv->u     = src[i].u;
+        pv->v     = src[i].v;
+        pv->argb  = argb;
+        pvr_dr_commit(pv);
+    }
+}
 
 static void render_fast(const DMSVertex* src, int count,
                         pvr_dr_state_t* dr) {
@@ -207,7 +349,7 @@ static void render_fast(const DMSVertex* src, int count,
  * ================================================================ */
 
 static void render_clipped(const DMSVertex* src, int count,
-                           pvr_dr_state_t* dr) {
+                           pvr_dr_state_t* dr, int lit) {
     g_dr = dr;
 
     /* Transform all verts, compute outcodes */
@@ -226,7 +368,7 @@ static void render_clipped(const DMSVertex* src, int count,
         g_clip_buffer[i].w = t.w;
         g_clip_buffer[i].u = src[i].u;
         g_clip_buffer[i].v = src[i].v;
-        g_clip_buffer[i].argb = src[i].argb;
+        g_clip_buffer[i].argb = lit ? shade(&src[i]) : src[i].argb;
         g_clip_buffer[i].flags = compute_outcode(&g_clip_buffer[i]);
         combined_or |= g_clip_buffer[i].flags;
     }
@@ -555,6 +697,8 @@ static void draw_blocks_list(DMSModel* model, shz_vec3_t pos, float scale,
      * lists would each get a copy of the transparent block */
     if (target_list == PVR_LIST_OP_MOD || target_list == PVR_LIST_TR_MOD) return;
     shz_sincos_t sc = shz_sincosf(yaw);
+    float yaw_cols[9] = { sc.cos, 0.0f, sc.sin,  0.0f, 1.0f, 0.0f,  -sc.sin, 0.0f, sc.cos };
+    light_to_model(pos, scale, rot ? rot : yaw_cols);
     const shz_mat4x4_t* pv = dc_camera_get_pv(cam);
     const WorldFrustum* fr = dc_camera_get_frustum(cam);
     alignas(32) shz_mat4x4_t mvp;
@@ -580,7 +724,8 @@ static void draw_blocks_list(DMSModel* model, shz_vec3_t pos, float scale,
     int list = target_list == PVR_LIST_OP_POLY ? 0 : target_list == PVR_LIST_PT_POLY ? 1 : 2;
 
     uint32_t batch[DRAW_BATCH];          /* mesh index, top bit = clip path */
-    uint32_t skip = DMS_MAT_COLLISION_ONLY | (g_env ? DMS_MAT_MIRROR : 0);
+    uint32_t skip = DMS_MAT_COLLISION_ONLY | DMS_MAT_MARKER |
+                    (g_env ? DMS_MAT_MIRROR : 0);
 
     uint32_t run_first = model->list_runs[list], run_last = model->list_runs[list + 1];
     if (g_add) {
@@ -661,10 +806,11 @@ static void draw_blocks_list(DMSModel* model, shz_vec3_t pos, float scale,
                 }
                 if (batch[i] & 0x80000000u) {
                     g_stats.verts_clipped += mesh->vertex_count;
-                    render_clipped(mesh->vertices, mesh->vertex_count, dr);
+                    render_clipped(mesh->vertices, mesh->vertex_count, dr, g_lit);
                 } else {
                     g_stats.verts_xformed += mesh->vertex_count;
-                    render_fast(mesh->vertices, mesh->vertex_count, dr);
+                    if (g_lit) render_fast_lit(mesh->vertices, mesh->vertex_count, dr);
+                    else       render_fast(mesh->vertices, mesh->vertex_count, dr);
                 }
             }
         }
@@ -682,7 +828,7 @@ static void draw_skinned_list(DMSModel* model, shz_vec3_t pos, float scale,
         int pvr_list = alpha_mode == 0 ? PVR_LIST_OP_POLY
                      : alpha_mode == 1 ? PVR_LIST_PT_POLY : PVR_LIST_TR_POLY;
         if (g_add ? target_list != PVR_LIST_TR_POLY : pvr_list != target_list) continue;
-        if (mesh->material_flags & DMS_MAT_COLLISION_ONLY) continue;
+        if (mesh->material_flags & (DMS_MAT_COLLISION_ONLY | DMS_MAT_MARKER)) continue;
         if (model->vol_on == m + 1) continue;   /* drawn by the volume path */
 
         if (!dr) {
@@ -818,6 +964,7 @@ static const DMSVertex* env_vertices(const DMSMesh* mesh, const float* right,
 static void draw_reflections(DMSModel* model, shz_vec3_t pos, float scale, float yaw,
                              const float* rot, const DCCamera* cam, int target_list) {
     if (!g_env || !model->metallic_count) return;
+    g_lit = 0;   /* the reflection passes carry their own colour */
     if (target_list == PVR_LIST_PT_POLY) return;
     /* Same fallthrough as draw_blocks_list */
     if (target_list == PVR_LIST_OP_MOD || target_list == PVR_LIST_TR_MOD) return;
@@ -926,7 +1073,7 @@ static void draw_reflections(DMSModel* model, shz_vec3_t pos, float scale, float
             g_stats.tris_drawn += mesh->tri_count;
             if (clip) {
                 g_stats.verts_clipped += mesh->vertex_count;
-                render_clipped(vtx[p], mesh->vertex_count, dr);
+                render_clipped(vtx[p], mesh->vertex_count, dr, 0);
             } else {
                 g_stats.verts_xformed += mesh->vertex_count;
                 render_fast(vtx[p], mesh->vertex_count, dr);
@@ -1624,7 +1771,7 @@ void dc_model_draw_shadow(DMSModel* model, shz_vec3_t pos, float scale, float ya
     /* 1. clean the buffer under the shadow */
     shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &g_shadow_clean_hdr);
     shz_xmtrx_load_4x4(&clean_mvp);
-    render_clipped(quad, 4, dr);
+    render_clipped(quad, 4, dr, 0);
 
     /* 2. the model, squashed, in grey */
     shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &g_shadow_grey_hdr);
@@ -1658,14 +1805,14 @@ void dc_model_draw_shadow(DMSModel* model, shz_vec3_t pos, float scale, float ya
         } else {
             g_stats.verts_clipped += mesh->vertex_count;
             shz_xmtrx_load_4x4(&mvp);
-            render_clipped(mesh->vertices, mesh->vertex_count, dr);
+            render_clipped(mesh->vertices, mesh->vertex_count, dr, 0);
         }
     }
 
     /* 3. the buffer onto the screen */
     shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &g_shadow_flush_hdr);
     shz_xmtrx_load_4x4(&flush_mvp);
-    render_clipped(quad, 4, dr);
+    render_clipped(quad, 4, dr, 0);
 }
 
 /* ================================================================

@@ -113,6 +113,37 @@ void dc_model_compile_header(const DMSMesh* mesh, pvr_poly_hdr_t* out, int pvrfo
 void dc_model_set_environment(const dttex_info_t* tex);
 
 /* ================================================================
+ * Light
+ * ================================================================ */
+
+/* A light that can move. See dc_set_light() in dc_draw.h. */
+typedef struct {
+    shz_vec3_t pos;      /* where the light is */
+    bool       sun;      /* pos is the way it shines instead (a far away light) */
+    float      r, g, b;  /* colour, 0 to 1. All zero means white */
+    float      range;    /* how far it reaches. 0 means 500. A sun has none */
+    float      ambient;  /* 0 to 1, how lit the side facing away is. 0 means 0.25 */
+} DCLight;
+
+/* Engine use (dc_set_light): the light, or NULL for none */
+void dc_model_set_light(const DCLight* light);
+
+/* ================================================================
+ * Markers
+ * ================================================================ */
+
+/* Where a model marks places rather than showing something: the corners of
+ * every mesh whose material has that name, in the model's own space, each
+ * corner once and in the order the file holds them. Those meshes stop being
+ * drawn, since asking for them says they are markers.
+ *
+ * It is how an effect made in code is put where the model says it goes: a
+ * flame over a burner, a muzzle, a place a door swings from. Returns how many
+ * there were, which may be more than max. */
+int dc_model_points(DMSModel* model, const char* material,
+                    shz_vec3_t* out, int max);
+
+/* ================================================================
  * Animation
  * ================================================================ */
 

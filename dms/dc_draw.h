@@ -59,6 +59,20 @@ typedef struct {
 void dc_draw_ex(DMSModel* model, const DCDrawOpts* opts);
 
 /* ================================================================
+ * Light
+ * ================================================================ */
+
+/* One light that can move, over everything drawn from now on. NULL turns it
+ * off, which is how a model starts: the colours baked into it in Blender go
+ * out as they are. With a light set they are multiplied by how much of it each
+ * vertex catches, so the baking stays and the light is what moves.
+ *
+ *     dc_set_light(&(DCLight){ .pos = torch, .range = 300.0f });
+ *
+ * Static models only; one with a skeleton ignores it. */
+void dc_set_light(const DCLight* light);
+
+/* ================================================================
  * Render targets
  *
  * A texture the engine draws into, for a screen inside the level, a mirror, a

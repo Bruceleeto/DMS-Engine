@@ -2053,11 +2053,12 @@ static void CutStrip(const std::vector<Vertex> &v, const std::vector<uint32_t> &
 }
 
 // Meshes with the same material are merged inside a block
-// Same look. Materials that look the same but are named differently still
-// merge, unless one of them has no texture: an untextured material with a
-// name of its own is there for code to find (a screen for a render target).
+// Same look and same name. Two materials that look alike but are named apart
+// are kept apart: the name is how code finds a mesh, and merging them makes
+// that lookup answer with both (the flame and its reflection in fire.glb
+// share a texture, so they used to come back as one mesh).
 static bool SameMaterial(const Mesh &a, const Mesh &b) {
-  if (a.textureId < 0 && strcmp(a.materialName, b.materialName) != 0)
+  if (strcmp(a.materialName, b.materialName) != 0)
     return false;
   return a.textureId == b.textureId && a.materialColor == b.materialColor &&
          a.alphaMode == b.alphaMode && a.alphaCutoff == b.alphaCutoff &&

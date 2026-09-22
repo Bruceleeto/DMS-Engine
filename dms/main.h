@@ -84,6 +84,9 @@ typedef struct __attribute__((aligned(32))) {
 /* material_flags bit 14: a mirror (solid, metallic, roughness near 0). Shows
  * the environment image in place of its own texture */
 #define DMS_MAT_MIRROR         (1u << 14)
+/* material_flags bit 15: set by dc_model_points(). The mesh marks a place
+ * rather than being something to look at, so it is not drawn */
+#define DMS_MAT_MARKER         (1u << 15)
 
 typedef struct {
     uint32_t vertex_count;

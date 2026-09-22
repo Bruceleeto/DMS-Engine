@@ -83,6 +83,13 @@ void dc_particles_burst(DCParticles* p, int how_many);
  * again. A fire being put out. */
 void dc_particles_pause(DCParticles* p, bool paused);
 
+/* How big the whole thing is from now on, as a multiple: a fire dying down,
+ * a jet opening up. 1 is as asked for. Everything measured in world units
+ * goes with it -- how big they are, how fast they set off, how far they
+ * scatter -- so a flame at 0.5 is half as tall as well as half as wide. The
+ * ones already alive carry on as they were. */
+void dc_particles_scale(DCParticles* p, float scale);
+
 /* How many are alive, for the stats line */
 int dc_particles_count(const DCParticles* p);
 

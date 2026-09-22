@@ -228,6 +228,31 @@ dinosaur, bones, scanner, stand and the animation — is one `.glb`.
 Credits:
 - Model and textures: Scanner demo, Sega Katana SDK (PowerVR / VideoLogic)
 
+### fire
+
+![fire](fire/resources/example.png)
+
+Four gas flames on a burner lighting a head and torso, after Fire from Sega's
+Katana SDK. Turning the gas up makes the flames stand taller and the light on
+the face brighter: one number does both, so they cannot drift apart. The flames
+are not in the model and never were — the `.glb` holds eight points in a mesh
+that is never drawn, four at the bottom of the flames and four at the top, and
+`dc_model_points()` reads them out so the particles land where the artist put
+them.
+
+| Button | Action |
+|---|---|
+| D-pad up / down | Turn the gas up and down |
+| Stick | Turn the camera |
+| L / R | Zoom |
+| X | Swap the light in the burner for the original's moving sun |
+| B | Light off |
+| Y | Flames off |
+| Start | Exit |
+
+Credits:
+- Model and textures: Fire demo, Sega Katana SDK (`Kamui2/k2Gasfl`)
+
 ## Blender settings
 
 Export as `.glb`. The converter reads these from the material (Principled
@@ -351,7 +376,8 @@ so black is invisible. `.smoke` mixes them in instead, for dark smoke and
 dust. Without `.texture` they get a soft round glow made in code, which is
 white, so `.start`, `.middle` and `.end` colour them. `dc_particles_burst()`
 throws a lot at once (an explosion), `dc_particles_move()` moves where they
-come from (an emitter that follows something).
+come from (an emitter that follows something), `dc_particles_scale()` turns the
+whole puff up and down keeping its shape (a flame on a gas tap).
 
 The whole puff is left out when it is off screen. They cost four vertices
 each, so the count is cheap; what costs is the screen they cover, and a camera
@@ -395,3 +421,37 @@ neither, and the wrong mesh looks exactly like a broken effect. Call
 it prints every mesh with its material name, counts, texture and alpha mode.
 Build with `-DDMS_VOLUME_DEBUG=1` for a line a second saying what actually
 reached the hardware. See `scanner`.
+
+### Lights
+
+One light that can move, over everything drawn from then on:
+
+```c
+dc_set_light(&(DCLight){ .pos = torch, .range = 300.0f });
+```
+
+Left out, or set to NULL, nothing changes and nothing costs: the colours baked
+in Blender go out as they are. With a light set they are multiplied by how much
+of it each vertex catches, so the baking stays and the light is what moves.
+`.sun = true` makes `.pos` the way it shines instead of where it is (no range,
+no falloff). `.r`, `.g`, `.b` colour it, `.ambient` is how lit the side facing
+away is. Static models only; one with a skeleton ignores it.
+
+It is a second, lit copy of the vertex loop. The normal is already in the
+32-byte vertex, and the light is moved into the model's own space once per
+draw, so no normal is ever transformed. See `fire`.
+
+### Markers
+
+Where an effect made in code goes, said in Blender rather than typed in as
+numbers. Give a mesh a material of its own, put it where the effect belongs,
+and read its corners back out:
+
+```c
+shz_vec3_t point[8];
+int n = dc_model_points(scene, "MFIRE", point, 8);
+```
+
+Every mesh wearing that material stops being drawn — asking for it says it is a
+marker, not something to look at. Good for a flame over a burner, a muzzle, a
+spawn, the place a door swings from. `fire` uses it for its four flames.

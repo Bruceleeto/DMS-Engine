@@ -82,6 +82,10 @@ void dc_set_camera(const DCCamera* cam) {
     current_cam = cam;
 }
 
+void dc_set_light(const DCLight* light) {
+    dc_model_set_light(light);
+}
+
 void dc_draw(DMSModel* model, shz_vec3_t pos) {
     queue_model(model, pos, 1.0f);
 }
