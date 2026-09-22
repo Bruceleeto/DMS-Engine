@@ -19,37 +19,37 @@ static DCModelStats g_stats;
 /* ================================================================
  * Vertex buffer guard
  *
- * If the PVR vertex buffer overflows, the TA writes over other VRAM and
- * the GPU hangs, so a mesh that might not fit is skipped. Drawing resumes
- * by itself as soon as there is room again (the next frame, or a smaller
- * mesh).
- *
- * Reading the TA's write position is slow (~0.5us a register, it was half
- * the cost of drawing a small mesh), so it is read once per model draw call
- * and the bytes sent after that are counted here instead. The count can only
- * run ahead of the TA, never behind it.
+ * An overflow makes the TA write over other VRAM and hang the GPU, so a mesh
+ * that might not fit is skipped. The budget is the buffer size, set once a
+ * frame and counted down in software. Reading the TA's write position instead
+ * returned the previous frame's total, which halved the budget.
  * ================================================================ */
 
 #define VTXBUF_MARGIN (32 * 1024)   /* TA lag, background poly, HUD after models */
 
-static void vtxbuf_warn(void) {
-    static int warned = 0;
-    if (!warned) {
-        warned = 1;
-        printf("DMS: PVR vertex buffer full (%luKB), skipping meshes so it doesn't hang. "
-               "Raise DCInitParams.vram_size or draw less.\n",
-               (unsigned long)((PVR_GET(PVR_TA_VERTBUF_END) - PVR_GET(PVR_TA_VERTBUF_START)) / 1024));
-    }
-}
-
 /* Bytes left in the vertex buffer after the safety margin */
 static int32_t g_vtx_left;
 
-/* Re-read the real position (the HUD, other code and the last frame all
- * moved it); both registers, KOS swaps buffers every frame */
-static inline void vtxbuf_sync(void) {
-    g_vtx_left = (int32_t)(PVR_GET(PVR_TA_VERTBUF_END) - PVR_GET(PVR_TA_VERTBUF_POS)) - VTXBUF_MARGIN;
+static uint32_t g_vtxbuf_size;   /* constant; a PVR register read is ~0.5us */
+
+void dc_model_frame_begin(void) {
+    if (SHZ_UNLIKELY(!g_vtxbuf_size))
+        g_vtxbuf_size = PVR_GET(PVR_TA_VERTBUF_END) - PVR_GET(PVR_TA_VERTBUF_START);
+    g_vtx_left = (int32_t)g_vtxbuf_size - VTXBUF_MARGIN;
 }
+
+static void vtxbuf_warn_need(int32_t need) {
+    static int warned = 0;
+    if (warned) return;
+    warned = 1;
+    printf("DMS: PVR vertex buffer full (%luKB buffer, %ldKB left, %ldKB wanted), "
+           "skipping meshes so it doesn't hang. Raise DCInitParams.vram_size or "
+           "draw less.\n",
+           (unsigned long)(g_vtxbuf_size / 1024),
+           (long)(g_vtx_left / 1024), (long)(need / 1024));
+}
+
+static void vtxbuf_warn(void) { vtxbuf_warn_need(0); }
 
 /* Clipped meshes are mostly plain strips, so both paths are estimated at
  * 32 bytes/vertex to get in. A clipped mesh then counts what it really
@@ -60,7 +60,7 @@ static inline int vtxbuf_full(const DMSMesh* mesh, int clip) {
         g_vtx_left -= clip ? 32 : need;
         return 0;
     }
-    vtxbuf_warn();
+    vtxbuf_warn_need(need);
     g_stats.meshes_vtxfull++;
     return 1;
 }
@@ -551,6 +551,9 @@ static inline shz_vec3_t turn_centre(const float* rot, float yaw, shz_sincos_t s
 static void draw_blocks_list(DMSModel* model, shz_vec3_t pos, float scale,
                              float yaw, const float* rot,
                              const DCCamera* cam, int target_list) {
+    /* The block index below falls through to 2, so without this the modifier
+     * lists would each get a copy of the transparent block */
+    if (target_list == PVR_LIST_OP_MOD || target_list == PVR_LIST_TR_MOD) return;
     shz_sincos_t sc = shz_sincosf(yaw);
     const shz_mat4x4_t* pv = dc_camera_get_pv(cam);
     const WorldFrustum* fr = dc_camera_get_frustum(cam);
@@ -618,6 +621,7 @@ static void draw_blocks_list(DMSModel* model, shz_vec3_t pos, float scale,
             for (; m < run_end && n < DRAW_BATCH; m++) {
                 const DMSMesh* mesh = &model->meshes[m];
                 if (mesh->material_flags & skip) continue;
+                if (model->vol_on == m + 1) continue;   /* drawn by the volume path */
                 shz_vec3_t tc = turn_centre(rot, yaw, sc, mesh->bound_cx, mesh->bound_cy,
                                             mesh->bound_cz);
                 shz_vec3_t mc = shz_vec3_init(pos.x + tc.x * scale, pos.y + tc.y * scale,
@@ -679,6 +683,7 @@ static void draw_skinned_list(DMSModel* model, shz_vec3_t pos, float scale,
                      : alpha_mode == 1 ? PVR_LIST_PT_POLY : PVR_LIST_TR_POLY;
         if (g_add ? target_list != PVR_LIST_TR_POLY : pvr_list != target_list) continue;
         if (mesh->material_flags & DMS_MAT_COLLISION_ONLY) continue;
+        if (model->vol_on == m + 1) continue;   /* drawn by the volume path */
 
         if (!dr) {
             dc_list_begin(target_list);
@@ -692,7 +697,6 @@ void dc_model_draw_list_rotated(DMSModel* model, shz_vec3_t pos, float scale,
                                 float yaw, const DCCamera* cam, int target_list) {
     if (!model || model->mesh_count == 0) return;
 
-    vtxbuf_sync();
     if (model->skeleton)
         draw_skinned_list(model, pos, scale, yaw, cam, target_list);
     else {
@@ -705,7 +709,6 @@ void dc_model_draw_list_oriented(DMSModel* model, shz_vec3_t pos, float scale,
                                  const float rot[9], const DCCamera* cam, int target_list) {
     if (!model || model->mesh_count == 0 || model->skeleton) return;
 
-    vtxbuf_sync();
     draw_blocks_list(model, pos, scale, 0.0f, rot, cam, target_list);
     if (!g_add) draw_reflections(model, pos, scale, 0.0f, rot, cam, target_list);
 }
@@ -816,6 +819,8 @@ static void draw_reflections(DMSModel* model, shz_vec3_t pos, float scale, float
                              const float* rot, const DCCamera* cam, int target_list) {
     if (!g_env || !model->metallic_count) return;
     if (target_list == PVR_LIST_PT_POLY) return;
+    /* Same fallthrough as draw_blocks_list */
+    if (target_list == PVR_LIST_OP_MOD || target_list == PVR_LIST_TR_MOD) return;
     int want_mirror = target_list == PVR_LIST_OP_POLY;
     if (want_mirror && !model->mirror_count) return;
 
@@ -857,7 +862,6 @@ static void draw_reflections(DMSModel* model, shz_vec3_t pos, float scale, float
     shz_xmtrx_apply_scale(scale, scale, scale);
     shz_xmtrx_store_4x4(&mvp);
 
-    vtxbuf_sync();
     pvr_dr_state_t* dr = NULL;
 
     for (uint32_t m = 0; m < model->mesh_count; m++) {
@@ -1233,11 +1237,16 @@ DMSModel* dc_model_load(const char* filename) {
             model->max_bind_radius = model->meshes[m].bound_radius;
     }
 
-    /* Clip buffer (shared, grows to largest static model) */
-    if (!is_animated && max_verts > g_clip_buffer_size) {
-        if (g_clip_buffer) free(g_clip_buffer);
-        g_clip_buffer = memalign(32, max_verts * sizeof(ClipVertex));
-        g_clip_buffer_size = max_verts;
+    /* Clip buffer (shared, grows to the largest mesh ever loaded). Animated
+     * models have no clip path, but the volume paths transform through this
+     * too, so they need one: without it they wrote every vertex to address 0. */
+    if (max_verts > g_clip_buffer_size) {
+        ClipVertex* grown = memalign(32, max_verts * sizeof(ClipVertex));
+        if (grown) {
+            free(g_clip_buffer);
+            g_clip_buffer = grown;
+            g_clip_buffer_size = max_verts;
+        }
     }
 
     /* ---- Embedded textures & PVR headers ---- */
@@ -1311,9 +1320,83 @@ DMSModel* dc_model_load(const char* filename) {
     return model;
 }
 
+/* One line per mesh, with the material name the .glb called it -- the name
+ * everything else in the engine is asked for by. */
+void dc_model_materials(const DMSModel* model) {
+    if (!model) return;
+
+    printf("DMS: %lu meshes, %d textures, %s\n",
+           (unsigned long)model->mesh_count, model->texture_count,
+           model->skeleton ? "animated" : "static");
+    printf("DMS: %lu opaque, %lu cutout, %lu transparent\n",
+           (unsigned long)model->opaque_count,
+           (unsigned long)model->cutout_count,
+           (unsigned long)model->transparent_count);
+
+    for (uint32_t m = 0; m < model->mesh_count; m++) {
+        const DMSMesh* mesh = &model->meshes[m];
+        uint32_t mode = mesh->material_flags & 0x3;
+        printf("  [%2lu] %-24s %6lu verts %5lu tris  tex %2ld  %s%s%s%s\n",
+               (unsigned long)m,
+               model->material_names ? model->material_names[m] : "(no name)",
+               (unsigned long)mesh->vertex_count,
+               (unsigned long)mesh->tri_count,
+               (long)mesh->texture_id,
+               mode == 0 ? "opaque" : mode == 1 ? "cutout" : "transparent",
+               (mesh->material_flags & DMS_MAT_COLLISION_ONLY) ? " collision-only" : "",
+               (mesh->material_flags & DMS_MAT_MIRROR)   ? " mirror"   : "",
+               (mesh->material_flags & DMS_MAT_METALLIC) ? " metallic" : "");
+    }
+}
+
+/* Alpha mode belongs in Blender; this is for a material that has to change
+ * afterwards -- a volume's shape, say, which you want to see as well as cut
+ * with. Animated only: a static model's meshes are sorted into blocks by alpha
+ * mode at load, so moving one between lists breaks the run table. */
+int dc_model_see_through(DMSModel* model, const char* material, uint8_t alpha) {
+    if (!model || !model->material_names || !material) return 0;
+    if (!model->skeleton) {
+        printf("DMS: see-through: '%s' is in a static model, which sorts its"
+               " meshes by alpha mode at load -- set it in Blender\n", material);
+        return 0;
+    }
+
+    int changed = 0;
+    for (uint32_t m = 0; m < model->mesh_count; m++) {
+        if (strcasecmp(model->material_names[m], material)) continue;
+        DMSMesh* mesh = &model->meshes[m];
+
+        uint32_t was = mesh->material_flags & 0x3;
+        if (was != 2) {
+            if (was == 0 && model->opaque_count) model->opaque_count--;
+            if (was == 1 && model->cutout_count) model->cutout_count--;
+            model->transparent_count++;
+            mesh->material_flags = (mesh->material_flags & ~0x3u) | 2u;
+        }
+
+        /* Translucent blending takes its alpha from the vertex colour */
+        for (uint32_t v = 0; v < mesh->vertex_count; v++)
+            mesh->vertices[v].argb = (mesh->vertices[v].argb & 0x00FFFFFFu) |
+                                     ((uint32_t)alpha << 24);
+
+        int tid = mesh->texture_id;
+        if (tid >= 0 && tid < model->texture_count && model->textures[tid].ptr) {
+            const dttex_info_t* t = &model->textures[tid];
+            dc_model_compile_header(mesh, &mesh->header, t->pvrformat,
+                                    t->width, t->height, t->ptr);
+        } else {
+            dc_model_compile_header(mesh, &mesh->header, 0, 0, 0, NULL);
+        }
+        changed++;
+    }
+
+    if (!changed)
+        printf("DMS: see-through: no mesh wears the material '%s'\n", material);
+    return changed;
+}
+
 void dc_model_submit_quads(const DMSVertex* verts, int quads, pvr_dr_state_t* dr) {
     if (quads <= 0) return;
-    vtxbuf_sync();
 
     for (int q = 0; q < quads; q++) {
         const DMSVertex* src = &verts[q * 4];
@@ -1513,7 +1596,6 @@ void dc_model_draw_shadow(DMSModel* model, shz_vec3_t pos, float scale, float ya
     squash.elem2D[3][1] = hc;
     squash.elem2D[3][2] = g * d[2] * hc / d[1] + mz * (1.0f - g);
 
-    vtxbuf_sync();
     dc_list_begin(PVR_LIST_TR_POLY);
     pvr_dr_state_t* dr = dc_dr_state();
 
@@ -1587,6 +1669,412 @@ void dc_model_draw_shadow(DMSModel* model, shz_vec3_t pos, float scale, float ya
 }
 
 /* ================================================================
+ * Modifier volumes
+ *
+ * One mesh of a model is submitted to the PVR's modifier list as a shape.
+ * Every pixel of another mesh then knows whether it is inside it, and takes
+ * one of two sets of texture, colour and blending -- the x-ray window. All
+ * three meshes are named by their Blender material, out of the one glb.
+ *
+ *     dc_model_volume(dino, "Scanner", "Dinosaur", "Bones");
+ *     dc_draw(dino, pos);     // as usual, nothing else to say
+ *
+ * Two things go out each frame:
+ *   1. the mesh drawn with a two-parameter header and 64-byte vertices
+ *      (pvr_vertex_tpcm_t), which carry both sets of texture coordinates and
+ *      colours. The same coordinates are used for both, so the second picture
+ *      lines up with the first with nothing changed in the model.
+ *   2. the shape, as single triangles (not strips) in the modifier list, the
+ *      last one told to close the volume.
+ *
+ * The shape is still drawn normally too; only the mesh it works on is taken
+ * off the normal path. A strip crossing the near plane is dropped whole rather
+ * than clipped -- the clip path would have to carry both parameter sets.
+ * ================================================================ */
+
+/* What is left of the mesh inside the shape. dc_model_volume_inside() changes it */
+static uint32_t g_vol_inside_argb = 0x40C8E6FFu;
+
+void dc_model_volume_inside(DMSModel* model, uint8_t alpha, uint32_t rgb) {
+    (void)model;   /* one wash for every volume; there is only ever one */
+    g_vol_inside_argb = ((uint32_t)alpha << 24) | (rgb & 0x00FFFFFFu);
+}
+
+/* -DDMS_VOLUME_DEBUG=1: a line a second saying what reached the hardware and
+ * where it landed. "Nothing sent" and "sent but invisible" look the same. */
+#ifndef DMS_VOLUME_DEBUG
+#define DMS_VOLUME_DEBUG 0
+#endif
+
+#if DMS_VOLUME_DEBUG
+typedef struct {
+    uint32_t considered, sent;          /* triangles, or strips */
+    float    x0, y0, x1, y1;            /* screen box of what was sent */
+    float    znear, zfar;               /* 1/w, so big is near */
+} VolCount;
+
+static VolCount g_vol_shape_c, g_vol_on_c;
+
+static inline void volc_start(VolCount* c) {
+    c->considered = c->sent = 0;
+    c->x0 = c->y0 =  1.0e30f;
+    c->x1 = c->y1 = -1.0e30f;
+    c->znear = -1.0e30f;
+    c->zfar  =  1.0e30f;
+}
+
+static inline void volc_point(VolCount* c, float x, float y, float z) {
+    if (x < c->x0) c->x0 = x;
+    if (x > c->x1) c->x1 = x;
+    if (y < c->y0) c->y0 = y;
+    if (y > c->y1) c->y1 = y;
+    if (z > c->znear) c->znear = z;
+    if (z < c->zfar)  c->zfar  = z;
+}
+
+static inline void volc_say(void) {
+    static uint64_t last;
+    uint64_t now = timer_ms_gettime64();
+    if (now - last < 1000) return;
+    last = now;
+    printf("VOL shape %lu/%lu tris  x %.0f..%.0f y %.0f..%.0f z %.4f..%.4f\n",
+           (unsigned long)g_vol_shape_c.sent, (unsigned long)g_vol_shape_c.considered,
+           g_vol_shape_c.x0, g_vol_shape_c.x1, g_vol_shape_c.y0, g_vol_shape_c.y1,
+           g_vol_shape_c.zfar, g_vol_shape_c.znear);
+    printf("VOL   on  %lu/%lu strips  x %.0f..%.0f y %.0f..%.0f z %.4f..%.4f\n",
+           (unsigned long)g_vol_on_c.sent, (unsigned long)g_vol_on_c.considered,
+           g_vol_on_c.x0, g_vol_on_c.x1, g_vol_on_c.y0, g_vol_on_c.y1,
+           g_vol_on_c.zfar, g_vol_on_c.znear);
+}
+#endif
+
+/* The mesh whose glTF material has this name. A shared material names none of
+ * them, and says so: silently taking the first looks like a broken volume. */
+static int volume_find(const DMSModel* model, const char* name, const char* role) {
+    if (!model->material_names || !name) return -1;
+
+    int found = -1, count = 0;
+    for (uint32_t m = 0; m < model->mesh_count; m++) {
+        if (strcasecmp(model->material_names[m], name)) continue;
+        if (found < 0) found = (int)m;
+        count++;
+    }
+    if (count > 1) {
+        printf("DMS: volume: %d meshes share the material '%s', so it does not"
+               " say which one is the %s:\n", count, name, role);
+        for (uint32_t m = 0; m < model->mesh_count; m++)
+            if (!strcasecmp(model->material_names[m], name))
+                printf("      mesh %lu, %lu verts, %lu tris\n",
+                       (unsigned long)m,
+                       (unsigned long)model->meshes[m].vertex_count,
+                       (unsigned long)model->meshes[m].tri_count);
+        printf("      give the one you mean its own material in Blender\n");
+    }
+    return found;
+}
+
+bool dc_model_volume(DMSModel* model, const char* shape, const char* on,
+                     const char* shows) {
+    if (!model) return false;
+    /* pvr_init() sized the tile bins long ago, so this cannot be turned on
+     * from here; without it the volume goes into a list with nowhere to put it */
+    if (!dc_volumes_enabled()) {
+        printf("DMS: volume: this needs the translucent modifier list, which is\n"
+               "      off by default because it costs about 525KB of texture RAM.\n"
+               "      Ask for it at startup:  dc_init((DCInitParams){ ..., .volumes = true });\n");
+        return false;
+    }
+    int s = volume_find(model, shape, "shape");
+    int o = volume_find(model, on, "mesh it shows through");
+    int p = volume_find(model, shows, "picture it shows");
+    if (s < 0 || o < 0 || p < 0) {
+        printf("DMS: volume needs materials '%s', '%s' and '%s' (%d %d %d)\n",
+               shape ? shape : "?", on ? on : "?", shows ? shows : "?", s, o, p);
+        return false;
+    }
+    int tex = model->meshes[p].texture_id;
+    if (tex < 0 || tex >= model->texture_count) {
+        printf("DMS: volume: material '%s' has no picture\n", shows);
+        return false;
+    }
+    model->vol_shape  = (uint32_t)s + 1;
+    model->vol_on     = (uint32_t)o + 1;
+    model->vol_inside = (uint32_t)tex + 1;
+    free(model->mod_headers);
+    model->mod_headers = NULL;
+
+    printf("DMS: volume: shape mesh %d '%s' (%lu tris), through mesh %d '%s',"
+           " showing texture %d\n",
+           s, shape, (unsigned long)model->meshes[s].tri_count, o, on, tex);
+    return true;
+}
+
+/* A two-parameter vertex is 64 bytes: two goes at the store queue */
+#define MOD_VTX_BYTES 64
+
+/* Two-parameter header: the mesh's own picture both times, opaque outside the
+ * shape and blended inside. Kept until dc_model_volume() changes the volume. */
+static bool mod_header_build(DMSModel* model) {
+    if (model->mod_headers) return true;
+    model->mod_headers = memalign(32, sizeof(pvr_poly_hdr_t));
+    if (!model->mod_headers) return false;
+
+    const DMSMesh* mesh = &model->meshes[model->vol_on - 1];
+    const dttex_info_t* own =
+        (mesh->texture_id >= 0 && mesh->texture_id < model->texture_count)
+            ? &model->textures[mesh->texture_id] : NULL;
+    if (!own && model->vol_inside &&
+        (int)model->vol_inside <= model->texture_count)
+        own = &model->textures[model->vol_inside - 1];
+    if (!own) return false;
+
+    /* Both sets read the same picture on the same UVs; what changes inside the
+     * shape is how much of it reaches the screen */
+    pvr_poly_cxt_t cxt;
+    pvr_poly_cxt_txr_mod(&cxt, VOL_POLY_LIST,
+                         own->pvrformat, own->width, own->height, own->ptr,
+                         PVR_FILTER_BILINEAR,
+                         own->pvrformat, own->width, own->height, own->ptr,
+                         PVR_FILTER_BILINEAR);
+    cxt.gen.culling = PVR_CULLING_NONE;
+
+    /* Outside: covers what is behind it, exactly as the opaque mesh did */
+    cxt.blend.src  = PVR_BLEND_ONE;
+    cxt.blend.dst  = PVR_BLEND_ZERO;
+    cxt.txr.env    = PVR_TXRENV_MODULATE;
+    cxt.gen.alpha  = PVR_ALPHA_DISABLE;
+
+    /* Inside: blended by the vertex alpha, so what is behind shows through */
+    cxt.blend.src2 = PVR_BLEND_SRCALPHA;
+    cxt.blend.dst2 = PVR_BLEND_INVSRCALPHA;
+    cxt.txr2.env   = PVR_TXRENV_MODULATEALPHA;
+    cxt.gen.alpha2 = PVR_ALPHA_ENABLE;
+
+    pvr_poly_mod_compile((pvr_poly_hdr_t*)model->mod_headers, &cxt);
+    return true;
+}
+
+/* The mesh the volume works on, both parameter sets. Always TR, whatever it
+ * was made as, so it can be seen through inside the shape. */
+void dc_model_draw_modified(DMSModel* model, shz_vec3_t pos, float scale, float yaw,
+                            const DCCamera* cam) {
+    if (!model || !model->vol_on || !cam) return;
+    if (!mod_header_build(model)) return;
+
+    DMSMesh* mesh = &model->meshes[model->vol_on - 1];
+    if (mesh->material_flags & DMS_MAT_COLLISION_ONLY) return;
+
+    dc_list_begin(VOL_POLY_LIST);
+    pvr_dr_state_t* dr = dc_dr_state();
+    (void)dr;   /* this KOS's pvr_dr_target() does not use it */
+
+    const DMSSkeleton* sk = model->skeleton;
+    float zs = sk ? -scale : scale;      /* animated: Z negation baked in */
+
+    alignas(32) shz_mat4x4_t mvp;
+    shz_xmtrx_load_4x4((shz_mat4x4_t*)dc_camera_get_pv(cam));
+    shz_xmtrx_translate(pos.x - cam->pos.x, pos.y - cam->pos.y, -(pos.z - cam->pos.z));
+    if (yaw != 0.0f) shz_xmtrx_apply_rotation_y(yaw);
+    shz_xmtrx_apply_scale(scale, scale, zs);
+    shz_xmtrx_store_4x4(&mvp);
+
+    /* Two words a vertex, so twice the room of a normal mesh */
+    if (g_vtx_left < (int32_t)(mesh->vertex_count * MOD_VTX_BYTES)) {
+        vtxbuf_warn();
+        return;
+    }
+
+    g_stats.meshes_drawn++;
+    shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), (pvr_poly_hdr_t*)model->mod_headers);
+
+    const DMSVertex* src = mesh->vertices;
+    int last_bone = -1;
+
+#if DMS_VOLUME_DEBUG
+    volc_start(&g_vol_on_c);
+#endif
+
+    /* Walk the strips: a strip that reaches the near plane is dropped */
+    uint32_t i = 0;
+    while (i < mesh->vertex_count) {
+        uint32_t end = i;
+        while (end < mesh->vertex_count && src[end].flags != PVR_CMD_VERTEX_EOL)
+            end++;
+        if (end < mesh->vertex_count) end++;
+
+        bool ok = true;
+        for (uint32_t k = i; k < end && ok; k++) {
+            if (sk) {
+                if ((int)src[k].pad != last_bone) {
+                    last_bone = src[k].pad;
+                    shz_xmtrx_load_apply_4x4(&mvp, &sk->bones[last_bone].skinMatrix);
+                }
+            } else if (k == i) {
+                shz_xmtrx_load_4x4(&mvp);
+            }
+            shz_vec4_t t = shz_vec4_swizzle(shz_xmtrx_transform_vec4(
+                shz_vec4_init(src[k].x, src[k].y, sk ? src[k].z : -src[k].z, 1.0f)),
+                1, 2, 3, 0);
+            if (t.w < NEAR_Z) ok = false;
+            g_clip_buffer[k - i].x = t.x;
+            g_clip_buffer[k - i].y = t.y;
+            g_clip_buffer[k - i].w = t.w;
+        }
+#if DMS_VOLUME_DEBUG
+        g_vol_on_c.considered++;
+        if (ok) g_vol_on_c.sent++;
+#endif
+        if (ok) {
+            g_vtx_left -= (int32_t)((end - i) * MOD_VTX_BYTES);
+            g_stats.verts_xformed += end - i;
+            for (uint32_t k = i; k < end; k++) {
+                const ClipVertex* cv = &g_clip_buffer[k - i];
+                float inv_w = shz_invf_fsrra(cv->w);
+#if DMS_VOLUME_DEBUG
+                volc_point(&g_vol_on_c, cv->x * inv_w, cv->y * inv_w, inv_w);
+#endif
+                pvr_vertex_tpcm_t* pv = (pvr_vertex_tpcm_t*)pvr_dr_target(*dr);
+                pv->flags = src[k].flags;
+                pv->x = cv->x * inv_w;
+                pv->y = cv->y * inv_w;
+                pv->z = inv_w;
+                pv->u0 = src[k].u;   pv->v0 = src[k].v;
+                pv->argb0 = src[k].argb;
+                pv->oargb0 = 0;
+                pvr_dr_commit(pv);
+                /* Second half: same place, same picture, washed and mostly
+                 * see-through */
+                uint32_t* w = (uint32_t*)pvr_dr_target(*dr);
+                ((float*)w)[0] = src[k].u;
+                ((float*)w)[1] = src[k].v;
+                w[2] = g_vol_inside_argb;
+                w[3] = 0;
+                w[4] = 0; w[5] = 0; w[6] = 0; w[7] = 0;
+                pvr_dr_commit(w);
+            }
+            g_stats.tris_drawn += (end - i) >= 3 ? (end - i) - 2 : 0;
+        }
+        i = end;
+    }
+}
+
+/* One modifier triangle: 64 bytes, so two goes at the store queue */
+static inline void volume_tri(pvr_dr_state_t* dr, const float* p) {
+    uint32_t* w = (uint32_t*)pvr_dr_target(*dr);
+    w[0] = PVR_CMD_VERTEX_EOL;
+    ((float*)w)[1] = p[0]; ((float*)w)[2] = p[1]; ((float*)w)[3] = p[2];
+    ((float*)w)[4] = p[3]; ((float*)w)[5] = p[4]; ((float*)w)[6] = p[5];
+    ((float*)w)[7] = p[6];
+    pvr_dr_commit(w);
+
+    w = (uint32_t*)pvr_dr_target(*dr);
+    ((float*)w)[0] = p[7]; ((float*)w)[1] = p[8];
+    w[2] = 0; w[3] = 0; w[4] = 0; w[5] = 0; w[6] = 0; w[7] = 0;
+    pvr_dr_commit(w);
+}
+
+/* The shape as single triangles. The last one closes the volume -- which is
+ * what makes "inside" mean anything -- so they are sent one behind. */
+void dc_model_draw_volume(DMSModel* model, shz_vec3_t pos, float scale, float yaw,
+                          const DCCamera* cam) {
+    if (!model || !model->vol_shape || !cam) return;
+    const DMSMesh* mesh = &model->meshes[model->vol_shape - 1];
+    if (mesh->vertex_count < 3) return;
+
+    dc_list_begin(VOL_MOD_LIST);
+    pvr_dr_state_t* dr = dc_dr_state();
+
+    const DMSSkeleton* sk = model->skeleton;
+
+    alignas(32) shz_mat4x4_t mvp;
+    shz_xmtrx_load_4x4((shz_mat4x4_t*)dc_camera_get_pv(cam));
+    shz_xmtrx_translate(pos.x - cam->pos.x, pos.y - cam->pos.y, -(pos.z - cam->pos.z));
+    if (yaw != 0.0f) shz_xmtrx_apply_rotation_y(yaw);
+    shz_xmtrx_apply_scale(scale, scale, sk ? -scale : scale);
+    shz_xmtrx_store_4x4(&mvp);
+
+    if (g_vtx_left < (int32_t)(mesh->tri_count * 64)) { vtxbuf_warn(); return; }
+
+    /* Every vertex once, then each triangle. Skinned like the normal path:
+     * the shape is usually animated. */
+    int last_bone = -1;
+    for (uint32_t i = 0; i < mesh->vertex_count; i++) {
+        if (sk) {
+            if ((int)mesh->vertices[i].pad != last_bone) {
+                last_bone = mesh->vertices[i].pad;
+                shz_xmtrx_load_apply_4x4(&mvp, &sk->bones[last_bone].skinMatrix);
+            }
+        } else if (i == 0) {
+            shz_xmtrx_load_4x4(&mvp);
+        }
+        shz_vec4_t t = shz_vec4_swizzle(shz_xmtrx_transform_vec4(
+            shz_vec4_init(mesh->vertices[i].x, mesh->vertices[i].y,
+                          sk ? mesh->vertices[i].z : -mesh->vertices[i].z, 1.0f)),
+            1, 2, 3, 0);
+        float inv_w = t.w < NEAR_Z ? 0.0f : shz_invf_fsrra(t.w);
+        g_clip_buffer[i].x = t.x * inv_w;
+        g_clip_buffer[i].y = t.y * inv_w;
+        g_clip_buffer[i].z = inv_w;
+        g_clip_buffer[i].w = t.w;
+    }
+    g_stats.verts_xformed += mesh->vertex_count;
+
+/* A triangle of the strip that is whole and in front of the near plane */
+#define VOL_TRI_OK(i)                                                \
+    (mesh->vertices[(i) - 2].flags != PVR_CMD_VERTEX_EOL &&          \
+     mesh->vertices[(i) - 1].flags != PVR_CMD_VERTEX_EOL &&          \
+     g_clip_buffer[(i) - 2].w >= NEAR_Z &&                           \
+     g_clip_buffer[(i) - 1].w >= NEAR_Z &&                           \
+     g_clip_buffer[(i)].w >= NEAR_Z)
+
+    /* Counted first: the volume is closed by its last triangle, so one whose
+     * triangles were all dropped must not be started at all */
+    uint32_t tris = 0;
+    for (uint32_t i = 2; i < mesh->vertex_count; i++)
+        if (VOL_TRI_OK(i)) tris++;
+#if DMS_VOLUME_DEBUG
+    volc_start(&g_vol_shape_c);
+    g_vol_shape_c.considered = mesh->vertex_count >= 2 ? mesh->vertex_count - 2 : 0;
+    g_vol_shape_c.sent = tris;
+    for (uint32_t i = 2; i < mesh->vertex_count; i++)
+        if (VOL_TRI_OK(i))
+            volc_point(&g_vol_shape_c, g_clip_buffer[i].x, g_clip_buffer[i].y,
+                       g_clip_buffer[i].z);
+    volc_say();
+#endif
+    if (!tris) return;
+
+    alignas(32) pvr_poly_hdr_t hdr;
+    if (tris > 1) {
+        pvr_mod_compile(&hdr, VOL_MOD_LIST, PVR_MODIFIER_OTHER_POLY,
+                        PVR_CULLING_NONE);
+        shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &hdr);
+    }
+
+    uint32_t sent = 0;
+    for (uint32_t i = 2; i < mesh->vertex_count && sent < tris; i++) {
+        if (!VOL_TRI_OK(i)) continue;
+
+        /* The last one closes the volume, so it goes under its own header */
+        if (sent == tris - 1) {
+            pvr_mod_compile(&hdr, VOL_MOD_LIST, PVR_MODIFIER_INCLUDE_LAST_POLY,
+                            PVR_CULLING_NONE);
+            shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &hdr);
+        }
+
+        const ClipVertex* a = &g_clip_buffer[i - 2];
+        const ClipVertex* b = &g_clip_buffer[i - 1];
+        const ClipVertex* c = &g_clip_buffer[i];
+        float tri[9] = { a->x, a->y, a->z, b->x, b->y, b->z, c->x, c->y, c->z };
+        volume_tri(dr, tri);
+        g_vtx_left -= 64;
+        g_stats.tris_drawn++;
+        sent++;
+    }
+}
+#undef VOL_TRI_OK
+
+/* ================================================================
  * Mesh header
  * ================================================================ */
 
@@ -1632,6 +2120,7 @@ void dc_model_free(DMSModel* model) {
             free(model->meshes[m].animated_vertices);
     }
     free(model->meshes);
+    free(model->mod_headers);
     free(model->blocks);
     free(model->runs);
     free(model->material_names);

@@ -366,13 +366,20 @@ void dc_draw_target_ex(DCTarget* target, const DCTargetOpts* opts) {
 static bool model_uses_list(const DMSModel* model, int pvr_list) {
     if (pvr_list == PVR_LIST_OP_POLY) return model->opaque_count != 0;
     if (pvr_list == PVR_LIST_PT_POLY) return model->cutout_count != 0;
+    /* The line below is a fallthrough that only ever saw TR_POLY when there
+     * were three lists; with five, anything transparent or metallic would claim
+     * the modifier lists too. Volumes are asked for separately by the caller. */
+    if (pvr_list == PVR_LIST_OP_MOD || pvr_list == PVR_LIST_TR_MOD) return false;
     /* Reflections of solid metallic meshes are drawn in the TR list */
     return model->transparent_count != 0 || model->metallic_count != 0;
 }
 
 /* Everything queued for one target (NULL: the screen), a list at a time */
 static void flush_scene(const DCTarget* target) {
-    static const int lists[3] = { PVR_LIST_OP_POLY, PVR_LIST_TR_POLY, PVR_LIST_PT_POLY };
+    /* Modifier lists come right after the polygons they change */
+    static const int lists[5] = { PVR_LIST_OP_POLY, PVR_LIST_OP_MOD,
+                                  PVR_LIST_TR_POLY, PVR_LIST_TR_MOD,
+                                  PVR_LIST_PT_POLY };
 
     /* A camera is built for the screen. Into a target its picture is squeezed
      * to the target's size: screen x and y are rows 1 and 2 of the matrix. */
@@ -381,7 +388,7 @@ static void flush_scene(const DCTarget* target) {
     float sx = target ? (float)target->width / SCR_W : 1.0f;
     float sy = target ? (float)target->height / SCR_H : 1.0f;
 
-    for (int l = 0; l < 3; l++) {
+    for (int l = 0; l < 5; l++) {
         for (int i = 0; i < queue_count; i++) {
             const DrawEntry* e = &queue[i];
             if (e->target != target) continue;
@@ -391,7 +398,9 @@ static void flush_scene(const DCTarget* target) {
                 e->call_fn(e->call_user);
             } else if (e->add ? lists[l] == PVR_LIST_TR_POLY
                               : model_uses_list(e->model, lists[l]) ||
-                                (e->has_shadow && lists[l] == PVR_LIST_TR_POLY)) {
+                                (e->has_shadow && lists[l] == PVR_LIST_TR_POLY) ||
+                                (e->model->vol_on && lists[l] == VOL_POLY_LIST) ||
+                                (e->model->vol_shape && lists[l] == VOL_MOD_LIST)) {
                 const DCCamera* cam = e->cam;
                 if (target) {
                     if (squeezed_from != cam) {
@@ -404,6 +413,14 @@ static void flush_scene(const DCTarget* target) {
                     }
                     cam = &squeezed;
                 }
+                /* Shape into the modifier list, then the mesh it works on;
+                 * the normal draw below leaves that mesh out */
+                if (e->model->vol_shape && lists[l] == VOL_MOD_LIST) {
+                    dc_model_draw_volume(e->model, e->pos, e->scale, e->yaw, cam);
+                    continue;
+                }
+                if (e->model->vol_on && lists[l] == VOL_POLY_LIST)
+                    dc_model_draw_modified(e->model, e->pos, e->scale, e->yaw, cam);
                 if (e->has_shadow && lists[l] == PVR_LIST_TR_POLY)
                     dc_model_draw_shadow(e->model, e->pos, e->scale, e->yaw,
                                          e->has_rot ? e->rot : NULL, cam, e->shadow.light,

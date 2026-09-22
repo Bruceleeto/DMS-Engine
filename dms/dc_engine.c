@@ -61,10 +61,16 @@ void dc_init(DCInitParams params) {
     if (params.vram_size == 0) params.vram_size = (int)(1024 * 1024 * 1.5f);
     g_engine.params = params;
 
-    /* PVR init — OP, PT, TR lists enabled */
+    /* One extra list costs ~525KB of texture RAM (128 bytes x 300 tiles x the
+     * x7 overflow, doubled), and at vram_size 2300KB it overruns the 4MB half,
+     * so TR_MOD is asked for. OP_MOD stays off: volumes need the translucent
+     * list to blend with what is behind them, so nothing writes to it. */
     pvr_init(&(pvr_init_params_t){
-        { PVR_BINSIZE_32, PVR_BINSIZE_0, PVR_BINSIZE_32,
-          PVR_BINSIZE_0, PVR_BINSIZE_32 },
+        { PVR_BINSIZE_32,                                    /* OP_POLY */
+          PVR_BINSIZE_0,                                     /* OP_MOD, unused */
+          PVR_BINSIZE_32,                                    /* TR_POLY */
+          params.volumes ? PVR_BINSIZE_32 : PVR_BINSIZE_0,   /* TR_MOD */
+          PVR_BINSIZE_32 },                                  /* PT_POLY */
         params.vram_size, 0, 0, 0, 6
     });
 
@@ -72,6 +78,10 @@ void dc_init(DCInitParams params) {
     g_engine.last_frame_ms = timer_ms_gettime64();
     g_engine.delta_time = 1.0f / 60.0f;  /* assume 60fps initially */
     g_engine.current_list = -1;
+}
+
+bool dc_volumes_enabled(void) {
+    return g_engine.params.volumes;
 }
 
 void dc_shutdown(void) {
@@ -104,6 +114,7 @@ void dc_frame_begin(void) {
 
     /* ---- PVR scene ---- */
     pvr_scene_begin();
+    dc_model_frame_begin();   /* buffer is wound back, so the guard resets here */
     g_engine.current_list = -1;
     g_engine.scene_active = true;
     g_engine.list_opened = false;

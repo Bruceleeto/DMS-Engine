@@ -15,10 +15,18 @@ typedef struct {
     float fov;            /* 60.0 default (degrees) */
     float near_z, far_z;  /* 0.1, 100.0 defaults */
     int   vram_size;      /* PVR VRAM pool in bytes, default 1.5 MB */
+    /* This app calls dc_model_volume(). The tile bins are sized in pvr_init(),
+     * before any model exists, so it cannot be worked out. Costs ~525KB of
+     * texture RAM. */
+    bool  volumes;
 } DCInitParams;
 
 /* Init PVR, timing, internal state. Zero-init params for defaults. */
 void dc_init(DCInitParams params);
+
+/* Engine use (dc_model_volume): whether dc_init() was given .volumes = true,
+ * and so whether the translucent modifier list has tile bins to write into. */
+bool dc_volumes_enabled(void);
 
 /* Free engine resources, pvr_shutdown(). */
 void dc_shutdown(void);

@@ -3381,6 +3381,19 @@ static void BakeModelLighting(const Model *model) {
   printf(" done.\n");
 }
 
+/* glTF defines baseColorFactor in linear light; the PVR multiplies it straight
+ * against an sRGB texel, so raw it comes out dark (Sketchfab writes 0.21223
+ * into everything: mid grey, 127/255, arriving as 54/255). sRGB is a power law
+ * and power laws are multiplicative -- encode(f*t) == encode(f)*encode(t) -- so
+ * encoding here lands where glTF's linear multiply would. Alpha is not gamma
+ * encoded and is left alone. */
+static uint8_t LinearToSrgb8(uint8_t linear) {
+  float x = linear / 255.0f;
+  float s = x <= 0.0031308f ? 12.92f * x
+                            : 1.055f * powf(x, 1.0f / 2.4f) - 0.055f;
+  return (uint8_t)(s * 255.0f + 0.5f);
+}
+
 void ExportTristrippedModel(const Model *model, const char *filename,
                             bool bakeLighting) {
   FILE *file = fopen(filename, "wb");
@@ -3513,10 +3526,12 @@ void ExportTristrippedModel(const Model *model, const char *filename,
            meshOrder[m], mesh->vertexCount, mesh->indexCount);
 
     // Bake lighting or apply material color
+    /* Encoded here, not where materialColor is read: BakeModelLighting wants
+     * the linear value, as a reflectance rather than a screen multiplier. */
     uint8_t baseA = (mesh->materialColor >> 24) & 0xFF;
-    uint8_t baseR = (mesh->materialColor >> 16) & 0xFF;
-    uint8_t baseG = (mesh->materialColor >> 8) & 0xFF;
-    uint8_t baseB = (mesh->materialColor) & 0xFF;
+    uint8_t baseR = LinearToSrgb8((mesh->materialColor >> 16) & 0xFF);
+    uint8_t baseG = LinearToSrgb8((mesh->materialColor >> 8) & 0xFF);
+    uint8_t baseB = LinearToSrgb8((mesh->materialColor) & 0xFF);
 
     if (bakeLighting) {
       /* BakeModelLighting has set the colours already */

@@ -131,6 +131,11 @@ typedef struct {
     uint32_t     metallic_count;    /* meshes that reflect the environment */
     uint32_t     mirror_count;      /* of those, mirrors */
     char       (*material_names)[32]; /* glTF material name of each mesh, or NULL */
+    /* dc_model_volume(). Mesh or texture number plus one, so 0 is "not asked for" */
+    void        *mod_headers;       /* the two-parameter header, built on first use */
+    uint32_t     vol_shape;         /* the mesh that is the shape */
+    uint32_t     vol_on;            /* the mesh it shows through */
+    uint32_t     vol_inside;        /* the texture it shows there */
 } DMSModel;
 
 /* ================================================================

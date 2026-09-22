@@ -14,6 +14,16 @@ DMSModel* dc_model_load(const char* filename);
 /* Free model and VRAM textures. */
 void dc_model_free(DMSModel* model);
 
+/* Print every mesh: material name, vertex and triangle counts, texture, alpha
+ * mode, flags. Those names are what the calls below are asked for by. */
+void dc_model_materials(const DMSModel* model);
+
+/* Draw everything wearing this Blender material see-through, at this alpha
+ * (0 invisible, 255 solid). Animated models only; a static model's lists are
+ * fixed at load, so set the alpha mode in Blender instead. Returns how many
+ * meshes it changed. */
+int dc_model_see_through(DMSModel* model, const char* material, uint8_t alpha);
+
 /* ================================================================
  * Drawing
  * ================================================================ */
@@ -51,6 +61,40 @@ void dc_model_draw_shadow(DMSModel* model, shz_vec3_t pos, float scale, float ya
  * with the matrix now in xmtrx. A square that reaches the near plane is
  * dropped whole, not clipped. Stops if the vertex buffer is full. */
 void dc_model_submit_quads(const DMSVertex* verts, int quads, pvr_dr_state_t* dr);
+
+/* Translucent, because inside the shape the mesh has to stop covering what is
+ * behind it. The opaque list writes every pixel it keeps and ignores the
+ * blend, so there a volume can only swap one picture for another. */
+#define VOL_POLY_LIST    PVR_LIST_TR_POLY
+#define VOL_MOD_LIST     PVR_LIST_TR_MOD
+
+/* Wherever the mesh `shape` covers the mesh `on`, `on` goes see-through so
+ * that `shows` can be seen behind it -- an x-ray window that moves with the
+ * model. All three named by Blender material, all in the one model:
+ *
+ *     dc_model_volume(dino, "Scanner", "Dinosaur", "Bones");
+ *
+ * Said once at load; drawing is dc_draw() as usual. False if a material was
+ * not found. */
+bool dc_model_volume(DMSModel* model, const char* shape, const char* on,
+                     const char* shows);
+
+/* How much of `on` is left inside the shape, 0 (gone, pure x-ray) to 255
+ * (solid, no effect), and what colour it is tinted there -- 0xFFFFFF for
+ * none. The default is a light blue wash at a quarter strength. */
+void dc_model_volume_inside(DMSModel* model, uint8_t alpha, uint32_t rgb);
+
+/* Engine use (dc_frame_begin): give the vertex buffer guard its budget back */
+void dc_model_frame_begin(void);
+
+/* Engine use (dc_draw flush): the mesh the volume works on, two-parameter,
+ * always in the TR list. */
+void dc_model_draw_modified(DMSModel* model, shz_vec3_t pos, float scale, float yaw,
+                            const DCCamera* cam);
+
+/* Engine use (dc_draw flush): the shape, as triangles, into PVR_LIST_TR_MOD */
+void dc_model_draw_volume(DMSModel* model, shz_vec3_t pos, float scale, float yaw,
+                          const DCCamera* cam);
 
 /* Engine use (dc_draw_ex .add): model draws that follow are additive, all in
  * the transparent list, until set back to false */

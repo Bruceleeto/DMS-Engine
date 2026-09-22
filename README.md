@@ -187,6 +187,27 @@ Still a work in progress.. Needs speeding up.
 
 Credits:
 
+### scanner
+
+![scanner](scanner/resources/example.png)
+
+A dinosaur under an x-ray scanner: where the scanner window crosses its skin,
+the skin goes see-through and the skeleton underneath shows. After Scanner from
+Sega's Katana SDK. The window is a modifier volume, and the whole set —
+dinosaur, bones, scanner, stand and the animation — is one `.glb`.
+
+| Button | Action |
+|---|---|
+| Stick | Turn the camera around the dinosaur |
+| L / R | Zoom |
+| A | Pause the animation |
+| B | Hide the scanner ring |
+| Y | Turn the window off |
+| Start | Exit |
+
+Credits:
+- Model and textures: Scanner demo, Sega Katana SDK (PowerVR / VideoLogic)
+
 ## Blender settings
 
 Export as `.glb`. The converter reads these from the material (Principled
@@ -315,3 +336,42 @@ come from (an emitter that follows something).
 The whole puff is left out when it is off screen. They cost four vertices
 each, so the count is cheap; what costs is the screen they cover, and a camera
 inside a cloud of big ones is the slow case. See `particles`.
+
+### X-ray windows (modifier volumes)
+
+One mesh of a model is made into a shape. Wherever it covers another mesh of
+the same model, that mesh goes see-through, so a third mesh drawn behind it
+shows through the window. All three are named by their Blender material, all
+out of the one `.glb`:
+
+```c
+dc_model_volume(scene, "Scanner", "Dinosaur", "Bones");
+dc_model_volume_inside(scene, 0x40, 0xC8E6FF);   /* how much skin is left
+                                                    inside, and its tint */
+```
+
+Said once at load; `dc_draw()` does the rest. The shape goes to the modifier
+list, the mesh it works on is drawn after everything opaque with two sets of
+parameters, and the mesh it reveals needs no handling at all — the window
+simply stops covering it.
+
+It has to be asked for at startup, because the PVR's tile bins are sized before
+any model is loaded, and the extra list costs about 525KB of texture RAM:
+
+```c
+dc_init((DCInitParams){ .vram_size = 2 * 1024 * 1024, .volumes = true });
+```
+
+A pixel is inside the volume when an odd number of the shape's faces lie
+between it and the camera, so the shape need not be closed — a flat disc makes
+a good window. A closed solid marks only the region it hides behind itself, so
+a ring or a tube used as its own shape covers everything it marks with its own
+near wall. `scanner` draws its ring see-through for that reason
+(`dc_model_see_through`), and B takes it away altogether.
+
+Give the shape a material of its own: a material worn by two meshes names
+neither, and the wrong mesh looks exactly like a broken effect. Call
+`dc_model_materials(model)` on a new `.glb` to see what there is to ask for —
+it prints every mesh with its material name, counts, texture and alpha mode.
+Build with `-DDMS_VOLUME_DEBUG=1` for a line a second saying what actually
+reached the hardware. See `scanner`.
