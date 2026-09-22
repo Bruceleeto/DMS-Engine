@@ -155,6 +155,21 @@ bool dc_model_cel_on(void);
 int dc_model_points(DMSModel* model, const char* material,
                     shz_vec3_t* out, int max);
 
+/* An Empty placed in Blender with this name, or NULL if there is none: a
+ * spawn point, where a camera starts, a pickup. Its copies count as the same
+ * name -- Blender calls them "pin.001", "pin.002" -- so this is the first.
+ *
+ *     const DMSEntity* start = dc_model_entity(level, "spawn");
+ *     if (start) player.pos = start->pos;
+ */
+const DMSEntity* dc_model_entity(const DMSModel* model, const char* name);
+
+/* Every Empty with this name and its copies, in the order the file holds
+ * them: the pins of a bowling lane, the coins in a level. Returns how many
+ * there were, which may be more than max. */
+int dc_model_entities(const DMSModel* model, const char* name,
+                      const DMSEntity** out, int max);
+
 /* ================================================================
  * Animation
  * ================================================================ */

@@ -127,6 +127,17 @@ std::vector<std::array<float, 9>> g_rtTriangles; // v0, v1, v2 packed
 static std::map<int, std::array<float, 3>> g_texAverage;   /* textureId -> average colour */
 static std::map<std::pair<int, uint32_t>, std::array<float, 3>> g_emissive;
 
+/* Blender empties: places marked in the scene rather than things drawn. The
+ * code finds them by name (dc_model_entity). rot is where the empty's x, y and
+ * z axes point, 3 columns, the same as DCDrawOpts.rot. */
+struct EntityRecord {
+  char name[32];
+  float pos[3];
+  float rot[9];
+  float scale[3];
+};
+static std::vector<EntityRecord> g_entities;
+
 bool LoadGLTF(const char *filename);
 void Cleanup(void);
 void optimize_mesh();
@@ -730,6 +741,39 @@ static bool NodeInScene(const cgltf_node *node, const cgltf_scene *scene) {
   return false;
 }
 
+/* Every node with no mesh and nothing under it is a place: an empty. The nodes
+ * that only group meshes have children and are left out, and so are bones. */
+static void CollectEntities(cgltf_data *data) {
+  g_entities.clear();
+  const cgltf_scene *scene = data->scene ? data->scene
+                           : data->scenes_count ? &data->scenes[0] : NULL;
+  std::set<const cgltf_node *> joints;
+  for (size_t s = 0; s < data->skins_count; s++)
+    for (size_t j = 0; j < data->skins[s].joints_count; j++)
+      joints.insert(data->skins[s].joints[j]);
+
+  for (size_t n = 0; n < data->nodes_count; n++) {
+    const cgltf_node *node = &data->nodes[n];
+    if (node->mesh || node->children_count || joints.count(node)) continue;
+    if (!NodeInScene(node, scene)) continue;
+
+    float w[16];
+    cgltf_node_transform_world(node, w);
+    EntityRecord e = {};
+    snprintf(e.name, sizeof(e.name), "%s", node->name ? node->name : "");
+    for (int i = 0; i < 3; i++) {
+      e.pos[i] = w[12 + i];
+      float len = sqrtf(w[i * 4] * w[i * 4] + w[i * 4 + 1] * w[i * 4 + 1] +
+                        w[i * 4 + 2] * w[i * 4 + 2]);
+      e.scale[i] = len;
+      for (int k = 0; k < 3; k++)
+        e.rot[i * 3 + k] = len > 0.0f ? w[i * 4 + k] / len : (i == k ? 1.0f : 0.0f);
+    }
+    g_entities.push_back(e);
+    printf("Entity '%s' at (%.2f, %.2f, %.2f)\n", e.name, e.pos[0], e.pos[1], e.pos[2]);
+  }
+}
+
 // Walk nodes in file order so exports that already have applied transforms
 // come out identical to the old mesh-list path.
 static std::vector<MeshInstance> CollectMeshInstances(cgltf_data *data) {
@@ -1268,6 +1312,8 @@ bool LoadGLTF(const char *filename) {
     cgltf_free(data);
     return false;
   }
+
+  CollectEntities(data);
 
   // Load skeleton
   cgltf_skin *skin = NULL;
@@ -3768,6 +3814,12 @@ void ExportTristrippedModel(const Model *model, const char *filename,
   fwrite("MATN", 1, 4, file);
   for (uint32_t m = 0; m < meshCount; m++)
     fwrite(model->meshes[meshOrder[m]].materialName, 1, 32, file);
+
+  // Entities (Blender empties): "ENTS", count, then one EntityRecord each
+  uint32_t entCount = (uint32_t)g_entities.size();
+  fwrite("ENTS", 1, 4, file);
+  fwrite(&entCount, sizeof(uint32_t), 1, file);
+  fwrite(g_entities.data(), sizeof(EntityRecord), entCount, file);
 
   long finalPos = ftell(file);
   fclose(file);

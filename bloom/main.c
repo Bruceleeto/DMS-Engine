@@ -31,12 +31,6 @@
 #define ZOOM_SPEED  400.0f
 #define DRIFT       0.12f   /* radians a second the camera turns by itself */
 
-/* Where the camera starts: the Blender empty in arena.glb says so. Empties do
- * not come through the converter yet, so its place is written out here. */
-#define CAM_X     0.0f
-#define CAM_Y   101.6f
-#define CAM_Z   217.4f
-
 /* The middle of the level, which the camera turns around */
 #define LOOK_X  -19.5f
 #define LOOK_Y  -44.3f
@@ -57,17 +51,19 @@ int main(int argc, char* argv[]) {
     dc_debug_init();
     dc_set_clear_color(0xFF05060A);
 
-    /* dc_camera_orbit puts the camera behind its target along the way it
-     * looks, so the turn and the distance that land it on the empty are
-     * worked back out of where the empty is */
+    scene = dc_model_load(ASSETS "bloom/arena.dms");
+
+    /* The camera starts where the Empty in arena.glb is. dc_camera_orbit puts
+     * the camera behind its target along the way it looks, so the turn and
+     * the distance that land it there are worked back out of the Empty. */
     dc_camera_init(&camera);
     shz_vec3_t look = shz_vec3_init(LOOK_X, LOOK_Y, LOOK_Z);
-    float vx = CAM_X - LOOK_X, vy = CAM_Y - LOOK_Y, vz = CAM_Z - LOOK_Z;
+    const DMSEntity* start = dc_model_entity(scene, "Empty");
+    shz_vec3_t cam = start ? start->pos : shz_vec3_init(0.0f, 100.0f, 200.0f);
+    float vx = cam.x - LOOK_X, vy = cam.y - LOOK_Y, vz = cam.z - LOOK_Z;
     distance = sqrtf(vx * vx + vy * vy + vz * vz);
     camera.pitch = asinf(vy / distance);
     camera.yaw   = atan2f(-vx, -vz);
-
-    scene = dc_model_load(ASSETS "bloom/arena.dms");
 
     printf("BLOOM: A bloom on/off, d-pad up/down strength, left/right spread, "
            "X picture size, triggers zoom, stick turns, Start exits\n");

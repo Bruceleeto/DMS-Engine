@@ -107,6 +107,17 @@ typedef struct {
     pvr_poly_hdr_t header __attribute__((aligned(32)));
 } DMSMesh;
 
+/* A Blender Empty: a place marked in the scene, found by name with
+ * dc_model_entity(). Where it is in the model's own space, the same space the
+ * vertices are in. */
+typedef struct {
+    char       name[32];
+    shz_vec3_t pos;
+    float      rot[9];      /* where its x, y and z axes point: 3 columns, as
+                             * DCDrawOpts.rot takes them */
+    shz_vec3_t scale;
+} DMSEntity;
+
 /* static levels are cut into blocks by location; one sphere culls
  * every mesh in the block */
 typedef struct {
@@ -139,6 +150,8 @@ typedef struct {
     uint32_t     mirror_count;      /* of those, mirrors */
     uint32_t     glow_count;        /* meshes that give off light (bloom) */
     char       (*material_names)[32]; /* glTF material name of each mesh, or NULL */
+    DMSEntity   *entities;          /* the Empties in the .glb */
+    uint32_t     entity_count;
     /* dc_model_volume(). Mesh or texture number plus one, so 0 is "not asked for" */
     void        *mod_headers;       /* the two-parameter header, built on first use */
     uint32_t     vol_shape;         /* the mesh that is the shape */

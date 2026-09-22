@@ -1724,6 +1724,20 @@ DMSModel* dc_model_load(const char* filename) {
             free(model->material_names);
             model->material_names = NULL;
         }
+
+        /* Then the Empties */
+        uint32_t count;
+        if (fread(tag, 1, 4, f) == 4 && !memcmp(tag, "ENTS", 4) &&
+            fread(&count, 4, 1, f) == 1 && count) {
+            model->entities = malloc(count * sizeof(DMSEntity));
+            if (model->entities &&
+                fread(model->entities, sizeof(DMSEntity), count, f) == count) {
+                model->entity_count = count;
+            } else {
+                free(model->entities);
+                model->entities = NULL;
+            }
+        }
     }
 
     /* Compile PVR headers using material_flags */
@@ -1781,6 +1795,40 @@ void dc_model_materials(const DMSModel* model) {
                (mesh->material_flags & DMS_MAT_METALLIC) ? " metallic" : "",
                (mesh->material_flags & DMS_MAT_GLOW)     ? " glow"     : "");
     }
+}
+
+/* The converter writes each Empty as this many bytes (EntityRecord) */
+_Static_assert(sizeof(DMSEntity) == 92, "DMSEntity must match the converter");
+
+/* The name, or a copy of it: Blender names copies "name.001" */
+static bool entity_is(const DMSEntity* e, const char* name) {
+    size_t n = strlen(name);
+    if (strncmp(e->name, name, n)) return false;
+    const char* rest = e->name + n;
+    if (!*rest) return true;
+    if (*rest != '.' || !rest[1]) return false;
+    for (rest++; *rest; rest++)
+        if (*rest < '0' || *rest > '9') return false;
+    return true;
+}
+
+const DMSEntity* dc_model_entity(const DMSModel* model, const char* name) {
+    if (!model || !name) return NULL;
+    for (uint32_t i = 0; i < model->entity_count; i++)
+        if (entity_is(&model->entities[i], name)) return &model->entities[i];
+    return NULL;
+}
+
+int dc_model_entities(const DMSModel* model, const char* name,
+                      const DMSEntity** out, int max) {
+    if (!model || !name) return 0;
+    int found = 0;
+    for (uint32_t i = 0; i < model->entity_count; i++) {
+        if (!entity_is(&model->entities[i], name)) continue;
+        if (found < max) out[found] = &model->entities[i];
+        found++;
+    }
+    return found;
 }
 
 /* Alpha mode belongs in Blender; this is for a material that has to change
@@ -2558,6 +2606,7 @@ void dc_model_free(DMSModel* model) {
     free(model->blocks);
     free(model->runs);
     free(model->material_names);
+    free(model->entities);
 
     if (model->textures) {
         for (int i = 0; i < model->texture_count; i++)
