@@ -69,7 +69,14 @@ void dc_draw_ex(DMSModel* model, const DCDrawOpts* opts);
  *
  *     dc_set_light(&(DCLight){ .pos = torch, .range = 300.0f });
  *
- * Static models only; one with a skeleton ignores it. */
+ * Static models only; one with a skeleton ignores it.
+ *
+ * Cel shaded, the light comes in flat steps with sharp edges between them:
+ *
+ *     dc_set_light(&(DCLight){ .pos = torch, .range = 300.0f, .bands = 3 });
+ *
+ * Textures stay. Solid meshes get it; cutout and see-through meshes keep the
+ * smooth light. It costs a second pass over each solid mesh, in the TR list. */
 void dc_set_light(const DCLight* light);
 
 /* ================================================================

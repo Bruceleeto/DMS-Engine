@@ -159,10 +159,74 @@ static int        g_lit;     /* this draw call shades instead of copying argb */
  * goes out black. Set per mesh, and only while dc_model_set_glow_only(). */
 static int        g_flat;
 
+/* Cel shading (DCLight.bands), after tiny3d's: how much light a vertex
+ * catches goes into its U, and a ramp texture of flat steps turns that into
+ * bands. The PVR carries U smoothly across a triangle and the ramp is read
+ * without filtering, so the edge between two bands is a sharp line wherever
+ * it falls, not a blend from one vertex to the next. A triangle has only one
+ * texture, so the mesh keeps its own by being drawn unlit first; the bands
+ * are then laid over it, multiplied, as a second pass (draw_cel). */
+#define CEL_RAMP_W 64
+#define CEL_RAMP_H 8
+
+static pvr_ptr_t      g_cel_tex;
+static pvr_poly_hdr_t g_cel_hdr __attribute__((aligned(32)));
+static int            g_cel_bands;               /* 0: smooth light */
+static int            g_cel_ramp_bands;          /* what the ramp holds now */
+static float          g_cel_ramp_ambient = -1.0f;
+
+static bool cel_setup(int bands, float ambient) {
+    if (!g_cel_tex) {
+        g_cel_tex = pvr_mem_malloc(CEL_RAMP_W * CEL_RAMP_H * 2);
+        if (!g_cel_tex) return false;
+
+        pvr_poly_cxt_t cxt;
+        pvr_poly_cxt_txr(&cxt, PVR_LIST_TR_POLY, PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED,
+                         CEL_RAMP_W, CEL_RAMP_H, g_cel_tex, PVR_FILTER_NONE);
+        cxt.gen.culling = PVR_CULLING_NONE;
+        cxt.txr.env = PVR_TXRENV_MODULATE;        /* ramp times the light colour */
+        cxt.txr.uv_clamp = PVR_UVCLAMP_UV;
+        /* src * dst + dst * src (as a dst factor DESTCOLOR is the source
+         * colour): the frame times twice the ramp, so the lit side can come
+         * out brighter than its baked colour, as with the smooth light */
+        cxt.blend.src = PVR_BLEND_DESTCOLOR;
+        cxt.blend.dst = PVR_BLEND_DESTCOLOR;
+        /* The same triangles as the solid draw, so the same depth */
+        cxt.depth.comparison = PVR_DEPTHCMP_GEQUAL;
+        cxt.depth.write = PVR_DEPTHWRITE_DISABLE;
+        pvr_poly_compile(&g_cel_hdr, &cxt);
+    }
+    if (bands != g_cel_ramp_bands || ambient != g_cel_ramp_ambient) {
+        /* Texel i is a vertex catching i / (W - 1) of the light. Half of
+         * what the smooth light would multiply by, for the blend above. */
+        uint16_t* t = (uint16_t*)g_cel_tex;
+        for (int i = 0; i < CEL_RAMP_W; i++) {
+            int b = (int)((float)i / (CEL_RAMP_W - 1) * bands);
+            if (b > bands - 1) b = bands - 1;
+            float v = (ambient + (float)b / (bands - 1)) * 0.5f;
+            uint32_t g = v >= 1.0f ? 255 : (uint32_t)(v * 255.0f);
+            uint16_t texel = (uint16_t)(((g >> 3) << 11) | ((g >> 2) << 5) | (g >> 3));
+            for (int y = 0; y < CEL_RAMP_H; y++) t[y * CEL_RAMP_W + i] = texel;
+        }
+        g_cel_ramp_bands = bands;
+        g_cel_ramp_ambient = ambient;
+    }
+    return true;
+}
+
 void dc_model_set_light(const DCLight* light) {
     g_light_set = light != NULL;
     if (light) g_light = *light;
+
+    g_cel_bands = 0;
+    if (light && light->bands >= 2) {
+        int bands = light->bands < CEL_RAMP_W ? light->bands : CEL_RAMP_W;
+        if (cel_setup(bands, light->ambient > 0.0f ? light->ambient : 0.25f))
+            g_cel_bands = bands;
+    }
 }
+
+bool dc_model_cel_on(void) { return g_cel_bands != 0; }
 
 int dc_model_points(DMSModel* model, const char* material,
                     shz_vec3_t* out, int max) {
@@ -226,7 +290,7 @@ static void light_to_model(shz_vec3_t pos, float scale, const float* cols) {
 /* The vertex's baked colour with the light over it. pos_w is what lets a sun
  * use the same arithmetic: the difference below collapses to the light
  * direction, which is already unit length, and nothing fades. */
-static inline uint32_t shade(const DMSVertex* s) {
+static inline float catch_light(const DMSVertex* s) {
     float dx = g_ml.x - s->x * g_ml.pos_w;
     float dy = g_ml.y - s->y * g_ml.pos_w;
     float dz = g_ml.z - s->z * g_ml.pos_w;
@@ -237,7 +301,11 @@ static inline uint32_t shade(const DMSVertex* s) {
     float att = 1.0f - (d2 * inv) * g_ml.inv_range;
     if (ndl < 0.0f) ndl = 0.0f;
     if (att < 0.0f) att = 0.0f;
-    float lit = g_ml.ambient + ndl * att;
+    return ndl * att;    /* 0 to 127, the length of an int8 normal */
+}
+
+static inline uint32_t shade(const DMSVertex* s) {
+    float lit = g_ml.ambient + catch_light(s);
 
     uint32_t c = s->argb;
     uint32_t r = (((c >> 16) & 0xff) * (uint32_t)(lit * g_ml.r)) >> 8;
@@ -751,6 +819,8 @@ void dc_model_set_glow_only(bool on) { g_glow_only = on; g_flat = 0; }
 
 static void draw_reflections(DMSModel* model, shz_vec3_t pos, float scale, float yaw,
                              const float* rot, const DCCamera* cam, int target_list);
+static void draw_cel(DMSModel* model, shz_vec3_t pos, float scale, float yaw,
+                     const float* rot, const DCCamera* cam, int target_list);
 
 enum { XM_OTHER, XM_PLANES, XM_MVP };   /* what XMTRX holds right now */
 
@@ -786,6 +856,9 @@ static void draw_blocks_list(DMSModel* model, shz_vec3_t pos, float scale,
     light_to_model(pos, scale, rot ? rot : yaw_cols);
     /* The glow pass draws what a mesh gives off, which a light cannot change */
     if (g_glow_only) g_lit = 0;
+    /* Cel shaded solid meshes go out with their baked colours; draw_cel lays
+     * the light over them */
+    if (g_cel_bands && target_list == PVR_LIST_OP_POLY && !g_add) g_lit = 0;
     const shz_mat4x4_t* pv = dc_camera_get_pv(cam);
     const WorldFrustum* fr = dc_camera_get_frustum(cam);
     alignas(32) shz_mat4x4_t mvp;
@@ -943,6 +1016,7 @@ void dc_model_draw_list_rotated(DMSModel* model, shz_vec3_t pos, float scale,
     else {
         draw_blocks_list(model, pos, scale, yaw, NULL, cam, target_list);
         if (!g_add) draw_reflections(model, pos, scale, yaw, NULL, cam, target_list);
+        if (!g_add) draw_cel(model, pos, scale, yaw, NULL, cam, target_list);
     }
 }
 
@@ -952,6 +1026,7 @@ void dc_model_draw_list_oriented(DMSModel* model, shz_vec3_t pos, float scale,
 
     draw_blocks_list(model, pos, scale, 0.0f, rot, cam, target_list);
     if (!g_add) draw_reflections(model, pos, scale, 0.0f, rot, cam, target_list);
+    if (!g_add) draw_cel(model, pos, scale, 0.0f, rot, cam, target_list);
 }
 
 void dc_model_draw_list(DMSModel* model, shz_vec3_t pos, float scale,
@@ -1174,6 +1249,118 @@ static void draw_reflections(DMSModel* model, shz_vec3_t pos, float scale, float
                 g_stats.verts_xformed += mesh->vertex_count;
                 render_fast(vtx[p], mesh->vertex_count, dr);
             }
+        }
+    }
+}
+
+/* ================================================================
+ * Cel shading pass
+ *
+ * The solid meshes again, in the TR list, with U swapped for how much light
+ * each vertex catches. The ramp (cel_setup) multiplies the frame by it.
+ * ================================================================ */
+
+static DMSVertex* g_cel_verts;
+static uint32_t   g_cel_verts_size;
+
+static const DMSVertex* cel_vertices(const DMSMesh* mesh, uint32_t argb) {
+    if (mesh->vertex_count > g_cel_verts_size) {
+        free(g_cel_verts);
+        g_cel_verts = memalign(32, mesh->vertex_count * sizeof(DMSVertex));
+        g_cel_verts_size = g_cel_verts ? mesh->vertex_count : 0;
+        if (!g_cel_verts) return NULL;
+    }
+    /* Onto the middle of the first and last texels, so 0 and full light land
+     * inside the ramp */
+    const float k = (CEL_RAMP_W - 1.0f) / (CEL_RAMP_W * 127.0f);
+    const float u0 = 0.5f / CEL_RAMP_W;
+    const DMSVertex* src = mesh->vertices;
+    DMSVertex* dst = g_cel_verts;
+    for (uint32_t i = 0; i < mesh->vertex_count; i++) {
+        SHZ_PREFETCH(&src[i + 4]);
+        dst[i].x = src[i].x;
+        dst[i].y = src[i].y;
+        dst[i].z = src[i].z;
+        dst[i].u = u0 + catch_light(&src[i]) * k;
+        dst[i].v = 0.5f;
+        dst[i].argb = argb;
+        dst[i].flags = src[i].flags;
+    }
+    return dst;
+}
+
+static uint32_t colour_byte(float c) {
+    return c >= 1.0f ? 255 : c <= 0.0f ? 0 : (uint32_t)(c * 255.0f);
+}
+
+static void draw_cel(DMSModel* model, shz_vec3_t pos, float scale, float yaw,
+                     const float* rot, const DCCamera* cam, int target_list) {
+    if (!g_cel_bands || target_list != PVR_LIST_TR_POLY) return;
+    if (g_glow_only || !model->opaque_count) return;
+
+    shz_sincos_t sc = shz_sincosf(yaw);
+    float yaw_cols[9] = { sc.cos, 0.0f, sc.sin,  0.0f, 1.0f, 0.0f,  -sc.sin, 0.0f, sc.cos };
+    light_to_model(pos, scale, rot ? rot : yaw_cols);
+    if (!g_lit) return;
+    g_lit = 0;   /* the colour is in the ramp, not the vertices */
+
+    /* The light's colour, which the ramp is modulated by */
+    uint32_t argb = 0xFFFFFFFFu;
+    if (g_light.r > 0.0f || g_light.g > 0.0f || g_light.b > 0.0f)
+        argb = 0xFF000000u | (colour_byte(g_light.r) << 16) |
+               (colour_byte(g_light.g) << 8) | colour_byte(g_light.b);
+
+    const WorldFrustum* fr = dc_camera_get_frustum(cam);
+    alignas(32) shz_mat4x4_t mvp;
+    shz_xmtrx_load_4x4((shz_mat4x4_t*)dc_camera_get_pv(cam));
+    shz_xmtrx_translate(pos.x - cam->pos.x, pos.y - cam->pos.y, -(pos.z - cam->pos.z));
+    if (rot) {
+        alignas(32) shz_mat4x4_t rm;
+        rm.elem2D[0][0] =  rot[0]; rm.elem2D[0][1] =  rot[1]; rm.elem2D[0][2] = -rot[2]; rm.elem2D[0][3] = 0.0f;
+        rm.elem2D[1][0] =  rot[3]; rm.elem2D[1][1] =  rot[4]; rm.elem2D[1][2] = -rot[5]; rm.elem2D[1][3] = 0.0f;
+        rm.elem2D[2][0] = -rot[6]; rm.elem2D[2][1] = -rot[7]; rm.elem2D[2][2] =  rot[8]; rm.elem2D[2][3] = 0.0f;
+        rm.elem2D[3][0] = 0.0f;    rm.elem2D[3][1] = 0.0f;    rm.elem2D[3][2] = 0.0f;    rm.elem2D[3][3] = 1.0f;
+        shz_xmtrx_apply_4x4(&rm);
+    } else if (yaw != 0.0f) {
+        shz_xmtrx_apply_rotation_y(yaw);
+    }
+    shz_xmtrx_apply_scale(scale, scale, scale);
+    shz_xmtrx_store_4x4(&mvp);
+
+    uint32_t skip = DMS_MAT_COLLISION_ONLY | DMS_MAT_MARKER |
+                    (g_env ? DMS_MAT_MIRROR : 0);
+    pvr_dr_state_t* dr = NULL;
+
+    for (uint32_t m = 0; m < model->opaque_count; m++) {
+        DMSMesh* mesh = &model->meshes[m];
+        if (mesh->material_flags & skip) continue;
+        if (model->vol_on == m + 1) continue;
+
+        shz_vec3_t tc = turn_centre(rot, yaw, sc, mesh->bound_cx, mesh->bound_cy, mesh->bound_cz);
+        shz_vec3_t mc = shz_vec3_init(pos.x + tc.x * scale, pos.y + tc.y * scale,
+                                      pos.z + tc.z * scale);
+        float mr = mesh->bound_radius * scale;
+        float nd;
+        shz_xmtrx_load_4x4((shz_mat4x4_t*)&fr->side_planes);
+        if (!sphere_visible(fr, mc, mr, &nd)) continue;
+        int clip = nd < mr && nd > -mr;
+
+        if (vtxbuf_full(mesh, clip)) return;
+        const DMSVertex* v = cel_vertices(mesh, argb);
+        if (!v) return;
+        if (!dr) {
+            dc_list_begin(target_list);
+            dr = dc_dr_state();
+        }
+        shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &g_cel_hdr);
+        shz_xmtrx_load_4x4(&mvp);
+        g_stats.tris_drawn += mesh->tri_count;
+        if (clip) {
+            g_stats.verts_clipped += mesh->vertex_count;
+            render_clipped(v, mesh->vertex_count, dr, 0);
+        } else {
+            g_stats.verts_xformed += mesh->vertex_count;
+            render_fast(v, mesh->vertex_count, dr);
         }
     }
 }

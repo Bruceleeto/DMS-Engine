@@ -129,10 +129,16 @@ typedef struct {
     float      r, g, b;  /* colour, 0 to 1. All zero means white */
     float      range;    /* how far it reaches. 0 means 500. A sun has none */
     float      ambient;  /* 0 to 1, how lit the side facing away is. 0 means 0.25 */
+    int        bands;    /* cel shading: the light in this many flat steps with
+                          * sharp edges between them. 0 means smooth */
 } DCLight;
 
 /* Engine use (dc_set_light): the light, or NULL for none */
 void dc_model_set_light(const DCLight* light);
+
+/* Engine use: the light is cel shaded, so solid meshes of static models also
+ * draw a pass in the TR list */
+bool dc_model_cel_on(void);
 
 /* ================================================================
  * Markers

@@ -261,6 +261,14 @@ Credits:
 - Level: [Mine Dungeon - Game Level](https://sketchfab.com/3d-models/mine-dungeon-game-level-7f40ddc776454ebb820be19110ed0403)
   by [Karthik Naidu](https://sketchfab.com/Karthiknaidu97)
 
+### cel
+
+![cel](cel/resources/example.png)
+
+Credits:
+- Model: [Michaelangelo](https://sketchfab.com/3d-models/michaelangelo-c59ff51a24dd41c1837da37ab9106d10)
+  by [saidovspiderman](https://sketchfab.com/saidovspiderman)
+
 ## Blender settings
 
 Export as `.glb`. The converter reads these from the material (Principled

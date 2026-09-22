@@ -560,8 +560,10 @@ static bool model_uses_list(const DMSModel* model, int pvr_list) {
      * were three lists; with five, anything transparent or metallic would claim
      * the modifier lists too. Volumes are asked for separately by the caller. */
     if (pvr_list == PVR_LIST_OP_MOD || pvr_list == PVR_LIST_TR_MOD) return false;
-    /* Reflections of solid metallic meshes are drawn in the TR list */
-    return model->transparent_count != 0 || model->metallic_count != 0;
+    /* Reflections of solid metallic meshes and cel shading are drawn in the
+     * TR list */
+    return model->transparent_count != 0 || model->metallic_count != 0 ||
+           (dc_model_cel_on() && model->opaque_count != 0 && !model->skeleton);
 }
 
 /* Everything queued for one target (NULL: the screen), a list at a time */
