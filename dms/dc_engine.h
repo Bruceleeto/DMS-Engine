@@ -4,6 +4,8 @@
 #include <kos.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdalign.h>
+#include <sh4zam/shz_sh4zam.h>
 
 /* ================================================================
  * Init / Shutdown
@@ -93,6 +95,21 @@ void dc_frame_stats_log(void);
 /* Set PVR background clear color (0xAARRGGBB). */
 void dc_set_clear_color(uint32_t argb);
 
+/* Hardware fog on every model (0xRRGGBB, blend from none at near to full at
+ * far, both in world units along the view). Free: the PVR does it per
+ * pixel from the depth. dc_set_fog_off() clears it (the default). */
+void dc_set_fog(uint32_t rgb, float near, float far);
+void dc_set_fog_off(void);
+
+/* The same, arriving over so many seconds from the fog as it is now: the
+ * colour and the distances ease there. A dc_set_fog() in the middle jumps
+ * straight to it. With no fog on yet it is set at once. */
+void dc_set_fog_over(uint32_t rgb, float near, float far, float seconds);
+
+/* The clear colour eased there over so many seconds (the sky following the
+ * fog, a dusk). dc_set_clear_color() in the middle jumps. */
+void dc_set_clear_color_over(uint32_t argb, float seconds);
+
 /* ================================================================
  * PVR list helpers (used by rendering code)
  * ================================================================ */
@@ -103,6 +120,44 @@ pvr_dr_state_t* dc_list_begin(int pvr_list);
 
 /* Finish the currently open list (if any). */
 void dc_list_finish(void);
+
+/* Engine use: the part of what is being drawn into that the polygons from now
+ * on may land in, in pixels. The PVR keeps polygons out of the 32 pixel tiles
+ * outside it, so the edges are rounded out to tiles. Only a scene with a
+ * camera whose view is smaller than the screen (dc_clip_scene) sends any of
+ * this; every other scene, and every render target, goes to the TA with no
+ * clip objects, no dummies and no clip bits, as before there was a clip. */
+void dc_list_clip(float x, float y, float w, float h);
+
+/* Engine use (the draw queue): whether the scene being flushed clips. On, a
+ * list opens with the whole render size clipped and every header carries the
+ * clip bit; off, nothing is sent. */
+void dc_clip_scene(bool on);
+
+/* PVR_USERCLIP_INSIDE << 16 while the scene clips, else 0 */
+extern uint32_t dc_clip_cmd;
+
+/* Engine use: on a context compiled straight into the store queues, before
+ * pvr_poly_compile. Set here and not on the compiled header: the store
+ * queues cannot be read back on real hardware, so a read-modify-write of a
+ * header there sends garbage (and it did: the TA locked up). */
+static inline void dc_cxt_clip(pvr_poly_cxt_t* cxt) {
+    cxt->gen.clip_mode = dc_clip_cmd ? PVR_USERCLIP_INSIDE : PVR_USERCLIP_DISABLE;
+}
+
+/* Engine use: send a header compiled ahead of time (in RAM, with no clip
+ * bit) to the TA, adding the clip bit when the scene clips. Goes through
+ * XMTRX, like the copy it replaces; load the matrix after. */
+static inline void dc_send_hdr(pvr_dr_state_t* dr, const pvr_poly_hdr_t* hdr) {
+    (void)dr;
+    if (!dc_clip_cmd) {
+        shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), hdr);
+        return;
+    }
+    alignas(32) pvr_poly_hdr_t h = *hdr;
+    h.cmd |= dc_clip_cmd;
+    shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &h);
+}
 
 /* Engine use (the draw queue): draw a scene into a texture (RGB565, not
  * twiddled, w by h) before the screen's scene. Returns false if it cannot. */

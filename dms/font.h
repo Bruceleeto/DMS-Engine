@@ -124,13 +124,12 @@ static void SetDrawingState(pvr_dr_state_t* state) {
     currentDrState = state; 
 }
 
-static void DrawText(const char* text, int posX, int posY, int fontSize, Color color) {
+static void DrawText(const char* text, int posX, int posY, int fontSize, Color color, float z) {
     if (!currentDrState || !fontLoaded) return;
     
     const float scale = (float)fontSize / DEFAULT_FONT_SIZE;
     const float h = DEFAULT_FONT_SIZE * scale;
     const uint32_t pvrColor = ColorToPVR(color);
-    const float z = 1.0f / 0.1f;  /* always in front of 3D geo */
     
     float currentX = (float)posX;
     float currentY = (float)posY;

@@ -137,10 +137,12 @@ static inline void submit_vert(ClipVertex* v, uint32_t flags) {
 /* ================================================================
  * Runtime light
  *
- * One light, multiplied over the colours already baked into the vertices. It
- * is moved into the space the model's vertices are stored in once per draw
- * call, so the vertex loop dots it straight against the int8 normal each
- * vertex already carries and nothing is rotated per vertex.
+ * The lights, multiplied over the colours already baked into the vertices.
+ * Each is moved into the space the model's vertices are stored in once per
+ * draw call, so the vertex loop dots it straight against the int8 normal
+ * each vertex already carries and nothing is rotated per vertex. One light
+ * is the common case and costs one dot a vertex; each one after it costs
+ * another. The ambient, the cel bands and the blend are the first light's.
  * ================================================================ */
 
 typedef struct {
@@ -151,10 +153,41 @@ typedef struct {
     float inv_range;     /* 0 for a sun, which never fades */
 } ModelLight;
 
-static DCLight    g_light;
-static bool       g_light_set;
-static ModelLight g_ml;      /* g_light in the space of the model being drawn */
+static DCLight    g_lights[DC_MAX_LIGHTS];
+static int        g_light_n;               /* how many are set; 0 for none */
+#define g_light   g_lights[0]              /* the first: ambient, cel, the blend */
+static ModelLight g_ml[DC_MAX_LIGHTS];     /* the lights in the space of the model being drawn */
+static int        g_ml_n;
+static float      g_ml_ambient;            /* the first light's, times 127 */
+static float      g_ml_model[DC_MAX_LIGHTS][3];   /* the same before a bone moved them (skinned) */
 static int        g_lit;     /* this draw call shades instead of copying argb */
+static int        g_tint_on; /* dc_model_set_tint(): every colour multiplied by it */
+static uint32_t   g_tint_r, g_tint_g, g_tint_b;   /* 0 to 256, so 255 is "as it is" */
+
+void dc_model_set_tint(uint32_t rgb) {
+    rgb &= 0xFFFFFFu;
+    g_tint_on = rgb != 0 && rgb != 0xFFFFFFu;
+    g_tint_r = ((rgb >> 16) & 0xff) + 1;
+    g_tint_g = ((rgb >>  8) & 0xff) + 1;
+    g_tint_b = ( rgb        & 0xff) + 1;
+}
+
+static inline uint32_t tint_argb(uint32_t c) {
+    uint32_t r = (((c >> 16) & 0xff) * g_tint_r) >> 8;
+    uint32_t g = (((c >>  8) & 0xff) * g_tint_g) >> 8;
+    uint32_t b = (( c        & 0xff) * g_tint_b) >> 8;
+    return (c & 0xff000000u) | (r << 16) | (g << 8) | b;
+}
+
+/* Rim light (Fresnel), after tiny3d's fresnel example: a vertex whose normal
+ * turns away from the camera takes on the mesh's rim colour, so the outline
+ * of a shiny thing glows and it reads as glossy and round. The camera is
+ * moved into the model's space once per draw call like the light, and each
+ * vertex dots its normal against the way to it. Set per mesh (rim_color). */
+typedef struct { float x, y, z; float r, g, b; } RimLight;
+static RimLight   g_rim;
+static int        g_rim_on;  /* this mesh has a rim colour */
+static bool       g_glow_only;   /* the bloom pass (defined with the reflections below) */
 /* This mesh is drawn only to block the glow behind it (the bloom pass), so it
  * goes out black. Set per mesh, and only while dc_model_set_glow_only(). */
 static int        g_flat;
@@ -214,9 +247,12 @@ static bool cel_setup(int bands, float ambient) {
     return true;
 }
 
-void dc_model_set_light(const DCLight* light) {
-    g_light_set = light != NULL;
-    if (light) g_light = *light;
+void dc_model_set_lights(const DCLight* lights, int count) {
+    if (!lights || count <= 0) count = 0;
+    if (count > DC_MAX_LIGHTS) count = DC_MAX_LIGHTS;
+    g_light_n = count;
+    for (int i = 0; i < count; i++) g_lights[i] = lights[i];
+    const DCLight* light = count ? &g_light : NULL;
 
     g_cel_bands = 0;
     if (light && light->bands >= 2) {
@@ -225,6 +261,8 @@ void dc_model_set_light(const DCLight* light) {
             g_cel_bands = bands;
     }
 }
+
+void dc_model_set_light(const DCLight* light) { dc_model_set_lights(light, light ? 1 : 0); }
 
 bool dc_model_cel_on(void) { return g_cel_bands != 0; }
 
@@ -257,75 +295,157 @@ int dc_model_points(DMSModel* model, const char* material,
  * model's x, y and z axes point in the world (the rot[9] of the public call),
  * so its transpose brings a world direction back the other way. */
 static void light_to_model(shz_vec3_t pos, float scale, const float* cols) {
-    g_lit = g_light_set && scale > 0.0f;
+    g_lit = g_light_n > 0 && scale > 0.0f;
     if (!g_lit) return;
+    g_ml_n = g_light_n;
+    g_ml_ambient = (g_light.ambient > 0.0f ? g_light.ambient : 0.25f) * 127.0f;
 
-    float w[3];
-    if (g_light.sun) {
-        w[0] = -g_light.pos.x; w[1] = -g_light.pos.y; w[2] = -g_light.pos.z;
-        float n = shz_inv_sqrtf(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
-        w[0] *= n; w[1] *= n; w[2] *= n;
-        g_ml.pos_w = 0.0f;
-        g_ml.inv_range = 0.0f;
-    } else {
-        float inv_scale = 1.0f / scale;
-        w[0] = (g_light.pos.x - pos.x) * inv_scale;
-        w[1] = (g_light.pos.y - pos.y) * inv_scale;
-        w[2] = (g_light.pos.z - pos.z) * inv_scale;
-        g_ml.pos_w = 1.0f;
-        g_ml.inv_range = scale / (g_light.range > 0.0f ? g_light.range : 500.0f);
-    }
-    g_ml.x = cols[0] * w[0] + cols[1] * w[1] + cols[2] * w[2];
-    g_ml.y = cols[3] * w[0] + cols[4] * w[1] + cols[5] * w[2];
-    g_ml.z = cols[6] * w[0] + cols[7] * w[1] + cols[8] * w[2];
-
+    /* A stretched model has columns shorter than 1 (see dc_draw_ex): a
+     * direction goes back through the inverse, which divides each axis by
+     * the column's length squared. Unit columns divide by 1. */
+    float lx2 = cols[0] * cols[0] + cols[1] * cols[1] + cols[2] * cols[2];
+    float ly2 = cols[3] * cols[3] + cols[4] * cols[4] + cols[5] * cols[5];
+    float lz2 = cols[6] * cols[6] + cols[7] * cols[7] + cols[8] * cols[8];
     const float k = 256.0f / 127.0f;
-    int white = g_light.r <= 0.0f && g_light.g <= 0.0f && g_light.b <= 0.0f;
-    g_ml.r = (white ? 1.0f : g_light.r) * k;
-    g_ml.g = (white ? 1.0f : g_light.g) * k;
-    g_ml.b = (white ? 1.0f : g_light.b) * k;
-    g_ml.ambient = (g_light.ambient > 0.0f ? g_light.ambient : 0.25f) * 127.0f;
+
+    for (int i = 0; i < g_light_n; i++) {
+        const DCLight* l = &g_lights[i];
+        ModelLight* ml = &g_ml[i];
+        float w[3];
+        if (l->sun) {
+            w[0] = -l->pos.x; w[1] = -l->pos.y; w[2] = -l->pos.z;
+            float n = shz_inv_sqrtf(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+            w[0] *= n; w[1] *= n; w[2] *= n;
+            ml->pos_w = 0.0f;
+            ml->inv_range = 0.0f;
+        } else {
+            float inv_scale = 1.0f / scale;
+            w[0] = (l->pos.x - pos.x) * inv_scale;
+            w[1] = (l->pos.y - pos.y) * inv_scale;
+            w[2] = (l->pos.z - pos.z) * inv_scale;
+            ml->pos_w = 1.0f;
+            ml->inv_range = scale / (l->range > 0.0f ? l->range : 500.0f);
+        }
+        ml->x = (cols[0] * w[0] + cols[1] * w[1] + cols[2] * w[2]) / lx2;
+        ml->y = (cols[3] * w[0] + cols[4] * w[1] + cols[5] * w[2]) / ly2;
+        ml->z = (cols[6] * w[0] + cols[7] * w[1] + cols[8] * w[2]) / lz2;
+        g_ml_model[i][0] = ml->x; g_ml_model[i][1] = ml->y; g_ml_model[i][2] = ml->z;
+
+        int white = l->r <= 0.0f && l->g <= 0.0f && l->b <= 0.0f;
+        ml->r = (white ? 1.0f : l->r) * k;
+        ml->g = (white ? 1.0f : l->g) * k;
+        ml->b = (white ? 1.0f : l->b) * k;
+    }
 }
 
-/* The vertex's baked colour with the light over it. pos_w is what lets a sun
- * use the same arithmetic: the difference below collapses to the light
- * direction, which is already unit length, and nothing fades. */
-static inline float catch_light(const DMSVertex* s) {
-    float dx = g_ml.x - s->x * g_ml.pos_w;
-    float dy = g_ml.y - s->y * g_ml.pos_w;
-    float dz = g_ml.z - s->z * g_ml.pos_w;
-    float d2 = dx * dx + dy * dy + dz * dz;
-    float inv = shz_inv_sqrtf(d2);
-
-    float ndl = (s->nx * dx + s->ny * dy + s->nz * dz) * inv;
-    float att = 1.0f - (d2 * inv) * g_ml.inv_range;
-    if (ndl < 0.0f) ndl = 0.0f;
-    if (att < 0.0f) att = 0.0f;
-    return ndl * att;    /* 0 to 127, the length of an int8 normal */
+/* The camera into the space the vertices are stored in, for the rim */
+static void cam_to_model(shz_vec3_t pos, float scale, const float* cols, const DCCamera* cam) {
+    float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+    float w[3] = { (cam->pos.x - pos.x) * inv_scale, (cam->pos.y - pos.y) * inv_scale, (cam->pos.z - pos.z) * inv_scale };
+    float lx2 = cols[0] * cols[0] + cols[1] * cols[1] + cols[2] * cols[2];
+    float ly2 = cols[3] * cols[3] + cols[4] * cols[4] + cols[5] * cols[5];
+    float lz2 = cols[6] * cols[6] + cols[7] * cols[7] + cols[8] * cols[8];
+    g_rim.x = (cols[0] * w[0] + cols[1] * w[1] + cols[2] * w[2]) / lx2;
+    g_rim.y = (cols[3] * w[0] + cols[4] * w[1] + cols[5] * w[2]) / ly2;
+    g_rim.z = (cols[6] * w[0] + cols[7] * w[1] + cols[8] * w[2]) / lz2;
 }
 
-static inline uint32_t shade(const DMSVertex* s) {
-    float lit = g_ml.ambient + catch_light(s);
+/* This mesh's rim colour, or none. Off in the glow pass: a rim is caught light */
+static inline void rim_set(const DMSMesh* mesh) {
+    uint32_t c = mesh->rim_color;
+    g_rim_on = c != 0 && !g_glow_only;
+    if (!g_rim_on) return;
+    g_rim.r = (float)((c >> 16) & 0xff);
+    g_rim.g = (float)((c >> 8) & 0xff);
+    g_rim.b = (float)(c & 0xff);
+}
 
-    uint32_t c = s->argb;
-    uint32_t r = (((c >> 16) & 0xff) * (uint32_t)(lit * g_ml.r)) >> 8;
-    uint32_t g = (((c >>  8) & 0xff) * (uint32_t)(lit * g_ml.g)) >> 8;
-    uint32_t b = (( c        & 0xff) * (uint32_t)(lit * g_ml.b)) >> 8;
+/* The colour with the rim added: nothing facing the camera, all of it edge-on,
+ * squared so it hugs the outline */
+static inline uint32_t rim_light(uint32_t c, const DMSVertex* s) {
+    float dx = g_rim.x - s->x, dy = g_rim.y - s->y, dz = g_rim.z - s->z;
+    float inv = shz_inv_sqrtf(dx * dx + dy * dy + dz * dz);
+    float ndv = (s->nx * dx + s->ny * dy + s->nz * dz) * inv * (1.0f / 127.0f);
+    float f = 1.0f - fabsf(ndv);
+    if (f <= 0.0f) return c;
+    f *= f;
+    uint32_t r = ((c >> 16) & 0xff) + (uint32_t)(g_rim.r * f);
+    uint32_t g = ((c >>  8) & 0xff) + (uint32_t)(g_rim.g * f);
+    uint32_t b = ( c        & 0xff) + (uint32_t)(g_rim.b * f);
     if (r > 255) r = 255;
     if (g > 255) g = 255;
     if (b > 255) b = 255;
     return (c & 0xff000000u) | (r << 16) | (g << 8) | b;
 }
 
+/* The vertex's baked colour with the light over it. pos_w is what lets a sun
+ * use the same arithmetic: the difference below collapses to the light
+ * direction, which is already unit length, and nothing fades. */
+static inline float catch_light(const DMSVertex* s, const ModelLight* ml) {
+    float dx = ml->x - s->x * ml->pos_w;
+    float dy = ml->y - s->y * ml->pos_w;
+    float dz = ml->z - s->z * ml->pos_w;
+    float d2 = dx * dx + dy * dy + dz * dz;
+    float inv = shz_inv_sqrtf(d2);
+
+    float ndl = (s->nx * dx + s->ny * dy + s->nz * dz) * inv;
+    float att = 1.0f - (d2 * inv) * ml->inv_range;
+    if (ndl < 0.0f) ndl = 0.0f;
+    if (att < 0.0f) att = 0.0f;
+    return ndl * att;    /* 0 to 127, the length of an int8 normal */
+}
+
+static inline uint32_t shade(const DMSVertex* s) {
+    uint32_t c = s->argb;
+    if (g_lit) {
+        /* The first light carries the ambient; the others only add */
+        float lit = g_ml_ambient + catch_light(s, &g_ml[0]);
+        float lr = lit * g_ml[0].r, lg = lit * g_ml[0].g, lb = lit * g_ml[0].b;
+        for (int i = 1; i < g_ml_n; i++) {
+            lit = catch_light(s, &g_ml[i]);
+            lr += lit * g_ml[i].r; lg += lit * g_ml[i].g; lb += lit * g_ml[i].b;
+        }
+        uint32_t r = (((c >> 16) & 0xff) * (uint32_t)lr) >> 8;
+        uint32_t g = (((c >>  8) & 0xff) * (uint32_t)lg) >> 8;
+        uint32_t b = (( c        & 0xff) * (uint32_t)lb) >> 8;
+        if (r > 255) r = 255;
+        if (g > 255) g = 255;
+        if (b > 255) b = 255;
+        c = (c & 0xff000000u) | (r << 16) | (g << 8) | b;
+    }
+    if (g_tint_on) c = tint_argb(c);
+    return g_rim_on ? rim_light(c, s) : c;
+}
+
 /* ================================================================
  * Render: fast path (static mesh, fully inside frustum)
  * ================================================================ */
+
+/* dc_model_scroll(): how far this mesh's texture has slid, added to every
+ * vertex's u and v by the loops below. Set per mesh from the clock, wrapped
+ * to a texture width so it never grows. */
+static float g_uv_u = 0.0f, g_uv_v = 0.0f;
+
+static inline void uv_scroll_set(const DMSMesh* m) {
+    if (m->flip_count) {   /* dc_model_flipbook(): jump to this moment's frame */
+        uint32_t frame = (uint32_t)((float)(dc_time_ms() % 3600000u) * 0.001f * m->flip_fps) % m->flip_count;
+        g_uv_u = (frame % m->flip_across) * m->flip_w;
+        g_uv_v = (frame / m->flip_across) * m->flip_h;
+        return;
+    }
+    if (m->scroll_u == 0.0f && m->scroll_v == 0.0f) { g_uv_u = g_uv_v = 0.0f; return; }
+    float t = (float)(dc_time_ms() % 3600000u) * 0.001f;
+    float u = m->scroll_u * t, v = m->scroll_v * t;
+    g_uv_u = u - floorf(u);
+    g_uv_v = v - floorf(v);
+}
 
 /* The lit copy of the loop below. The shading goes between the matrix multiply
  * and the divide that wants its result, which is where the unlit loop stalls,
  * so this one has no software pipeline to keep it busy. */
 static void render_fast_lit(const DMSVertex* src, int count,
                             pvr_dr_state_t* dr) {
+    const float uv_u = g_uv_u, uv_v = g_uv_v;
     SHZ_PREFETCH(&src[0]);
     SHZ_PREFETCH(&src[1]);
 
@@ -344,8 +464,8 @@ static void render_fast_lit(const DMSVertex* src, int count,
         pv->x     = t.x * inv_w;
         pv->y     = t.y * inv_w;
         pv->z     = inv_w;
-        pv->u     = src[i].u;
-        pv->v     = src[i].v;
+        pv->u     = src[i].u + uv_u;
+        pv->v     = src[i].v + uv_v;
         pv->argb  = argb;
         pvr_dr_commit(pv);
     }
@@ -369,8 +489,9 @@ static void render_fast(const DMSVertex* src, int count,
     float    cur_sx    = t0.x * cur_invw;
     float    cur_sy    = t0.y * cur_invw;
     uint32_t cur_flags = src[0].flags;
-    float    cur_u     = src[0].u;
-    float    cur_v     = src[0].v;
+    const float uv_u = g_uv_u, uv_v = g_uv_v;
+    float    cur_u     = src[0].u + uv_u;
+    float    cur_v     = src[0].v + uv_v;
     uint32_t cur_argb  = src[0].argb;
 
     for (int i = 1; i < count; i++) {
@@ -380,8 +501,8 @@ static void render_fast(const DMSVertex* src, int count,
         float    ny     = src[i].y;
         float    nz     = -src[i].z;
         uint32_t nflags = src[i].flags;
-        float    nu     = src[i].u;
-        float    nv     = src[i].v;
+        float    nu     = src[i].u + uv_u;
+        float    nv     = src[i].v + uv_v;
         uint32_t nargb  = src[i].argb;
 
         shz_vec4_t next_t = shz_xmtrx_transform_vec4(
@@ -511,8 +632,8 @@ static void render_clipped(const DMSVertex* src, int count,
         g_clip_buffer[i].y = t.y;
         g_clip_buffer[i].z = t.z;
         g_clip_buffer[i].w = t.w;
-        g_clip_buffer[i].u = src[i].u;
-        g_clip_buffer[i].v = src[i].v;
+        g_clip_buffer[i].u = src[i].u + g_uv_u;
+        g_clip_buffer[i].v = src[i].v + g_uv_v;
         g_clip_buffer[i].argb = g_flat ? (src[i].argb & 0xff000000u)
                               : lit    ? shade(&src[i])
                                        : src[i].argb;
@@ -565,13 +686,25 @@ static void render_clipped(const DMSVertex* src, int count,
             uint32_t and_codes = oc0 & oc1 & oc2;
 
             if (or_codes == 0) {
+                int next_inside = !eos && (v[j+1].flags == 0);
+                int end_strip = eos || !next_inside;
                 if (!in_strip) {
+                    /* A strip restarted on an odd triangle would come out
+                     * with the opposite winding and be culled. On its own it
+                     * goes out as a triangle in the right order; with more
+                     * to follow, a repeated first vertex (one degenerate
+                     * triangle, 32 bytes) keeps the strip's parity */
+                    if ((j & 1) && end_strip) {
+                        submit_vert(&v[j-1], PVR_CMD_VERTEX);
+                        submit_vert(&v[j-2], PVR_CMD_VERTEX);
+                        submit_vert(&v[j],   PVR_CMD_VERTEX_EOL);
+                        continue;
+                    }
+                    if (j & 1) submit_vert(&v[j-1], PVR_CMD_VERTEX);
                     submit_vert(&v[j-2], PVR_CMD_VERTEX);
                     submit_vert(&v[j-1], PVR_CMD_VERTEX);
                     in_strip = 1;
                 }
-                int next_inside = !eos && (v[j+1].flags == 0);
-                int end_strip = eos || !next_inside;
                 submit_vert(&v[j], end_strip ? PVR_CMD_VERTEX_EOL
                                              : PVR_CMD_VERTEX);
                 if (end_strip) in_strip = 0;
@@ -614,6 +747,32 @@ static void render_clipped(const DMSVertex* src, int count,
  * Render: skinned path (animated mesh, fused skin+MVP+submit)
  * ================================================================ */
 
+/* A skinned vertex and its normal are stored in the bind pose and the bone's
+ * skin matrix moves them to where the bone is now. The light is brought the
+ * other way, once per run of vertices on a bone, so the loop dots it against
+ * the stored normal as the static path does and nothing is rotated per
+ * vertex. The 3x3 goes back through its transpose over each column's length
+ * squared (a bone with scale in it); a light in a place also loses the
+ * bone's translation, a sun only turns. */
+static inline void light_to_bone(const shz_mat4x4_t* skin) {
+    float inv2[3];
+    for (int c = 0; c < 3; c++) {
+        float cx = skin->elem2D[c][0], cy = skin->elem2D[c][1], cz = skin->elem2D[c][2];
+        inv2[c] = 1.0f / (cx * cx + cy * cy + cz * cz);
+    }
+    for (int i = 0; i < g_ml_n; i++) {
+        ModelLight* ml = &g_ml[i];
+        float w[3] = { g_ml_model[i][0], g_ml_model[i][1], g_ml_model[i][2] };
+        if (ml->pos_w != 0.0f) {
+            w[0] -= skin->elem2D[3][0]; w[1] -= skin->elem2D[3][1]; w[2] -= skin->elem2D[3][2];
+        }
+        float out[3];
+        for (int c = 0; c < 3; c++)
+            out[c] = (skin->elem2D[c][0] * w[0] + skin->elem2D[c][1] * w[1] + skin->elem2D[c][2] * w[2]) * inv2[c];
+        ml->x = out[0]; ml->y = out[1]; ml->z = out[2];
+    }
+}
+
 static void render_skinned(const DMSVertex* src, int count,
                            const DMSSkeleton* sk,
                            const shz_mat4x4_t* mvp,
@@ -627,10 +786,13 @@ static void render_skinned(const DMSVertex* src, int count,
     SHZ_PREFETCH(&src[2]);
     SHZ_PREFETCH(&src[3]);
 
+    const int lit = g_lit;
+
     /* Prime: load bone matrix for vertex 0 */
     {
         uint8_t bone_id = src[0].pad;
         if (bone_id != last_bone) {
+            if (lit) light_to_bone(&sk->bones[bone_id].skinMatrix);
             shz_xmtrx_load_apply_4x4(mvp, &sk->bones[bone_id].skinMatrix);
             last_bone = bone_id;
         }
@@ -646,9 +808,14 @@ static void render_skinned(const DMSVertex* src, int count,
     float    cur_sx    = t0.x * cur_invw;
     float    cur_sy    = t0.y * cur_invw;
     uint32_t cur_flags = src[0].flags;
-    float    cur_u     = src[0].u;
-    float    cur_v     = src[0].v;
-    uint32_t cur_argb  = src[0].argb;
+    const float uv_u = g_uv_u, uv_v = g_uv_v;
+    float    cur_u     = src[0].u + uv_u;
+    float    cur_v     = src[0].v + uv_v;
+    /* Tinted, a colour is worked out once and reused while it repeats, which
+     * on a skinned model is most of the time. Lit, every vertex is its own. */
+    const int tint     = g_tint_on && !lit;
+    uint32_t raw_prev  = src[0].argb;
+    uint32_t cur_argb  = lit ? shade(&src[0]) : tint ? tint_argb(raw_prev) : raw_prev;
 
     for (int i = 1; i < count; i++) {
         SHZ_PREFETCH(&src[i + 4]);
@@ -656,6 +823,7 @@ static void render_skinned(const DMSVertex* src, int count,
         uint8_t bone_id = src[i].pad;
 
         if (bone_id != last_bone) {
+            if (lit) light_to_bone(&sk->bones[bone_id].skinMatrix);
             shz_xmtrx_load_apply_4x4(mvp, &sk->bones[bone_id].skinMatrix);
             last_bone = bone_id;
         }
@@ -664,9 +832,11 @@ static void render_skinned(const DMSVertex* src, int count,
         float    ny     = src[i].y;
         float    nz     = src[i].z;  /* no negation — baked into MVP */
         uint32_t nflags = src[i].flags;
-        float    nu     = src[i].u;
-        float    nv     = src[i].v;
+        float    nu     = src[i].u + uv_u;
+        float    nv     = src[i].v + uv_v;
         uint32_t nargb  = src[i].argb;
+        if (lit) nargb = shade(&src[i]);
+        else if (tint) nargb = nargb == raw_prev ? cur_argb : (raw_prev = nargb, tint_argb(nargb));
 
         shz_vec4_t next_t = shz_xmtrx_transform_vec4(
             shz_vec4_init(nx, ny, nz, 1.0f)
@@ -721,11 +891,11 @@ void dc_model_set_add(bool add) {
 static inline void send_header(pvr_dr_state_t* dr, const DMSMesh* mesh) {
     (void)dr;
     if (!g_add) {
-        shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &mesh->header);
+        dc_send_hdr(dr, &mesh->header);
         return;
     }
     alignas(32) pvr_poly_hdr_t h = mesh->header;
-    h.cmd = (h.cmd & ~PVR_TA_CMD_TYPE_MASK) | (PVR_LIST_TR_POLY << PVR_TA_CMD_TYPE_SHIFT);
+    h.cmd = (h.cmd & ~PVR_TA_CMD_TYPE_MASK) | (PVR_LIST_TR_POLY << PVR_TA_CMD_TYPE_SHIFT) | dc_clip_cmd;
     h.mode1 &= ~PVR_TA_PM1_DEPTHWRITE_MASK;
     h.mode1 |= PVR_DEPTHWRITE_DISABLE << PVR_TA_PM1_DEPTHWRITE_SHIFT;
     h.mode2 &= ~(PVR_TA_PM2_SRCBLEND_MASK | PVR_TA_PM2_DSTBLEND_MASK);
@@ -737,10 +907,12 @@ static inline void send_header(pvr_dr_state_t* dr, const DMSMesh* mesh) {
 /* Skinned mesh: cull the whole animated bound, then skin + submit.
  * Returns 1 if the mesh was drawn, 0 if culled. */
 static int draw_skinned_mesh(DMSMesh* mesh, DMSModel* model,
-                             shz_vec3_t pos, float scale, float yaw,
+                             shz_vec3_t pos, float scale, float yaw, shz_vec3_t stretch,
                              const DCCamera* cam, pvr_dr_state_t* dr) {
-    float bcx = model->anim_bound_cx;
-    float bcz = model->anim_bound_cz;
+    float bcx = model->anim_bound_cx * stretch.x;
+    float bcz = model->anim_bound_cz * stretch.z;
+    float widest = stretch.x > stretch.y ? stretch.x : stretch.y;
+    if (stretch.z > widest) widest = stretch.z;
 
     /* Rotate bounding sphere center to match model yaw */
     if (yaw != 0.0f) {
@@ -752,9 +924,9 @@ static int draw_skinned_mesh(DMSMesh* mesh, DMSModel* model,
     }
 
     shz_vec3_t wc = shz_vec3_init(pos.x + bcx * scale,
-                                  pos.y + model->anim_bound_cy * scale,
+                                  pos.y + model->anim_bound_cy * stretch.y * scale,
                                   pos.z + bcz * scale);
-    float wr = model->anim_bound_radius * scale;
+    float wr = model->anim_bound_radius * scale * widest;
 
     /* Skinned meshes have no clip path: cull if off-screen or crossing near */
     if (dc_frustum_cull_sphere(cam, wc, wr) < 0 ||
@@ -771,16 +943,28 @@ static int draw_skinned_mesh(DMSMesh* mesh, DMSModel* model,
 
     send_header(dr, mesh);
 
+    /* The light into the model's space: the yaw, and the stretch as column
+     * lengths, which light_to_model divides back out. The rim light is not
+     * on the skinned path (its camera is worked out per static model only). */
+    shz_sincos_t sc = shz_sincosf(yaw);
+    float cols[9] = { sc.cos * stretch.x, 0.0f, sc.sin * stretch.x,
+                      0.0f, stretch.y, 0.0f,
+                      -sc.sin * stretch.z, 0.0f, sc.cos * stretch.z };
+    light_to_model(pos, scale, cols);
+    if (g_glow_only) g_lit = 0;
+    g_rim_on = 0;
+
     /* Build MVP with Z negation baked into scale */
     shz_xmtrx_load_4x4((shz_mat4x4_t*)dc_camera_get_pv(cam));
     shz_xmtrx_translate(pos.x - cam->pos.x, pos.y - cam->pos.y, -(pos.z - cam->pos.z));
     if (yaw != 0.0f) shz_xmtrx_apply_rotation_y(yaw);
-    shz_xmtrx_apply_scale(scale, scale, -scale);
+    shz_xmtrx_apply_scale(scale * stretch.x, scale * stretch.y, -scale * stretch.z);
 
     alignas(32) shz_mat4x4_t mvp;
     shz_xmtrx_store_4x4(&mvp);
 
     g_stats.verts_xformed += mesh->vertex_count;
+    uv_scroll_set(mesh);
     render_skinned(mesh->vertices, mesh->vertex_count, model->skeleton, &mvp, dr);
     return 1;
 }
@@ -812,8 +996,8 @@ static inline int sphere_visible(const WorldFrustum* fr, shz_vec3_t c, float r, 
 static const dttex_info_t* g_env;
 
 /* The bloom pass (dc_set_bloom): only meshes that give off light are drawn,
- * so what lands in the small picture is the glow and nothing else */
-static bool g_glow_only;
+ * so what lands in the small picture is the glow and nothing else.
+ * g_glow_only is declared with the light above. */
 
 void dc_model_set_glow_only(bool on) { g_glow_only = on; g_flat = 0; }
 
@@ -854,6 +1038,7 @@ static void draw_blocks_list(DMSModel* model, shz_vec3_t pos, float scale,
     shz_sincos_t sc = shz_sincosf(yaw);
     float yaw_cols[9] = { sc.cos, 0.0f, sc.sin,  0.0f, 1.0f, 0.0f,  -sc.sin, 0.0f, sc.cos };
     light_to_model(pos, scale, rot ? rot : yaw_cols);
+    cam_to_model(pos, scale, rot ? rot : yaw_cols, cam);
     /* The glow pass draws what a mesh gives off, which a light cannot change */
     if (g_glow_only) g_lit = 0;
     /* Cel shaded solid meshes go out with their baked colours; draw_cel lays
@@ -967,14 +1152,17 @@ static void draw_blocks_list(DMSModel* model, shz_vec3_t pos, float scale,
                 /* In the glow pass everything that is not a lamp is still
                  * drawn, in black, so it blocks what is behind it */
                 g_flat = g_glow_only && !(mesh->material_flags & DMS_MAT_GLOW);
+                rim_set(mesh);
+                uv_scroll_set(mesh);
+                int shaded = g_lit || g_rim_on || g_tint_on;
                 if (batch[i] & 0x80000000u) {
                     g_stats.verts_clipped += mesh->vertex_count;
-                    render_clipped(mesh->vertices, mesh->vertex_count, dr, g_lit);
+                    render_clipped(mesh->vertices, mesh->vertex_count, dr, shaded);
                 } else {
                     g_stats.verts_xformed += mesh->vertex_count;
-                    if (g_flat)     render_fast_flat(mesh->vertices, mesh->vertex_count, dr);
-                    else if (g_lit) render_fast_lit(mesh->vertices, mesh->vertex_count, dr);
-                    else            render_fast(mesh->vertices, mesh->vertex_count, dr);
+                    if (g_flat)      render_fast_flat(mesh->vertices, mesh->vertex_count, dr);
+                    else if (shaded) render_fast_lit(mesh->vertices, mesh->vertex_count, dr);
+                    else             render_fast(mesh->vertices, mesh->vertex_count, dr);
                 }
             }
         }
@@ -983,7 +1171,7 @@ static void draw_blocks_list(DMSModel* model, shz_vec3_t pos, float scale,
 
 /* Skinned models: one mesh at a time */
 static void draw_skinned_list(DMSModel* model, shz_vec3_t pos, float scale,
-                              float yaw, const DCCamera* cam, int target_list) {
+                              float yaw, shz_vec3_t stretch, const DCCamera* cam, int target_list) {
     pvr_dr_state_t* dr = NULL;
 
     for (uint32_t m = 0; m < model->mesh_count; m++) {
@@ -1003,7 +1191,7 @@ static void draw_skinned_list(DMSModel* model, shz_vec3_t pos, float scale,
             dc_list_begin(target_list);
             dr = dc_dr_state();
         }
-        draw_skinned_mesh(mesh, model, pos, scale, yaw, cam, dr);
+        draw_skinned_mesh(mesh, model, pos, scale, yaw, stretch, cam, dr);
     }
 }
 
@@ -1012,12 +1200,24 @@ void dc_model_draw_list_rotated(DMSModel* model, shz_vec3_t pos, float scale,
     if (!model || model->mesh_count == 0) return;
 
     if (model->skeleton)
-        draw_skinned_list(model, pos, scale, yaw, cam, target_list);
+        draw_skinned_list(model, pos, scale, yaw, shz_vec3_init(1.0f, 1.0f, 1.0f), cam, target_list);
     else {
         draw_blocks_list(model, pos, scale, yaw, NULL, cam, target_list);
         if (!g_add) draw_reflections(model, pos, scale, yaw, NULL, cam, target_list);
         if (!g_add) draw_cel(model, pos, scale, yaw, NULL, cam, target_list);
     }
+}
+
+/* A skinned model pulled by a different factor on each of its own axes,
+ * on top of scale: squash and stretch. The bones move it, then it is
+ * scaled, so a squashed one still animates. Its light is close, not exact. */
+void dc_model_draw_list_stretched(DMSModel* model, shz_vec3_t pos, float scale, float yaw,
+                                  shz_vec3_t stretch, const DCCamera* cam, int target_list) {
+    if (!model || model->mesh_count == 0 || !model->skeleton) return;
+    if (stretch.x == 0.0f) stretch.x = 1.0f;
+    if (stretch.y == 0.0f) stretch.y = 1.0f;
+    if (stretch.z == 0.0f) stretch.z = 1.0f;
+    draw_skinned_list(model, pos, scale, yaw, stretch, cam, target_list);
 }
 
 void dc_model_draw_list_oriented(DMSModel* model, shz_vec3_t pos, float scale,
@@ -1084,12 +1284,15 @@ void dc_model_set_environment(const dttex_info_t* tex) {
     cxt.blend.src = PVR_BLEND_SRCALPHA;
     cxt.blend.dst = PVR_BLEND_ONE;
     cxt.depth.write = PVR_DEPTHWRITE_DISABLE;
+    /* The same triangles as the solid draw, so the same depth: with the
+     * default (greater) the shine passed or failed pixel by pixel */
+    cxt.depth.comparison = PVR_DEPTHCMP_GEQUAL;
     pvr_poly_compile(&g_env_shine_hdr, &cxt);
 
     /* Front faces only from here on */
     pvr_poly_cxt_txr(&cxt, PVR_LIST_TR_POLY, tex->pvrformat, tex->width, tex->height,
                      tex->ptr, PVR_FILTER_BILINEAR);
-    cxt.gen.culling = PVR_CULLING_CCW;
+    cxt.gen.culling = PVR_CULLING_CW;
     cxt.txr.env = PVR_TXRENV_REPLACE;
     cxt.blend.src = PVR_BLEND_ONE;
     cxt.blend.dst = PVR_BLEND_ZERO;
@@ -1097,7 +1300,7 @@ void dc_model_set_environment(const dttex_info_t* tex) {
     pvr_poly_compile(&g_env_accum_hdr, &cxt);
 
     pvr_poly_cxt_col(&cxt, PVR_LIST_TR_POLY);
-    cxt.gen.culling = PVR_CULLING_CCW;
+    cxt.gen.culling = PVR_CULLING_CW;
     cxt.blend.src = PVR_BLEND_SRCALPHA;
     cxt.blend.dst = PVR_BLEND_INVSRCALPHA;
     cxt.blend.src_enable = PVR_BLEND_ENABLE;
@@ -1125,7 +1328,8 @@ static const DMSVertex* env_vertices(const DMSMesh* mesh, const float* right,
         dst[i].z = src[i].z;
         dst[i].u = 0.5f + (nx * right[0] + ny * right[1] + nz * right[2]);
         dst[i].v = 0.5f - (nx * up[0] + ny * up[1] + nz * up[2]);
-        dst[i].argb = (src[i].argb & argb_and) | argb_or;
+        uint32_t argb = (src[i].argb & argb_and) | argb_or;
+        dst[i].argb = g_rim_on ? rim_light(argb, &src[i]) : argb;
         dst[i].flags = src[i].flags;
     }
     return dst;
@@ -1134,7 +1338,9 @@ static const DMSVertex* env_vertices(const DMSMesh* mesh, const float* right,
 static void draw_reflections(DMSModel* model, shz_vec3_t pos, float scale, float yaw,
                              const float* rot, const DCCamera* cam, int target_list) {
     if (!g_env || !model->metallic_count) return;
-    if (g_glow_only) return;   /* a reflection is caught light, not given off */
+    /* A reflection is caught light, not given off: in the glow pass only a
+     * metallic mesh with an Emission colour goes in, with what it reflects */
+    if (g_glow_only && !model->glow_count) return;
     g_lit = 0;   /* the reflection passes carry their own colour */
     if (target_list == PVR_LIST_PT_POLY) return;
     /* Same fallthrough as draw_blocks_list */
@@ -1151,7 +1357,7 @@ static void draw_reflections(DMSModel* model, shz_vec3_t pos, float scale, float
     shz_xmtrx_init_identity();
     shz_xmtrx_apply_rotation_y(-cam->yaw);
     shz_xmtrx_apply_rotation_x(-cam->pitch);
-    shz_vec4_t wr = shz_xmtrx_transform_vec4(shz_vec4_init(1.0f, 0.0f, 0.0f, 0.0f));
+    shz_vec4_t wr = shz_xmtrx_transform_vec4(shz_vec4_init(-1.0f, 0.0f, 0.0f, 0.0f));
     shz_vec4_t wu = shz_xmtrx_transform_vec4(shz_vec4_init(0.0f, 1.0f, 0.0f, 0.0f));
     wr.z = -wr.z;
     wu.z = -wu.z;
@@ -1162,6 +1368,7 @@ static void draw_reflections(DMSModel* model, shz_vec3_t pos, float scale, float
         up[j]    = (cols[j*3] * wu.x + cols[j*3+1] * wu.y + cols[j*3+2] * wu.z) * k;
     }
 
+    cam_to_model(pos, scale, cols, cam);
     const shz_mat4x4_t* pv = dc_camera_get_pv(cam);
     const WorldFrustum* fr = dc_camera_get_frustum(cam);
     alignas(32) shz_mat4x4_t mvp;
@@ -1188,6 +1395,8 @@ static void draw_reflections(DMSModel* model, shz_vec3_t pos, float scale, float
         if (mesh->material_flags & DMS_MAT_COLLISION_ONLY) continue;
         int mirror = (mesh->material_flags & DMS_MAT_MIRROR) != 0;
         if (mirror != want_mirror) continue;
+        if (g_glow_only && !(mesh->material_flags & DMS_MAT_GLOW)) continue;
+        rim_set(mesh);
 
         shz_vec3_t tc = turn_centre(rot, yaw, sc, mesh->bound_cx, mesh->bound_cy, mesh->bound_cz);
         shz_vec3_t mc = shz_vec3_init(pos.x + tc.x * scale, pos.y + tc.y * scale,
@@ -1221,7 +1430,7 @@ static void draw_reflections(DMSModel* model, shz_vec3_t pos, float scale, float
             pvr_poly_cxt_txr(&cxt, PVR_LIST_TR_POLY, tex->pvrformat, tex->width, tex->height,
                              tex->ptr, ((mesh->material_flags >> 9) & 1) ? PVR_FILTER_NONE
                                                                         : PVR_FILTER_BILINEAR);
-            cxt.gen.culling = PVR_CULLING_CCW;
+            cxt.gen.culling = PVR_CULLING_CW;
             cxt.txr.env = PVR_TXRENV_MODULATEALPHA;
             cxt.blend.src = PVR_BLEND_DESTALPHA;
             cxt.blend.dst = PVR_BLEND_SRCALPHA;
@@ -1239,7 +1448,7 @@ static void draw_reflections(DMSModel* model, shz_vec3_t pos, float scale, float
                 dc_list_begin(target_list);
                 dr = dc_dr_state();
             }
-            shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), hdrs[p]);
+            dc_send_hdr(dr, hdrs[p]);
             shz_xmtrx_load_4x4(&mvp);
             g_stats.tris_drawn += mesh->tri_count;
             if (clip) {
@@ -1281,7 +1490,7 @@ static const DMSVertex* cel_vertices(const DMSMesh* mesh, uint32_t argb) {
         dst[i].x = src[i].x;
         dst[i].y = src[i].y;
         dst[i].z = src[i].z;
-        dst[i].u = u0 + catch_light(&src[i]) * k;
+        dst[i].u = u0 + catch_light(&src[i], &g_ml[0]) * k;
         dst[i].v = 0.5f;
         dst[i].argb = argb;
         dst[i].flags = src[i].flags;
@@ -1352,7 +1561,7 @@ static void draw_cel(DMSModel* model, shz_vec3_t pos, float scale, float yaw,
             dc_list_begin(target_list);
             dr = dc_dr_state();
         }
-        shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &g_cel_hdr);
+        dc_send_hdr(dr, &g_cel_hdr);
         shz_xmtrx_load_4x4(&mvp);
         g_stats.tris_drawn += mesh->tri_count;
         if (clip) {
@@ -1377,8 +1586,10 @@ static void update_skeleton(DMSSkeleton* sk, float delta_time) {
 
     /* Advance time, loop */
     sk->currentTime += delta_time;
-    while (sk->currentTime >= anim->duration)
+    while (sk->currentTime >= anim->duration) {
         sk->currentTime -= anim->duration;
+        sk->loops++;
+    }
     while (sk->currentTime < 0.0f)
         sk->currentTime += anim->duration;
 
@@ -1425,15 +1636,9 @@ static void update_bounds_from_skeleton(DMSModel* model) {
     DMSSkeleton* sk = model->skeleton;
     if (!sk || sk->boneCount == 0) return;
 
-    float minx, maxx, miny, maxy, minz, maxz;
-    {
-        shz_mat4x4_t* wp = &sk->bones[0].worldPose;
-        minx = maxx = wp->elem2D[3][0];
-        miny = maxy = wp->elem2D[3][1];
-        minz = maxz = wp->elem2D[3][2];
-    }
-
-    for (int i = 1; i < sk->boneCount; i++) {
+    float minx =  1e18f, maxx = -1e18f, miny =  1e18f, maxy = -1e18f, minz =  1e18f, maxz = -1e18f;
+    for (int i = 0; i < sk->boneCount; i++) {
+        if (!sk->bones[i].skinned) continue;
         shz_mat4x4_t* wp = &sk->bones[i].worldPose;
         float bx = wp->elem2D[3][0];
         float by = wp->elem2D[3][1];
@@ -1445,6 +1650,7 @@ static void update_bounds_from_skeleton(DMSModel* model) {
         if (bz < minz) minz = bz;
         if (bz > maxz) maxz = bz;
     }
+    if (minx > maxx) return;            /* no bone owns a vertex */
 
     float ex = (maxx - minx) * 0.5f;
     float ey = (maxy - miny) * 0.5f;
@@ -1473,6 +1679,26 @@ void dc_model_set_anim(DMSModel* model, int anim_index) {
     if (model->skeleton->currentAnim == anim_index) return;
     model->skeleton->currentAnim = anim_index;
     model->skeleton->currentTime = 0.0f;
+    model->skeleton->loops = 0;
+}
+
+float dc_model_anim_length(const DMSModel* model, int anim_index) {
+    if (!model || !model->skeleton || anim_index < 0 || anim_index >= model->skeleton->animCount) return 0.0f;
+    return model->skeleton->animations[anim_index].duration;
+}
+
+float dc_model_anim_time(const DMSModel* model) {
+    return model && model->skeleton ? model->skeleton->currentTime : 0.0f;
+}
+
+bool dc_model_anim_done(const DMSModel* model) {
+    return model && model->skeleton && model->skeleton->loops > 0;
+}
+
+void dc_model_anim_restart(DMSModel* model) {
+    if (!model || !model->skeleton) return;
+    model->skeleton->currentTime = 0.0f;
+    model->skeleton->loops = 0;
 }
 
 int dc_model_get_anim(DMSModel* model) {
@@ -1480,23 +1706,169 @@ int dc_model_get_anim(DMSModel* model) {
     return model->skeleton->currentAnim;
 }
 
+int dc_model_anim_index(const DMSModel* model, const char* name) {
+    if (!model || !model->skeleton || !name) return -1;
+    for (int i = 0; i < model->skeleton->animCount; i++)
+        if (strcmp(model->skeleton->animations[i].name, name) == 0) return i;
+    return -1;
+}
+
 /* ================================================================
  * Loading
  * ================================================================ */
 
-DMSModel* dc_model_load(const char* filename) {
-    FILE* f = fopen(filename, "rb");
-    if (!f) {
-        printf("DMS: Failed to open %s\n", filename);
+/* A file read whole, then parsed like a stream */
+typedef struct { uint8_t* data; size_t size, pos; } MemFile;
+
+/* The box round a mesh's vertices, and the model's round all of them */
+static void mesh_bounds(DMSMesh* mesh) {
+    float lo[3] = {  1e30f,  1e30f,  1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
+    for (uint32_t v = 0; v < mesh->vertex_count; v++) {
+        const DMSVertex* p = &mesh->vertices[v];
+        float c[3] = { p->x, p->y, p->z };
+        for (int k = 0; k < 3; k++) {
+            if (c[k] < lo[k]) lo[k] = c[k];
+            if (c[k] > hi[k]) hi[k] = c[k];
+        }
+    }
+    for (int k = 0; k < 3; k++) { mesh->bound_min[k] = lo[k]; mesh->bound_max[k] = hi[k]; }
+}
+
+static void model_bounds(DMSModel* model) {
+    float lo[3] = {  1e30f,  1e30f,  1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
+    for (uint32_t m = 0; m < model->mesh_count; m++) {
+        const DMSMesh* mesh = &model->meshes[m];
+        if (mesh->vertex_count == 0) continue;
+        for (int k = 0; k < 3; k++) {
+            if (mesh->bound_min[k] < lo[k]) lo[k] = mesh->bound_min[k];
+            if (mesh->bound_max[k] > hi[k]) hi[k] = mesh->bound_max[k];
+        }
+    }
+    model->bound_min = shz_vec3_init(lo[0], lo[1], lo[2]);
+    model->bound_max = shz_vec3_init(hi[0], hi[1], hi[2]);
+}
+
+DCBounds dc_model_bounds(const DMSModel* model, const char* material) {
+    DCBounds b = { shz_vec3_init(1e30f, 1e30f, 1e30f), shz_vec3_init(-1e30f, -1e30f, -1e30f) };
+    if (!model) return b;
+    if (!material) { b.min = model->bound_min; b.max = model->bound_max; return b; }
+    float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
+    for (uint32_t m = 0; m < model->mesh_count; m++) {
+        const DMSMesh* mesh = &model->meshes[m];
+        if (!model->material_names || strcasecmp(model->material_names[m], material) || mesh->vertex_count == 0) continue;
+        for (int k = 0; k < 3; k++) {
+            if (mesh->bound_min[k] < lo[k]) lo[k] = mesh->bound_min[k];
+            if (mesh->bound_max[k] > hi[k]) hi[k] = mesh->bound_max[k];
+        }
+    }
+    b.min = shz_vec3_init(lo[0], lo[1], lo[2]);
+    b.max = shz_vec3_init(hi[0], hi[1], hi[2]);
+    return b;
+}
+
+/* The clip buffer is shared and grows to the largest mesh ever loaded */
+static void clip_buffer_reserve(uint32_t max_verts) {
+    if (max_verts <= g_clip_buffer_size) return;
+    ClipVertex* grown = memalign(32, max_verts * sizeof(ClipVertex));
+    if (!grown) return;
+    free(g_clip_buffer);
+    g_clip_buffer = grown;
+    g_clip_buffer_size = max_verts;
+}
+
+DMSModel* dc_model_cube(void) {
+    DMSModel* model = calloc(1, sizeof(DMSModel));
+    if (!model) return NULL;
+    model->mesh_count = model->opaque_count = 1;
+    model->meshes = memalign(32, sizeof(DMSMesh));
+    model->blocks = malloc(sizeof(DMSBlock));
+    model->runs = malloc(sizeof(DMSBlockRun));
+    model->material_names = malloc(sizeof(*model->material_names));
+    DMSVertex* v = memalign(32, 24 * sizeof(DMSVertex));
+    if (!model->meshes || !model->blocks || !model->runs || !model->material_names || !v) {
+        free(model->meshes); free(model->blocks); free(model->runs); free(model->material_names); free(v); free(model);
         return NULL;
     }
+    memset(model->meshes, 0, sizeof(DMSMesh));
+    memset(v, 0, 24 * sizeof(DMSVertex));
+
+    /* Six faces, each a strip of four. n is the face normal, a and b the two
+     * directions across it */
+    static const float faces[6][3][3] = {
+        { { 0,  0,  1 }, { 1, 0, 0 }, { 0, 1, 0 } },
+        { { 0,  0, -1 }, { -1, 0, 0 }, { 0, 1, 0 } },
+        { { 1,  0,  0 }, { 0, 0, -1 }, { 0, 1, 0 } },
+        { { -1, 0,  0 }, { 0, 0, 1 }, { 0, 1, 0 } },
+        { { 0,  1,  0 }, { 1, 0, 0 }, { 0, 0, -1 } },
+        { { 0, -1,  0 }, { 1, 0, 0 }, { 0, 0, 1 } },
+    };
+    static const float corner[4][2] = { { -1, -1 }, { 1, -1 }, { -1, 1 }, { 1, 1 } };
+    for (int f = 0; f < 6; f++) {
+        const float *n = faces[f][0], *a = faces[f][1], *b = faces[f][2];
+        for (int c = 0; c < 4; c++) {
+            DMSVertex* p = &v[f * 4 + c];
+            float cu = corner[c][0], cv = corner[c][1];
+            p->x = 0.5f * (n[0] + a[0] * cu + b[0] * cv);
+            p->y = 0.5f * (n[1] + a[1] * cu + b[1] * cv);
+            p->z = 0.5f * (n[2] + a[2] * cu + b[2] * cv);
+            p->u = cu > 0.0f ? 1.0f : 0.0f;
+            p->v = cv > 0.0f ? 1.0f : 0.0f;
+            p->argb = 0xFFFFFFFFu;
+            p->nx = (int8_t)(n[0] * 127.0f); p->ny = (int8_t)(n[1] * 127.0f); p->nz = (int8_t)(n[2] * 127.0f);
+            p->flags = c == 3 ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
+        }
+    }
+
+    DMSMesh* mesh = &model->meshes[0];
+    mesh->vertex_count = 24;
+    mesh->texture_id = -1;
+    mesh->bound_radius = 0.8661f;
+    mesh->material_flags = DMS_MAT_DOUBLE_SIDED;   /* one winding for all six is not worth getting right */
+    mesh->tri_count = 12;
+    mesh->vertices = v;
+    mesh_bounds(mesh);
+    model_bounds(model);
+    strcpy(model->material_names[0], "cube");
+
+    model->block_count = 1;
+    model->blocks[0] = (DMSBlock){ 0.0f, 0.0f, 0.0f, 0.8661f };
+    model->runs[0] = (DMSBlockRun){ 0, 0, 1 };
+    model->list_runs[0] = 0; model->list_runs[1] = model->list_runs[2] = model->list_runs[3] = 1;
+    model->max_bind_radius = mesh->bound_radius;
+    clip_buffer_reserve(24);
+    dc_model_compile_header(mesh, &mesh->header, 0, 0, 0, NULL);
+    return model;
+}
+
+static size_t mf_read(void* dst, size_t sz, size_t n, MemFile* f) {
+    size_t want = sz * n, left = f->size - f->pos;
+    if (want > left) { n = sz ? left / sz : 0; want = sz * n; }
+    memcpy(dst, f->data + f->pos, want);
+    f->pos += want;
+    return n;
+}
+static int mf_seek(MemFile* f, long off, int whence) {
+    (void)whence;   /* only SEEK_SET is used */
+    if (off < 0 || (size_t)off > f->size) return -1;
+    f->pos = (size_t)off;
+    return 0;
+}
+static long mf_tell(MemFile* f) { return (long)f->pos; }
+static void mf_close(MemFile* f) { free(f->data); f->data = NULL; }
+
+DMSModel* dc_model_load(const char* filename) {
+    MemFile mf;
+    mf.data = dc_file_read(filename, &mf.size);
+    if (!mf.data) return NULL;
+    mf.pos = 0;
+    MemFile* f = &mf;
 
     uint32_t magic, mesh_count, bone_count;
-    fread(&magic, 4, 1, f);
-    fread(&mesh_count, 4, 1, f);
-    fread(&bone_count, 4, 1, f);
+    mf_read(&magic, 4, 1, f);
+    mf_read(&mesh_count, 4, 1, f);
+    mf_read(&bone_count, 4, 1, f);
 
-    if (magic != DMS_MAGIC) { printf("DMS: %s is not a .dms file\n", filename); fclose(f); return NULL; }
+    if (magic != DMS_MAGIC) { printf("DMS: %s is not a .dms file\n", filename); mf_close(f); return NULL; }
 
     int is_animated = (bone_count > 0);
 
@@ -1504,9 +1876,9 @@ DMSModel* dc_model_load(const char* filename) {
     memset(model, 0, sizeof(DMSModel));
     model->mesh_count = mesh_count;
 
-    fread(&model->opaque_count, 4, 1, f);
-    fread(&model->cutout_count, 4, 1, f);
-    fread(&model->transparent_count, 4, 1, f);
+    mf_read(&model->opaque_count, 4, 1, f);
+    mf_read(&model->cutout_count, 4, 1, f);
+    mf_read(&model->transparent_count, 4, 1, f);
     printf("DMS: %lu opaque, %lu cutout, %lu transparent\n",
            (unsigned long)model->opaque_count,
            (unsigned long)model->cutout_count,
@@ -1529,10 +1901,10 @@ DMSModel* dc_model_load(const char* filename) {
 
         for (uint32_t i = 0; i < bone_count; i++) {
             DMSBone* bone = &sk->bones[i];
-            fread(bone->name, sizeof(char), 64, f);
-            fread(&bone->parent, sizeof(int), 1, f);
-            fread(&bone->bindPose, sizeof(DMSTransform), 1, f);
-            fread(&bone->inverseBindMatrix, sizeof(shz_mat4x4_t), 1, f);
+            mf_read(bone->name, sizeof(char), 64, f);
+            mf_read(&bone->parent, sizeof(int), 1, f);
+            mf_read(&bone->bindPose, sizeof(DMSTransform), 1, f);
+            mf_read(&bone->inverseBindMatrix, sizeof(shz_mat4x4_t), 1, f);
             bone->localPose = bone->bindPose;
 
             printf("  Bone %lu: %s (parent=%d)\n",
@@ -1560,7 +1932,7 @@ DMSModel* dc_model_load(const char* filename) {
 
         /* Load animations */
         uint32_t anim_count;
-        fread(&anim_count, 4, 1, f);
+        mf_read(&anim_count, 4, 1, f);
         printf("DMS: %lu animations\n", (unsigned long)anim_count);
 
         if (anim_count > 0) {
@@ -1569,14 +1941,14 @@ DMSModel* dc_model_load(const char* filename) {
 
             for (uint32_t i = 0; i < anim_count; i++) {
                 DMSAnimation* anim = &sk->animations[i];
-                fread(anim->name, sizeof(char), 32, f);
-                fread(&anim->boneCount, sizeof(int), 1, f);
-                fread(&anim->frameCount, sizeof(int), 1, f);
-                fread(&anim->duration, sizeof(float), 1, f);
+                mf_read(anim->name, sizeof(char), 32, f);
+                mf_read(&anim->boneCount, sizeof(int), 1, f);
+                mf_read(&anim->frameCount, sizeof(int), 1, f);
+                mf_read(&anim->duration, sizeof(float), 1, f);
 
                 size_t total_poses = anim->frameCount * anim->boneCount;
                 anim->framePoses = calloc(total_poses, sizeof(DMSTransform));
-                fread(anim->framePoses, sizeof(DMSTransform), total_poses, f);
+                mf_read(anim->framePoses, sizeof(DMSTransform), total_poses, f);
 
                 printf("  Anim %lu: '%s' %d bones, %d frames, %.2fs\n",
                        (unsigned long)i, anim->name,
@@ -1590,17 +1962,17 @@ DMSModel* dc_model_load(const char* filename) {
 
     } else {
         uint32_t anim_count;
-        fread(&anim_count, 4, 1, f);
+        mf_read(&anim_count, 4, 1, f);
     }
 
     /* ---- Block table (static models only) ---- */
-    fread(&model->block_count, 4, 1, f);
+    mf_read(&model->block_count, 4, 1, f);
     model->blocks = malloc(model->block_count * sizeof(DMSBlock));
-    fread(model->blocks, sizeof(DMSBlock), model->block_count, f);
+    mf_read(model->blocks, sizeof(DMSBlock), model->block_count, f);
     if (!is_animated) printf("DMS: %lu blocks\n", (unsigned long)model->block_count);
     if (!is_animated && model->block_count == 0) {
         printf("DMS: %s has no blocks\n", filename);
-        free(model->blocks); free(model->meshes); free(model); fclose(f);
+        free(model->blocks); free(model->meshes); free(model); mf_close(f);
         return NULL;
     }
 
@@ -1610,20 +1982,20 @@ DMSModel* dc_model_load(const char* filename) {
     for (uint32_t m = 0; m < mesh_count; m++) {
         DMSMesh* mesh = &model->meshes[m];
 
-        fread(&mesh->vertex_count, 4, 1, f);
-        fread(&mesh->texture_id, 4, 1, f);
-        fread(&mesh->material_color, 4, 1, f);
-        fread(&mesh->bound_cx, 4, 1, f);
-        fread(&mesh->bound_cy, 4, 1, f);
-        fread(&mesh->bound_cz, 4, 1, f);
-        fread(&mesh->bound_radius, 4, 1, f);
+        mf_read(&mesh->vertex_count, 4, 1, f);
+        mf_read(&mesh->texture_id, 4, 1, f);
+        mf_read(&mesh->rim_color, 4, 1, f);
+        mf_read(&mesh->bound_cx, 4, 1, f);
+        mf_read(&mesh->bound_cy, 4, 1, f);
+        mf_read(&mesh->bound_cz, 4, 1, f);
+        mf_read(&mesh->bound_radius, 4, 1, f);
 
-        fread(&mesh->material_flags, 4, 1, f);
-        fread(&mesh->alpha_cutoff, sizeof(float), 1, f);
-        fread(&mesh->block, 4, 1, f);
+        mf_read(&mesh->material_flags, 4, 1, f);
+        mf_read(&mesh->alpha_cutoff, sizeof(float), 1, f);
+        mf_read(&mesh->block, 4, 1, f);
 
         mesh->vertices = memalign(32, mesh->vertex_count * sizeof(DMSVertex));
-        fread(mesh->vertices, sizeof(DMSVertex), mesh->vertex_count, f);
+        mf_read(mesh->vertices, sizeof(DMSVertex), mesh->vertex_count, f);
         mesh->animated_vertices = NULL;
 
         /* Count triangles: each strip of n verts contributes n-2 */
@@ -1638,7 +2010,10 @@ DMSModel* dc_model_load(const char* filename) {
 
         if (mesh->vertex_count > max_verts)
             max_verts = mesh->vertex_count;
+
+        mesh_bounds(mesh);
     }
+    model_bounds(model);
 
     /* ---- Block runs: meshes are sorted by list, then block ---- */
     if (!is_animated) {
@@ -1660,6 +2035,17 @@ DMSModel* dc_model_load(const char* filename) {
         while (list < 3) model->list_runs[++list] = n;
     }
 
+    /* ---- Which bones own vertices (the bound sphere is built on those) ---- */
+    if (is_animated) {
+        for (uint32_t m = 0; m < mesh_count; m++) {
+            const DMSMesh* mesh = &model->meshes[m];
+            for (uint32_t v = 0; v < mesh->vertex_count; v++) {
+                uint8_t id = mesh->vertices[v].pad;
+                if (id < bone_count) model->skeleton->bones[id].skinned = true;
+            }
+        }
+    }
+
     /* ---- Cache max bind radius for animated bounds ---- */
     model->max_bind_radius = 0.0f;
     for (uint32_t m = 0; m < mesh_count; m++) {
@@ -1670,26 +2056,19 @@ DMSModel* dc_model_load(const char* filename) {
     /* Clip buffer (shared, grows to the largest mesh ever loaded). Animated
      * models have no clip path, but the volume paths transform through this
      * too, so they need one: without it they wrote every vertex to address 0. */
-    if (max_verts > g_clip_buffer_size) {
-        ClipVertex* grown = memalign(32, max_verts * sizeof(ClipVertex));
-        if (grown) {
-            free(g_clip_buffer);
-            g_clip_buffer = grown;
-            g_clip_buffer_size = max_verts;
-        }
-    }
+    clip_buffer_reserve(max_verts);
 
     /* ---- Embedded textures & PVR headers ---- */
     uint32_t tex_count;
-    fread(&tex_count, 4, 1, f);
+    mf_read(&tex_count, 4, 1, f);
     printf("DMS: %lu embedded textures\n", (unsigned long)tex_count);
 
     model->texture_count = tex_count;
-    long tex_end = ftell(f) + (long)tex_count * 8;   /* end of the texture data */
+    long tex_end = mf_tell(f) + (long)tex_count * 8;   /* end of the texture data */
     if (tex_count > 0) {
         struct { uint32_t offset; uint32_t size; } *tex_table;
         tex_table = malloc(tex_count * 8);
-        fread(tex_table, 8, tex_count, f);
+        mf_read(tex_table, 8, tex_count, f);
 
         model->textures = calloc(tex_count, sizeof(dttex_info_t));
 
@@ -1697,8 +2076,8 @@ DMSModel* dc_model_load(const char* filename) {
             if (tex_table[i].size == 0) continue;
 
             void *buf = malloc(tex_table[i].size);
-            fseek(f, tex_table[i].offset, SEEK_SET);
-            fread(buf, 1, tex_table[i].size, f);
+            mf_seek(f, tex_table[i].offset, SEEK_SET);
+            mf_read(buf, 1, tex_table[i].size, f);
 
             pvrtex_load_from_buffer(buf, tex_table[i].size, &model->textures[i]);
             if ((long)(tex_table[i].offset + tex_table[i].size) > tex_end)
@@ -1716,22 +2095,22 @@ DMSModel* dc_model_load(const char* filename) {
 
     /* Material names follow the last texture */
     char tag[4];
-    if (fseek(f, tex_end, SEEK_SET) == 0 &&
-        fread(tag, 1, 4, f) == 4 && !memcmp(tag, "MATN", 4)) {
+    if (mf_seek(f, tex_end, SEEK_SET) == 0 &&
+        mf_read(tag, 1, 4, f) == 4 && !memcmp(tag, "MATN", 4)) {
         model->material_names = malloc(mesh_count * 32);
         if (model->material_names &&
-            fread(model->material_names, 32, mesh_count, f) != mesh_count) {
+            mf_read(model->material_names, 32, mesh_count, f) != mesh_count) {
             free(model->material_names);
             model->material_names = NULL;
         }
 
         /* Then the Empties */
         uint32_t count;
-        if (fread(tag, 1, 4, f) == 4 && !memcmp(tag, "ENTS", 4) &&
-            fread(&count, 4, 1, f) == 1 && count) {
+        if (mf_read(tag, 1, 4, f) == 4 && !memcmp(tag, "ENTS", 4) &&
+            mf_read(&count, 4, 1, f) == 1 && count) {
             model->entities = malloc(count * sizeof(DMSEntity));
             if (model->entities &&
-                fread(model->entities, sizeof(DMSEntity), count, f) == count) {
+                mf_read(model->entities, sizeof(DMSEntity), count, f) == count) {
                 model->entity_count = count;
             } else {
                 free(model->entities);
@@ -1763,7 +2142,7 @@ DMSModel* dc_model_load(const char* filename) {
             model->glow_count++;
     }
 
-    fclose(f);
+    mf_close(f);
     return model;
 }
 
@@ -1874,6 +2253,47 @@ int dc_model_see_through(DMSModel* model, const char* material, uint8_t alpha) {
 
     if (!changed)
         printf("DMS: see-through: no mesh wears the material '%s'\n", material);
+    return changed;
+}
+
+int dc_model_retexture(DMSModel* model, const char* material, const dttex_info_t* tex) {
+    if (!model) return 0;
+    if (material && !model->material_names) {
+        printf("DMS: texture: the model has no material names\n");
+        return 0;
+    }
+    int changed = 0;
+    for (uint32_t i = 0; i < model->mesh_count; i++) {
+        if (material && strcasecmp(model->material_names[i], material) != 0) continue;
+        DMSMesh* mesh = &model->meshes[i];
+        const dttex_info_t* t = tex;
+        if (!t && mesh->texture_id >= 0 && mesh->texture_id < model->texture_count &&
+            model->textures[mesh->texture_id].ptr)
+            t = &model->textures[mesh->texture_id];
+        if (t) dc_model_compile_header(mesh, &mesh->header, t->pvrformat, t->width, t->height, t->ptr);
+        else   dc_model_compile_header(mesh, &mesh->header, 0, 0, 0, NULL);
+        changed++;
+    }
+    if (!changed && material)
+        printf("DMS: texture: no mesh wears the material '%s'\n", material);
+    return changed;
+}
+
+int dc_model_scroll(DMSModel* model, const char* material, float u, float v) {
+    if (!model || !material) return 0;
+    if (!model->material_names) {
+        printf("DMS: scroll: the model has no material names\n");
+        return 0;
+    }
+    int changed = 0;
+    for (uint32_t i = 0; i < model->mesh_count; i++) {
+        if (strcasecmp(model->material_names[i], material) != 0) continue;
+        model->meshes[i].scroll_u = u;
+        model->meshes[i].scroll_v = v;
+        changed++;
+    }
+    if (!changed)
+        printf("DMS: scroll: no mesh wears the material '%s'\n", material);
     return changed;
 }
 
@@ -2104,12 +2524,12 @@ void dc_model_draw_shadow(DMSModel* model, shz_vec3_t pos, float scale, float ya
     }
 
     /* 1. clean the buffer under the shadow */
-    shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &g_shadow_clean_hdr);
+    dc_send_hdr(dr, &g_shadow_clean_hdr);
     shz_xmtrx_load_4x4(&clean_mvp);
     render_clipped(quad, 4, dr, 0);
 
     /* 2. the model, squashed, in grey */
-    shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &g_shadow_grey_hdr);
+    dc_send_hdr(dr, &g_shadow_grey_hdr);
     shz_xmtrx_load_4x4((shz_mat4x4_t*)dc_camera_get_pv(cam));
     shz_xmtrx_apply_4x4(&squash);
     shz_xmtrx_translate(pos.x - cam->pos.x, pos.y - cam->pos.y, -(pos.z - cam->pos.z));
@@ -2145,7 +2565,7 @@ void dc_model_draw_shadow(DMSModel* model, shz_vec3_t pos, float scale, float ya
     }
 
     /* 3. the buffer onto the screen */
-    shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &g_shadow_flush_hdr);
+    dc_send_hdr(dr, &g_shadow_flush_hdr);
     shz_xmtrx_load_4x4(&flush_mvp);
     render_clipped(quad, 4, dr, 0);
 }
@@ -2578,7 +2998,13 @@ void dc_model_compile_header(const DMSMesh* mesh, pvr_poly_hdr_t* out, int pvrfo
     else
         pvr_poly_cxt_col(&cxt, pvr_list);
 
-    cxt.gen.culling = PVR_CULLING_NONE;
+    /* glTF single-sided: the PVR drops the back faces. Same direction as the
+     * "front faces only" reflection headers */
+    cxt.gen.culling = (mesh->material_flags & DMS_MAT_DOUBLE_SIDED)
+                      ? PVR_CULLING_NONE : PVR_CULLING_CW;
+
+    /* Table fog on every model; dc_set_fog decides whether there is any */
+    cxt.gen.fog_type = PVR_FOG_TABLE;
 
     if (alpha_mode == 2) {
         cxt.txr.env = PVR_TXRENV_MODULATEALPHA;
@@ -2640,4 +3066,28 @@ void dc_model_reset_stats(void) {
 
 const DCModelStats* dc_model_get_stats(void) {
     return &g_stats;
+}
+
+int dc_model_flipbook(DMSModel* model, const char* material, int across, int down,
+                      int count, float fps) {
+    if (!model || !material || across < 1 || down < 1) return 0;
+    if (!model->material_names) {
+        printf("DMS: flipbook: the model has no material names\n");
+        return 0;
+    }
+    if (count < 1 || count > across * down) count = across * down;
+    int changed = 0;
+    for (uint32_t i = 0; i < model->mesh_count; i++) {
+        if (strcasecmp(model->material_names[i], material) != 0) continue;
+        DMSMesh* m = &model->meshes[i];
+        m->flip_w = 1.0f / across;
+        m->flip_h = 1.0f / down;
+        m->flip_across = across;
+        m->flip_count = count;
+        m->flip_fps = fps;
+        changed++;
+    }
+    if (!changed)
+        printf("DMS: flipbook: no mesh wears the material '%s'\n", material);
+    return changed;
 }

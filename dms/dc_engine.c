@@ -9,6 +9,9 @@
 #include <string.h>
 #include <math.h>
 
+/* dc_audio.c is only linked by games that want sound */
+extern void dc_audio_update(void) __attribute__((weak));
+
 /* ================================================================
  * Internal state
  * ================================================================ */
@@ -29,6 +32,7 @@ static struct {
     bool scene_active;
     bool list_opened;        /* a list was opened in the scene being built */
     float render_w, render_h;   /* size of what is being drawn into */
+    int  clip[4];            /* the tiles the open list is clipped to (dc_list_clip); -1: none sent */
 
     /* Frame statistics, summed over PROF_INTERVAL frames then averaged */
     uint64_t frame_start_ns;
@@ -74,6 +78,8 @@ void dc_init(DCInitParams params) {
         params.vram_size, 0, 0, 0, 6
     });
 
+    dc_set_fog_off();
+
     /* Timing */
     g_engine.last_frame_ms = timer_ms_gettime64();
     g_engine.delta_time = 1.0f / 60.0f;  /* assume 60fps initially */
@@ -92,6 +98,15 @@ void dc_shutdown(void) {
  * Frame management
  * ================================================================ */
 
+static void blends_step(float dt);
+static void list_close(void);
+
+uint32_t dc_clip_cmd;
+
+void dc_clip_scene(bool on) {
+    dc_clip_cmd = on ? (uint32_t)PVR_USERCLIP_INSIDE << 16 : 0;
+}
+
 void dc_frame_begin(void) {
     g_engine.frame_start_ns = perf_cntr_timer_ns();
     dc_model_reset_stats();
@@ -109,6 +124,8 @@ void dc_frame_begin(void) {
 
     g_engine.frame_count++;
 
+    blends_step(g_engine.delta_time);
+
     /* ---- Input ---- */
     dc_input_poll();
 
@@ -116,6 +133,7 @@ void dc_frame_begin(void) {
     pvr_scene_begin();
     dc_model_frame_begin();   /* buffer is wound back, so the guard resets here */
     g_engine.current_list = -1;
+    dc_clip_cmd = 0;
     g_engine.scene_active = true;
     g_engine.list_opened = false;
     g_engine.render_w = SCR_W;
@@ -191,20 +209,19 @@ const DCFrameStats* dc_frame_stats(void) {
 }
 
 void dc_frame_end(void) {
-    /* Everything queued with dc_draw*, then the text on top */
+    /* Everything queued with dc_draw*, the 2D layer inside it */
     dc_prof_begin(DC_PROF_DRAW);
     dc_draw_flush();
-    dc_draw2d_flush();
     dc_prof_end(DC_PROF_DRAW);
 
     /* Close any open list */
-    if (g_engine.current_list >= 0) {
-        pvr_list_finish();
-        g_engine.current_list = -1;
-    }
+    if (g_engine.current_list >= 0) list_close();
 
     pvr_scene_finish();
     g_engine.scene_active = false;
+
+    /* Keep music streaming when the game linked dc_audio */
+    if (dc_audio_update) dc_audio_update();
 
     stats_frame_done();
 }
@@ -241,16 +258,145 @@ uint32_t dc_frame_count(void) {
  * Display
  * ================================================================ */
 
-void dc_set_clear_color(uint32_t argb) {
+/* What the fog and the clear colour are now, and what they are on their way
+ * to. Stepped each frame from dc_frame_begin(). */
+static uint32_t g_clear_now = 0xFF000000u, g_clear_from, g_clear_to;
+static float    g_clear_t, g_clear_secs;
+static bool     g_clear_blending;
+static bool     g_fog_on, g_fog_blending;
+static uint32_t g_fog_now, g_fog_from, g_fog_to;
+static float    g_fog_near, g_fog_far, g_fog_near_from, g_fog_far_from, g_fog_near_to, g_fog_far_to;
+static float    g_fog_t, g_fog_secs;
+
+static uint32_t rgb_lerp(uint32_t a, uint32_t b, float t) {
+    uint32_t c = 0;
+    for (int sh = 0; sh <= 24; sh += 8) {
+        float x = (float)((a >> sh) & 0xFF), y = (float)((b >> sh) & 0xFF);
+        c |= (uint32_t)(x + (y - x) * t + 0.5f) << sh;
+    }
+    return c;
+}
+
+static void clear_apply(uint32_t argb) {
     float r = ((argb >> 16) & 0xFF) / 255.0f;
     float g = ((argb >>  8) & 0xFF) / 255.0f;
     float b = ( argb        & 0xFF) / 255.0f;
     pvr_set_bg_color(r, g, b);
+    g_clear_now = argb;
+}
+
+void dc_set_clear_color(uint32_t argb) {
+    g_clear_blending = false;
+    clear_apply(argb);
+}
+
+void dc_set_clear_color_over(uint32_t argb, float seconds) {
+    if (seconds <= 0.0f) { dc_set_clear_color(argb); return; }
+    g_clear_from = g_clear_now;
+    g_clear_to = argb;
+    g_clear_t = 0.0f;
+    g_clear_secs = seconds;
+    g_clear_blending = true;
+}
+
+static void fog_apply(uint32_t rgb, float near, float far) {
+    float r = ((rgb >> 16) & 0xFF) / 255.0f;
+    float g = ((rgb >>  8) & 0xFF) / 255.0f;
+    float b = ( rgb        & 0xFF) / 255.0f;
+    if (far <= near) far = near + 1.0f;
+    pvr_fog_table_color(1.0f, r, g, b);
+    pvr_fog_table_linear(near, far);
+    g_fog_on = true;
+    g_fog_now = rgb & 0xFFFFFFu; g_fog_near = near; g_fog_far = far;
+}
+
+void dc_set_fog_over(uint32_t rgb, float near, float far, float seconds) {
+    if (seconds <= 0.0f || !g_fog_on) { dc_set_fog(rgb, near, far); return; }
+    g_fog_from = g_fog_now; g_fog_near_from = g_fog_near; g_fog_far_from = g_fog_far;
+    g_fog_to = rgb & 0xFFFFFFu; g_fog_near_to = near; g_fog_far_to = far;
+    g_fog_t = 0.0f;
+    g_fog_secs = seconds;
+    g_fog_blending = true;
+}
+
+static void blends_step(float dt) {
+    if (g_clear_blending) {
+        g_clear_t += dt / g_clear_secs;
+        float t = g_clear_t >= 1.0f ? 1.0f : g_clear_t;
+        clear_apply(rgb_lerp(g_clear_from, g_clear_to, t));
+        if (t >= 1.0f) g_clear_blending = false;
+    }
+    if (g_fog_blending) {
+        g_fog_t += dt / g_fog_secs;
+        float t = g_fog_t >= 1.0f ? 1.0f : g_fog_t;
+        fog_apply(rgb_lerp(g_fog_from, g_fog_to, t),
+                  g_fog_near_from + (g_fog_near_to - g_fog_near_from) * t,
+                  g_fog_far_from + (g_fog_far_to - g_fog_far_from) * t);
+        if (t >= 1.0f) g_fog_blending = false;
+    }
+    dc_draw_step_blends(dt);
+}
+
+/* Model headers always ask for table fog; a zero table is "off". Vertex fog
+ * and the 2D layer stay untouched. */
+void dc_set_fog(uint32_t rgb, float near, float far) {
+    g_fog_blending = false;
+    fog_apply(rgb, near, far);
+}
+
+void dc_set_fog_off(void) {
+    g_fog_blending = false;
+    g_fog_on = false;
+    float table[129];
+    for (int i = 0; i < 129; i++) table[i] = 0.0f;
+    pvr_fog_far_depth(1.0f);
+    pvr_fog_table_custom(table);
 }
 
 /* ================================================================
  * PVR list helpers
  * ================================================================ */
+
+/* Modifier volume lists take no polygon headers, so no clip and no dummy */
+static bool list_is_volumes(int pvr_list) {
+    return pvr_list == PVR_LIST_OP_MOD || pvr_list == PVR_LIST_TR_MOD;
+}
+
+/* Holly bug 18 (Dreamcast/Dev.Box System Architecture, CORE & TA bugs): a
+ * change of user tile clip, the area from the clip object or the mode from a
+ * polygon header, lands one polygon early, on the polygon before it. The
+ * chip revision that is in every console has it, and on it the TA locked up
+ * when the first polygon of a frame was clipped. The workaround is the one
+ * Katana and Bloom use: a dummy polygon before every switch, so the early
+ * switch hits that. It carries the mode of the polygons before it, is never
+ * drawn (depth test never passes) and costs 128 bytes. Closing a list resets
+ * the clip too, so one goes before every close. */
+static void clip_dummy(int mode) {
+    pvr_poly_cxt_t cxt;
+    pvr_poly_cxt_col(&cxt, g_engine.current_list);
+    cxt.gen.culling = PVR_CULLING_SMALL;
+    cxt.gen.clip_mode = mode;
+    cxt.depth.comparison = PVR_DEPTHCMP_NEVER;
+    cxt.depth.write = PVR_DEPTHWRITE_DISABLE;
+    pvr_poly_hdr_t* hdr = (pvr_poly_hdr_t*)pvr_dr_target(g_engine.dr_state);
+    pvr_poly_compile(hdr, &cxt);
+    pvr_dr_commit(hdr);
+    for (int i = 0; i < 3; i++) {
+        pvr_vertex_t* v = (pvr_vertex_t*)pvr_dr_target(g_engine.dr_state);
+        v->flags = (i == 2) ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
+        v->x = 0.0f; v->y = 0.0f; v->z = 1.0f;
+        v->u = 0.0f; v->v = 0.0f;
+        v->argb = 0; v->oargb = 0;
+        pvr_dr_commit(v);
+    }
+}
+
+/* Close the open list: the dummy first, as the close resets the clip */
+static void list_close(void) {
+    if (dc_clip_cmd && !list_is_volumes(g_engine.current_list)) clip_dummy(PVR_USERCLIP_INSIDE);
+    pvr_list_finish();
+    g_engine.current_list = -1;
+}
 
 pvr_dr_state_t* dc_list_begin(int pvr_list) {
     /* If same list is already open, just return DR state */
@@ -259,14 +405,42 @@ pvr_dr_state_t* dc_list_begin(int pvr_list) {
 
     /* Close previous list if one is open */
     if (g_engine.current_list >= 0)
-        pvr_list_finish();
+        list_close();
 
     /* Open new list */
     pvr_list_begin(pvr_list);
     g_engine.list_opened = true;
     g_engine.current_list = pvr_list;
+    g_engine.clip[0] = -1;
+    if (!dc_clip_cmd || list_is_volumes(pvr_list)) return &g_engine.dr_state;
+
+    /* A fresh list clips nothing; the first clipped header is a switch */
+    clip_dummy(PVR_USERCLIP_DISABLE);
+    dc_list_clip(0.0f, 0.0f, g_engine.render_w, g_engine.render_h);
 
     return &g_engine.dr_state;
+}
+
+/* The TA's user tile clip: one 32 byte object, the tile range inclusive.
+ * It holds for the polygons after it in the list. */
+void dc_list_clip(float x, float y, float w, float h) {
+    if (!dc_clip_cmd || g_engine.current_list < 0 || list_is_volumes(g_engine.current_list)) return;
+    int tw = (int)(g_engine.render_w / 32.0f), th = (int)(g_engine.render_h / 32.0f);
+    int c[4] = { (int)(x / 32.0f), (int)(y / 32.0f),
+                 (int)((x + w - 1.0f) / 32.0f), (int)((y + h - 1.0f) / 32.0f) };
+    if (c[0] < 0) c[0] = 0;
+    if (c[1] < 0) c[1] = 0;
+    if (c[2] > tw - 1) c[2] = tw - 1;
+    if (c[3] > th - 1) c[3] = th - 1;
+    if (c[0] == g_engine.clip[0] && c[1] == g_engine.clip[1] && c[2] == g_engine.clip[2] && c[3] == g_engine.clip[3]) return;
+    const bool first = g_engine.clip[0] < 0;   /* the list-open dummy just went */
+    memcpy(g_engine.clip, c, sizeof(c));
+    if (!first) clip_dummy(PVR_USERCLIP_INSIDE);
+    uint32_t* o = (uint32_t*)pvr_dr_target(g_engine.dr_state);
+    o[0] = PVR_CMD_USERCLIP;
+    o[1] = o[2] = o[3] = 0;
+    o[4] = (uint32_t)c[0]; o[5] = (uint32_t)c[1]; o[6] = (uint32_t)c[2]; o[7] = (uint32_t)c[3];
+    pvr_dr_commit(o);
 }
 
 bool dc_scene_begin_texture(pvr_ptr_t txr, int w, int h) {
@@ -309,10 +483,7 @@ void dc_render_size(float* w, float* h) {
 }
 
 void dc_list_finish(void) {
-    if (g_engine.current_list >= 0) {
-        pvr_list_finish();
-        g_engine.current_list = -1;
-    }
+    if (g_engine.current_list >= 0) list_close();
 }
 
 pvr_dr_state_t* dc_dr_state(void) {

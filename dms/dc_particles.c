@@ -303,7 +303,7 @@ static void particles_draw_cb(void* user) {
     if (!cam || !s->live) return;
 
     pvr_dr_state_t* dr = dc_dr_state();
-    shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &s->hdr);
+    dc_send_hdr(dr, &s->hdr);
 
     /* World coordinates, camera at the origin: the same matrix the flat
      * shadows use */
@@ -312,7 +312,7 @@ static void particles_draw_cb(void* user) {
 
     /* The square faces the camera: across the screen, and up it */
     shz_sincos_t y = shz_sincosf(cam->yaw), pi = shz_sincosf(cam->pitch);
-    const float rx = y.cos,             ry = 0.0f,   rz = -y.sin;
+    const float rx = -y.cos,            ry = 0.0f,   rz = y.sin;
     const float ux = y.sin * pi.sin,    uy = pi.cos, uz = y.cos * pi.sin;
 
     static const float corner[4][2] = { {-1, -1}, {1, -1}, {-1, 1}, {1, 1} };

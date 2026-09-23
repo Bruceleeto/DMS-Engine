@@ -17,12 +17,16 @@ typedef struct {
     DCTarget*       target;     /* NULL for the screen */
     DMSModel*       model;
     const DCCamera* cam;
+    const DCImage*  env;        /* what its metallic meshes reflect, or NULL */
     shz_vec3_t      pos;
     float           scale;
     float           yaw;
     bool            has_rot;
     float           rot[9];
+    bool            has_stretch;    /* a skinned model: the stretch goes in as it is */
+    shz_vec3_t      stretch;
     bool            add;
+    uint32_t        tint;       /* 0 for as it is */
     bool            glow;       /* the bloom pass: only what gives off light */
     bool            has_shadow;
     DCShadow        shadow;
@@ -34,6 +38,8 @@ typedef struct {
 static DrawEntry       queue[DRAW_QUEUE_MAX];
 static int             queue_count;
 static const DCCamera* current_cam;
+static const DCImage*  current_env;     /* dc_set_environment: taken by each draw queued after it */
+static const DCImage*  applied_env;     /* the one the model layer has now */
 static DCTarget*       current_target;
 
 static DrawEntry* queue_push(void) {
@@ -66,11 +72,14 @@ static DrawEntry* queue_model(DMSModel* model, shz_vec3_t pos, float scale) {
     e->kind = ENTRY_MODEL;
     e->model = model;
     e->cam = current_cam;
+    e->env = current_env;
     e->pos = pos;
     e->scale = scale;
     e->yaw = 0.0f;
     e->has_rot = false;
+    e->has_stretch = false;
     e->add = false;
+    e->tint = 0;
     e->glow = false;
     e->has_shadow = false;
     return e;
@@ -84,8 +93,78 @@ void dc_set_camera(const DCCamera* cam) {
     current_cam = cam;
 }
 
+/* Each draw keeps the environment current when it was queued, so a scene can
+ * have gold things and silver things: set it, draw them, set the next */
+void dc_set_environment(const DCImage* img) {
+    current_env = img;
+}
+
+const DCImage* dc_get_environment(void) {
+    return current_env;
+}
+
+/* At the flush: the model layer's headers rebuilt only when the image changes
+ * between one draw and the next */
+static void env_for(const DCImage* env) {
+    if (env == applied_env) return;
+    dc_model_set_environment((const dttex_info_t*)dc_image_tex(env));
+    applied_env = env;
+}
+
+/* The lights as they are now (the first is the one that blends, from
+ * g_light_from to g_light_to) */
+static DCLight g_lights[DC_MAX_LIGHTS], g_light_from, g_light_to;
+static int     g_light_n;
+static bool    g_light_blending;
+static float   g_light_t, g_light_secs;
+#define g_light_now g_lights[0]
+#define g_light_on  (g_light_n > 0)
+
+/* The fields left out stand for something; filled in so they blend */
+static void light_fill(DCLight* l) {
+    if (l->r <= 0.0f && l->g <= 0.0f && l->b <= 0.0f) l->r = l->g = l->b = 1.0f;
+    if (l->range <= 0.0f)   l->range = 500.0f;
+    if (l->ambient <= 0.0f) l->ambient = 0.25f;
+}
+
+void dc_set_lights(const DCLight* lights, int count) {
+    g_light_blending = false;
+    if (!lights || count < 0) count = 0;
+    if (count > DC_MAX_LIGHTS) count = DC_MAX_LIGHTS;
+    g_light_n = count;
+    for (int i = 0; i < count; i++) { g_lights[i] = lights[i]; light_fill(&g_lights[i]); }
+    dc_model_set_lights(g_lights, count);
+}
+
 void dc_set_light(const DCLight* light) {
-    dc_model_set_light(light);
+    dc_set_lights(light, light ? 1 : 0);
+}
+
+void dc_set_light_over(const DCLight* light, float seconds) {
+    if (!light || seconds <= 0.0f || !g_light_on) { dc_set_light(light); return; }
+    g_light_from = g_light_now;
+    g_light_to = *light;
+    light_fill(&g_light_to);
+    g_light_t = 0.0f;
+    g_light_secs = seconds;
+    g_light_blending = true;
+}
+
+static inline float lerpf(float a, float b, float t) { return a + (b - a) * t; }
+
+void dc_draw_step_blends(float dt) {
+    if (!g_light_blending) return;
+    g_light_t += dt / g_light_secs;
+    float t = g_light_t >= 1.0f ? 1.0f : g_light_t;
+    const DCLight *a = &g_light_from, *b = &g_light_to;
+    DCLight l = *b;
+    l.pos = shz_vec3_lerp(a->pos, b->pos, t);
+    l.r = lerpf(a->r, b->r, t); l.g = lerpf(a->g, b->g, t); l.b = lerpf(a->b, b->b, t);
+    l.range = lerpf(a->range, b->range, t);
+    l.ambient = lerpf(a->ambient, b->ambient, t);
+    g_light_now = l;
+    dc_model_set_lights(g_lights, g_light_n);
+    if (t >= 1.0f) g_light_blending = false;
 }
 
 void dc_draw(DMSModel* model, shz_vec3_t pos) {
@@ -98,6 +177,7 @@ void dc_draw_ex(DMSModel* model, const DCDrawOpts* opts) {
     if (!e) return;
     e->yaw = opts->yaw;
     e->add = opts->add;
+    e->tint = opts->tint;
     if (opts->shadow) {
         e->has_shadow = true;
         e->shadow = *opts->shadow;
@@ -106,6 +186,34 @@ void dc_draw_ex(DMSModel* model, const DCDrawOpts* opts) {
         e->has_rot = true;
         memcpy(e->rot, opts->rot, sizeof(e->rot));
     }
+    if (opts->stretch.x != 0.0f || opts->stretch.y != 0.0f || opts->stretch.z != 0.0f) {
+        /* A stretch is a turn whose columns are not unit length. The longest
+         * axis goes into scale, which is what the bounding spheres use, and
+         * the columns carry the rest as factors of 1 or less. */
+        if (model->skeleton) {          /* the skinned path scales after the bones, so it takes it as is */
+            e->has_stretch = true;
+            e->stretch = opts->stretch;
+            return;
+        }
+        float sx = opts->stretch.x != 0.0f ? opts->stretch.x : 1.0f;
+        float sy = opts->stretch.y != 0.0f ? opts->stretch.y : 1.0f;
+        float sz = opts->stretch.z != 0.0f ? opts->stretch.z : 1.0f;
+        float m = sx > sy ? sx : sy;
+        if (sz > m) m = sz;
+        if (!e->has_rot) {
+            shz_sincos_t sc = shz_sincosf(e->yaw);
+            const float yaw_cols[9] = { sc.cos, 0.0f, sc.sin,  0.0f, 1.0f, 0.0f,  -sc.sin, 0.0f, sc.cos };
+            memcpy(e->rot, yaw_cols, sizeof(e->rot));
+            e->has_rot = true;
+        }
+        float inv = 1.0f / m;
+        for (int i = 0; i < 3; i++) {
+            e->rot[i]     *= sx * inv;
+            e->rot[3 + i] *= sy * inv;
+            e->rot[6 + i] *= sz * inv;
+        }
+        e->scale *= m;
+    }
 }
 
 void dc_draw_call(int pvr_list, void (*fn)(void* user), void* user) {
@@ -113,6 +221,7 @@ void dc_draw_call(int pvr_list, void (*fn)(void* user), void* user) {
     DrawEntry* e = queue_push();
     if (!e) return;
     e->kind = ENTRY_CALL;
+    e->cam = current_cam;
     e->call_list = pvr_list;
     e->call_fn = fn;
     e->call_user = user;
@@ -307,7 +416,7 @@ static void target_quad_draw(void* user) {
         cxt.depth.write = PVR_DEPTHWRITE_DISABLE;
     }
     pvr_poly_hdr_t* hdr = (pvr_poly_hdr_t*)pvr_dr_target(*dr);
-    pvr_poly_compile(hdr, &cxt);
+    dc_cxt_clip(&cxt); pvr_poly_compile(hdr, &cxt);
     pvr_dr_commit(hdr);
 
     static const float corner[4][2] = {{0, 0}, {1, 0}, {0, 1}, {1, 1}};
@@ -426,7 +535,7 @@ static void bloom_black_draw(void* user) {
     pvr_poly_cxt_col(&cxt, PVR_LIST_OP_POLY);
     cxt.gen.culling = PVR_CULLING_NONE;
     pvr_poly_hdr_t* hdr = (pvr_poly_hdr_t*)pvr_dr_target(*dr);
-    pvr_poly_compile(hdr, &cxt);
+    dc_cxt_clip(&cxt); pvr_poly_compile(hdr, &cxt);
     pvr_dr_commit(hdr);
 
     static const float corner[4][2] = {{0, 0}, {1, 0}, {0, 1}, {1, 1}};
@@ -566,6 +675,19 @@ static bool model_uses_list(const DMSModel* model, int pvr_list) {
            (dc_model_cel_on() && model->opaque_count != 0 && !model->skeleton);
 }
 
+/* The part of the screen the camera draws into (its view), or the whole of
+ * what is being drawn into. Into a target the whole target: a view is a
+ * part of the screen, not of a picture. Cheap when nothing changes. */
+static void clip_for(const DCCamera* cam, const DCTarget* target) {
+    if (cam && !target && cam->view.w > 0.0f && cam->view.h > 0.0f)
+        dc_list_clip(cam->view.x, cam->view.y, cam->view.w, cam->view.h);
+    else {
+        float w, h;
+        dc_render_size(&w, &h);
+        dc_list_clip(0.0f, 0.0f, w, h);
+    }
+}
+
 /* Everything queued for one target (NULL: the screen), a list at a time */
 static void flush_scene(const DCTarget* target) {
     /* Modifier lists come right after the polygons they change */
@@ -580,6 +702,18 @@ static void flush_scene(const DCTarget* target) {
     float sx = target ? (float)target->width / SCR_W : 1.0f;
     float sy = target ? (float)target->height / SCR_H : 1.0f;
 
+    /* Only a scene with a camera drawing into part of the screen clips.
+     * A render target never does: a view is a part of the screen. */
+    bool clip = false;
+    if (!target) {
+        for (int i = 0; i < queue_count && !clip; i++) {
+            const DCCamera* cam = queue[i].cam;
+            if (queue[i].target || !cam || cam->view.w <= 0.0f || cam->view.h <= 0.0f) continue;
+            clip = cam->view.w < SCR_W || cam->view.h < SCR_H;
+        }
+    }
+    dc_clip_scene(clip);
+
     for (int l = 0; l < 5; l++) {
         for (int i = 0; i < queue_count; i++) {
             const DrawEntry* e = &queue[i];
@@ -587,6 +721,7 @@ static void flush_scene(const DCTarget* target) {
             if (e->kind == ENTRY_CALL) {
                 if (e->call_list != lists[l]) continue;
                 dc_list_begin(lists[l]);
+                clip_for(e->cam, target);
                 e->call_fn(e->call_user);
             } else if (e->add ? lists[l] == PVR_LIST_TR_POLY
                               : model_uses_list(e->model, lists[l]) ||
@@ -605,6 +740,8 @@ static void flush_scene(const DCTarget* target) {
                     }
                     cam = &squeezed;
                 }
+                dc_list_begin(lists[l]);
+                clip_for(e->cam, target);
                 /* Shape into the modifier list, then the mesh it works on;
                  * the normal draw below leaves that mesh out. The glow pass
                  * wants none of it: a volume and a shadow both take light
@@ -620,17 +757,30 @@ static void flush_scene(const DCTarget* target) {
                     dc_model_draw_shadow(e->model, e->pos, e->scale, e->yaw,
                                          e->has_rot ? e->rot : NULL, cam, e->shadow.light,
                                          e->shadow.sun, e->shadow.floor_y, e->shadow.dark);
+                env_for(e->env);
                 if (e->add) dc_model_set_add(true);
+                if (e->tint) dc_model_set_tint(e->tint);
                 if (e->glow) dc_model_set_glow_only(true);
-                if (e->has_rot)
+                if (e->has_stretch)
+                    dc_model_draw_list_stretched(e->model, e->pos, e->scale, e->yaw, e->stretch,
+                                                 cam, lists[l]);
+                else if (e->has_rot)
                     dc_model_draw_list_oriented(e->model, e->pos, e->scale, e->rot,
                                                 cam, lists[l]);
                 else
                     dc_model_draw_list_rotated(e->model, e->pos, e->scale, e->yaw,
                                                cam, lists[l]);
                 if (e->glow) dc_model_set_glow_only(false);
+                if (e->tint) dc_model_set_tint(0);
                 if (e->add) dc_model_set_add(false);
             }
+        }
+        /* Text and images go on the screen after everything else in the
+         * translucent list, above it all by depth */
+        if (!target && lists[l] == PVR_LIST_TR_POLY) {
+            dc_list_begin(PVR_LIST_TR_POLY);
+            clip_for(NULL, NULL);               /* the 2D layer is over the whole screen */
+            dc_draw2d_flush();
         }
     }
 }

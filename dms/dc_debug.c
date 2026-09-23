@@ -64,7 +64,7 @@ void dc_debug_sphere(shz_vec3_t center, float radius,
     const shz_mat4x4_t* pv = dc_camera_get_pv(cam);
 
     /* Submit debug poly header */
-    shz_sq_memcpy32_1(pvr_dr_target(0), &dbg_poly_header);
+    dc_send_hdr(dc_dr_state(), &dbg_poly_header);
 
     float ox = center.x - cam->pos.x;
     float oy = center.y - cam->pos.y;

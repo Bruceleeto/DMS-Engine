@@ -33,8 +33,9 @@ typedef struct {
     ColCell*   cells;       /* hash table, cell_mask + 1 slots */
     uint32_t   cell_mask;
     int        tri_count;
-    shz_vec3_t pos;         /* model placement (world = vertex * scale + pos) */
+    shz_vec3_t pos;         /* model placement (world = turn(vertex) * scale + pos) */
     float      scale;
+    float      yaw_cos, yaw_sin;   /* the turn about y, as dc_draw_ex takes it */
     int       gx, gz;
     float     cell_size;
     float     inv_cell;
@@ -46,6 +47,7 @@ typedef struct {
 typedef struct {
     int   hit;
     float y;
+    shz_vec3_t normal;      /* of the face hit, unit length, pointing up */
 } ColGroundHit;
 
 /* ---- Ray hit result ---- */
@@ -59,7 +61,14 @@ typedef struct {
 /* The model must stay loaded while the ColWorld is used. */
 /* Cell size is chosen automatically from the model and the free RAM. */
 ColWorld*    col_build(DMSModel* dms_model, shz_vec3_t pos, float scale);
+/* The same, for a model drawn turned: yaw as dc_draw_ex takes it */
+ColWorld*    col_build_rotated(DMSModel* dms_model, shz_vec3_t pos, float scale, float yaw);
 shz_vec3_t   col_move(ColWorld* w, shz_vec3_t from, shz_vec3_t to, float radius);
+/* col_move against the walls only: floors and ceilings (a face within 45
+ * degrees of flat) are ignored and the push is in the ground plane. For a
+ * thing whose underside is above the sphere's middle, like a desk, which
+ * col_move would push down through the floor. */
+shz_vec3_t   col_move_walls(ColWorld* w, shz_vec3_t from, shz_vec3_t to, float radius);
 ColGroundHit col_ground(ColWorld* w, shz_vec3_t origin, float max_dist);
 ColRayHit  col_raycast(ColWorld* w, shz_vec3_t org, shz_vec3_t dir, float max_dist);
 /* Triangles whose bounds touch the sphere, each one once, for code that does
@@ -113,9 +122,12 @@ static inline const ColCell* col_find_cell(const ColWorld* w, int gx, int gz) {
 }
 
 static inline shz_vec3_t col_world_vert(const ColWorld* w, const DMSVertex* v) {
-    return shz_vec3_init(v->x * w->scale + w->pos.x,
+    /* The same turn dc_draw_ex gives a model with a yaw */
+    float x = v->x * w->yaw_cos - v->z * w->yaw_sin;
+    float z = v->x * w->yaw_sin + v->z * w->yaw_cos;
+    return shz_vec3_init(x * w->scale + w->pos.x,
                          v->y * w->scale + w->pos.y,
-                         v->z * w->scale + w->pos.z);
+                         z * w->scale + w->pos.z);
 }
 
 /* Rebuild a triangle from its reference */
@@ -323,10 +335,17 @@ static int col_build_grid(ColWorld* w, const ColTriRef* tris, const ColGridCost*
 #define COL_TARGET_TRIS  8
 
 ColWorld* col_build(DMSModel* mdl, shz_vec3_t pos, float scale) {
+    return col_build_rotated(mdl, pos, scale, 0.0f);
+}
+
+ColWorld* col_build_rotated(DMSModel* mdl, shz_vec3_t pos, float scale, float yaw) {
     ColWorld* w = (ColWorld*)calloc(1, sizeof(ColWorld));
     if (!w) return NULL;
     w->pos = pos;
     w->scale = scale;
+    shz_sincos_t sc = shz_sincosf(yaw);
+    w->yaw_cos = sc.cos;
+    w->yaw_sin = sc.sin;
 
     /* --- Pass 1: count triangles, bounds --- */
     w->tri_count = col_collect_tris(w, mdl, NULL);
@@ -467,8 +486,12 @@ static inline int col_gravity_ray_tri(const ColTri* ct, shz_vec3_t origin,
                                       float max_t, float* out_t) {
     /* P = D x edge2 with D = (0, -1, 0) */
     float px = -ct->edge2.z, pz = ct->edge2.x;
+    /* det is the triangle normal's y: a face pointing down is a ceiling or
+     * the underside of a floor, never ground, so it is skipped rather than
+     * landed on (a spawn probe started above a roof used to put the player
+     * on top of it) */
     float det = ct->edge1.x * px + ct->edge1.z * pz;
-    if (fabsf(det) < 1e-7f) return 0;
+    if (det < 1e-7f) return 0;
     float inv_det = 1.0f / det;
 
     shz_vec3_t s = shz_vec3_sub(origin, ct->v0);
@@ -524,7 +547,7 @@ static inline int col_ray_tri(const ColTri* ct, shz_vec3_t org,
  * ================================================================ */
 #define COL_MOVE_ITERS 3
 
-shz_vec3_t col_move(ColWorld* w, shz_vec3_t from, shz_vec3_t to, float radius) {
+static shz_vec3_t col_move_ex(ColWorld* w, shz_vec3_t to, float radius, bool walls) {
     if (!w) return to;
 
     float radius_sq = radius * radius;
@@ -550,8 +573,13 @@ shz_vec3_t col_move(ColWorld* w, shz_vec3_t from, shz_vec3_t to, float radius) {
 
                     ColTri ct;
                     col_tri_get(w, refs[i], &ct);
+                    if (walls) {                /* a flat face: floor or ceiling */
+                        shz_vec3_t n = shz_vec3_cross(ct.edge1, ct.edge2);
+                        if (n.y * n.y * 2.0f > shz_mag_sqr3f(n.x, n.y, n.z)) continue;
+                    }
                     shz_vec3_t closest = col_closest_on_tri(&ct, resolved);
                     shz_vec3_t diff = shz_vec3_sub(resolved, closest);
+                    if (walls) diff.y = 0.0f;
 
                     float dist_sq = shz_mag_sqr3f(diff.x, diff.y, diff.z);
 
@@ -575,14 +603,25 @@ shz_vec3_t col_move(ColWorld* w, shz_vec3_t from, shz_vec3_t to, float radius) {
     return resolved;
 }
 
+shz_vec3_t col_move(ColWorld* w, shz_vec3_t from, shz_vec3_t to, float radius) {
+    (void)from;
+    return col_move_ex(w, to, radius, false);
+}
+
+shz_vec3_t col_move_walls(ColWorld* w, shz_vec3_t from, shz_vec3_t to, float radius) {
+    (void)from;
+    return col_move_ex(w, to, radius, true);
+}
+
 /* ================================================================
  * col_ground -- gravity raycast using precomputed data
  * ================================================================ */
 ColGroundHit col_ground(ColWorld* w, shz_vec3_t origin, float max_dist) {
-    ColGroundHit result = { 0, 0.0f };
+    ColGroundHit result = { 0, 0.0f, { .x = 0.0f, .y = 1.0f, .z = 0.0f } };
     if (!w) return result;
 
     float best_t = max_dist;
+    ColTri best_tri = { 0 };
 
     int cx0 = col_cell_x(w, origin.x - 1.0f);
     int cx1 = col_cell_x(w, origin.x + 1.0f);
@@ -604,14 +643,19 @@ ColGroundHit col_ground(ColWorld* w, shz_vec3_t origin, float max_dist) {
                 col_tri_get(w, refs[i], &ct);
                 if (col_gravity_ray_tri(&ct, origin, best_t, &t)) {
                     best_t = t;
+                    best_tri = ct;
                     result.hit = 1;
                 }
             }
         }
     }
 
-    if (result.hit)
+    if (result.hit) {                       /* the face's normal, once, for the one hit */
         result.y = origin.y - best_t;
+        shz_vec3_t n = shz_vec3_cross(best_tri.edge1, best_tri.edge2);
+        float inv_len = shz_inv_sqrtf(shz_mag_sqr3f(n.x, n.y, n.z));
+        result.normal = shz_vec3_init(n.x * inv_len, n.y * inv_len, n.z * inv_len);
+    }
 
     return result;
 }

@@ -24,6 +24,29 @@ void dc_model_materials(const DMSModel* model);
  * meshes it changed. */
 int dc_model_see_through(DMSModel* model, const char* material, uint8_t alpha);
 
+/* The texture on everything wearing this Blender material slides along by
+ * itself: u and v are how many texture widths a second, u across and v down
+ * (negative goes the other way). Water, lava, a conveyor belt, a screen of
+ * scrolling text. Said once at load; drawing is dc_draw() as usual. The
+ * texture wraps, so the model's UVs can run past 1 as they like. Returns how
+ * many meshes it changed.
+ *
+ *     dc_model_scroll(belt, "Belt", 0.0f, -1.5f);
+ */
+int dc_model_scroll(DMSModel* model, const char* material, float u, float v);
+
+/* The texture on everything wearing this Blender material is a sheet of
+ * frames, `across` by `down`, read left to right then down, and the mesh
+ * shows the next one `fps` times a second, round and round. The model's UVs
+ * cover the first frame; the engine moves them along. count is how many of
+ * the sheet's frames are used, 0 for all of them. A television, a fire, a
+ * blinking sign. Said once at load. Returns how many meshes it changed.
+ *
+ *     dc_model_flipbook(cabinet, "screen", 8, 8, 64, 12.0f);
+ */
+int dc_model_flipbook(DMSModel* model, const char* material, int across, int down,
+                      int count, float fps);
+
 /* ================================================================
  * Drawing
  * ================================================================ */
@@ -48,6 +71,10 @@ void dc_model_draw_list_rotated(DMSModel* model, shz_vec3_t pos, float scale,
 
 /* Draw list turned any way (static models only). rot is 3 columns: where the
  * model's x, y and z axes point in the world. */
+/* A skinned model squashed or stretched: a factor per axis of the model on top
+ * of scale (0 means 1). For static models, dc_draw's .stretch does it. */
+void dc_model_draw_list_stretched(DMSModel* model, shz_vec3_t pos, float scale, float yaw,
+                                  shz_vec3_t stretch, const DCCamera* cam, int target_list);
 void dc_model_draw_list_oriented(DMSModel* model, shz_vec3_t pos, float scale,
                                  const float rot[9], const DCCamera* cam, int target_list);
 
@@ -102,6 +129,11 @@ void dc_model_draw_volume(DMSModel* model, shz_vec3_t pos, float scale, float ya
  * the transparent list, until set back to false */
 void dc_model_set_add(bool add);
 
+/* Engine use (dc_model_texture() in dc_draw2d.h): every mesh wearing the
+ * material draws with this texture, or its own again for NULL. material NULL
+ * means every mesh. Returns how many meshes it changed. */
+int dc_model_retexture(DMSModel* model, const char* material, const dttex_info_t* tex);
+
 /* Engine use: build a mesh's PVR header from its material flags and a texture
  * (txr NULL for none) */
 void dc_model_compile_header(const DMSMesh* mesh, pvr_poly_hdr_t* out, int pvrformat,
@@ -133,8 +165,12 @@ typedef struct {
                           * sharp edges between them. 0 means smooth */
 } DCLight;
 
-/* Engine use (dc_set_light): the light, or NULL for none */
+/* How many lights at once (dc_set_lights) */
+#define DC_MAX_LIGHTS 4
+
+/* Engine use (dc_set_light, dc_set_lights): the lights, or none */
 void dc_model_set_light(const DCLight* light);
+void dc_model_set_lights(const DCLight* lights, int count);
 
 /* Engine use: the light is cel shaded, so solid meshes of static models also
  * draw a pass in the TR list */
@@ -183,6 +219,51 @@ void dc_model_set_anim(DMSModel* model, int anim_index);
 
 /* Get current animation index, or -1 if no skeleton. */
 int dc_model_get_anim(DMSModel* model);
+
+/* How long a clip is, in seconds (0 for no such clip), and how far into the
+ * current one it is */
+float dc_model_anim_length(const DMSModel* model, int anim_index);
+float dc_model_anim_time(const DMSModel* model);
+
+/* The current clip has played through at least once since it was set or
+ * restarted. Clips loop, so this stays true until the next set or restart:
+ * an attack, a landing, a shot, held on its last frames until the game
+ * moves on. */
+bool dc_model_anim_done(const DMSModel* model);
+
+/* The current clip from its start again (dc_model_set_anim() leaves a clip
+ * already playing alone, so a second shot of the same clip goes here) */
+void dc_model_anim_restart(DMSModel* model);
+
+/* The index of the clip with this name, as Blender named it, or -1 if there
+ * is none:
+ *
+ *     dc_model_set_anim(robot, dc_model_anim_index(robot, "walk"));
+ */
+int dc_model_anim_index(const DMSModel* model, const char* name);
+
+/* ================================================================
+ * Bounds
+ * ================================================================ */
+
+/* The box round a model's vertices, in its own units (the bind pose for a
+ * skinned one). material picks the meshes wearing that Blender material,
+ * NULL takes them all. A platform's top is .max.y, its half width
+ * (.max.x - .min.x) / 2, its middle (.max.x + .min.x) / 2: no numbers copied
+ * out of Blender. Nothing matched gives a box of nothing: min above max. */
+typedef struct {
+    shz_vec3_t min, max;
+} DCBounds;
+DCBounds dc_model_bounds(const DMSModel* model, const char* material);
+
+/* A white cube one unit across (-0.5 to 0.5), no texture, drawn like any
+ * model: a marker, a dot, a debug box, with DCDrawOpts.tint for its colour.
+ * Free it with dc_model_free(). */
+DMSModel* dc_model_cube(void);
+
+/* Engine use: dc_draw_ex() with a tint. 0xRRGGBB multiplied into every
+ * vertex colour of the draws that follow; 0 is off. */
+void dc_model_set_tint(uint32_t rgb);
 
 /* ================================================================
  * Render statistics

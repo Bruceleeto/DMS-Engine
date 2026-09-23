@@ -47,6 +47,13 @@ typedef struct {
 typedef struct {
     shz_vec3_t   pos;
     float        scale;     /* 0 means 1 */
+    shz_vec3_t   stretch;   /* on top of scale, one factor per axis of the model
+                             * (a 0 means 1): a floor 5 times wider but no thicker
+                             * is .scale = 64, .stretch = { .x = 5, .y = 1, .z = 5 }.
+                             * A skinned model takes it too (scaled after its
+                             * bones, so it still animates: squash and stretch).
+                             * The light on a stretched model is close, not
+                             * exact: its normals are not re-made. */
     float        yaw;       /* radians, about y */
     const float* rot;       /* turned any way, used instead of yaw (static models
                              * only): 9 floats, 3 columns, where the model's x, y
@@ -54,6 +61,13 @@ typedef struct {
     const DCShadow* shadow; /* also draw its shadow. It is copied. */
     bool         add;       /* added to what is behind it, so black adds nothing:
                              * flashes, glows, fire. Draw it after the solid things. */
+    uint32_t     tint;      /* 0xRRGGBB multiplied into its colours; 0 means as it is.
+                             * A red flash of damage, a team colour, a white cube
+                             * (dc_model_cube()) made any colour. It only darkens:
+                             * a colour cannot be made brighter than it was baked.
+                             * Costs the lit path's per-vertex work on a static
+                             * model that was not lit; a skinned one pays a compare
+                             * a vertex. */
 } DCDrawOpts;
 
 void dc_draw_ex(DMSModel* model, const DCDrawOpts* opts);
@@ -69,7 +83,9 @@ void dc_draw_ex(DMSModel* model, const DCDrawOpts* opts);
  *
  *     dc_set_light(&(DCLight){ .pos = torch, .range = 300.0f });
  *
- * Static models only; one with a skeleton ignores it.
+ * A skinned model takes it too: the light is turned into each bone's space
+ * once per run of vertices on that bone, so the loop pays the same dot as a
+ * static mesh and nothing more. Its rim light and cel bands are not done.
  *
  * Cel shaded, the light comes in flat steps with sharp edges between them:
  *
@@ -78,6 +94,29 @@ void dc_draw_ex(DMSModel* model, const DCDrawOpts* opts);
  * Textures stay. Solid meshes get it; cutout and see-through meshes keep the
  * smooth light. It costs a second pass over each solid mesh, in the TR list. */
 void dc_set_light(const DCLight* light);
+
+/* More than one at once, up to DC_MAX_LIGHTS (4): a sun and a torch, four
+ * coloured lights going round a disco ball. Each vertex adds up what it
+ * catches of every one, so each light after the first costs another dot a
+ * vertex on everything lit. The ambient is the first light's, and only the
+ * first is cel shaded or blended by dc_set_light_over(); the rest add plain
+ * light. dc_set_light() is the same call with one, and either replaces all
+ * of them. Nothing here: NULL or 0 turns them all off.
+ *
+ *     dc_set_lights((DCLight[]){ { .pos = sunDir, .sun = true },
+ *                                { .pos = torch, .range = 200.0f, .r = 1, .g = 0.6f, .b = 0.2f } }, 2);
+ */
+void dc_set_lights(const DCLight* lights, int count);
+
+/* The same, arriving over so many seconds: the colour, the strength, where it
+ * is, the ambient, all easing from the light as it is now to this one. A room
+ * that goes red as the alarm sounds, a torch that dims. dc_set_light() in the
+ * middle of it jumps straight there. With no light on yet it is set at once.
+ * Only the first light blends; any others set stay as they are. */
+void dc_set_light_over(const DCLight* light, float seconds);
+
+/* Engine use: moves the blends along. Called by dc_frame_begin(). */
+void dc_draw_step_blends(float dt);
 
 /* ================================================================
  * Bloom

@@ -87,6 +87,17 @@ static void player_physics(DCPlayer* p, float dx, float dz, ColWorld* col) {
         p->vy -= p->gravity;
         resolved.y += p->vy;
 
+        /* Going up: a ceiling met by the top of the head ends the rise */
+        if (p->vy > 0.0f) {
+            float head = p->height - p->eye_height;
+            ColRayHit ch = col_raycast(col, shz_vec3_init(resolved.x, resolved.y - p->vy + head, resolved.z),
+                                       shz_vec3_init(0.0f, 1.0f, 0.0f), p->vy + 0.01f);
+            if (ch.hit && ch.pos.y - head < resolved.y) {
+                resolved.y = ch.pos.y - head;
+                p->vy = 0.0f;
+            }
+        }
+
         if (gh.hit) {
             float max_ground2 = col ? (resolved.y - col->min_y + 1.0f) : 50.0f;
             ColGroundHit gh2 = col_ground(col, resolved, max_ground2);
@@ -129,7 +140,7 @@ SHZ_NO_FAST_MATH
 static void update_fps(DCPlayer* p, DCCamera* cam,
                        const DCInput* inp, ColWorld* col, float dt) {
     /* Look: left stick */
-    cam->yaw   += inp->stick_x * p->look_speed * dt;
+    cam->yaw   -= inp->stick_x * p->look_speed * dt;
     cam->pitch += inp->stick_y * p->look_speed * 0.75f * dt;
     if (cam->pitch >  p->pitch_limit) cam->pitch =  p->pitch_limit;
     if (cam->pitch < -p->pitch_limit) cam->pitch = -p->pitch_limit;
@@ -145,8 +156,8 @@ static void update_fps(DCPlayer* p, DCCamera* cam,
     shz_sincos_t sc = shz_sincosf(cam->yaw);
     float fwd_x   =  sc.sin;
     float fwd_z   =  sc.cos;
-    float right_x =  sc.cos;
-    float right_z = -sc.sin;
+    float right_x = -sc.cos;
+    float right_z =  sc.sin;
 
     /* Build desired XZ movement from DPAD */
     float dx = 0.0f, dz = 0.0f;
@@ -184,7 +195,7 @@ static void update_third(DCPlayer* p, DCCamera* cam,
      */
 
     /* ---- 1. Turn: stick X rotates the player ---- */
-    p->yaw += inp->stick_x * p->turn_speed * dt;
+    p->yaw -= inp->stick_x * p->turn_speed * dt;
     p->yaw = wrap_angle(p->yaw);
 
     /* ---- 2. Move: stick Y along player's forward ---- */
@@ -242,7 +253,7 @@ static void update_third(DCPlayer* p, DCCamera* cam,
 SHZ_NO_FAST_MATH
 static void update_noclip(DCPlayer* p, DCCamera* cam,
                           const DCInput* inp, float dt) {
-    cam->yaw   += inp->stick_x * p->look_speed * dt;
+    cam->yaw   -= inp->stick_x * p->look_speed * dt;
     cam->pitch += inp->stick_y * p->look_speed * 0.75f * dt;
     if (cam->pitch >  p->pitch_limit) cam->pitch =  p->pitch_limit;
     if (cam->pitch < -p->pitch_limit) cam->pitch = -p->pitch_limit;
@@ -250,8 +261,8 @@ static void update_noclip(DCPlayer* p, DCCamera* cam,
     shz_sincos_t sc = shz_sincosf(cam->yaw);
     float fwd_x   =  sc.sin;
     float fwd_z   =  sc.cos;
-    float right_x =  sc.cos;
-    float right_z = -sc.sin;
+    float right_x = -sc.cos;
+    float right_z =  sc.sin;
 
     float speed   = 60.0f;   /* d-pad, units/sec */
     float v_speed = 120.0f;  /* triggers (up/down), units/sec */

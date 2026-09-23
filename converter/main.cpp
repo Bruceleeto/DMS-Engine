@@ -82,6 +82,8 @@ typedef struct {
                           // environment, 2 = a mirror (roughness near 0)
   int glow;               // glTF emissiveFactor is not black: the material gives
                           // off light, so dc_set_bloom() blooms it
+  uint32_t rim;           // Blender's Sheen colour, 0xRRGGBB: the edges facing
+                          // away from the camera light up this colour (Fresnel)
 
 } Mesh;
 
@@ -1645,6 +1647,14 @@ bool LoadGLTF(const char *filename) {
           dstMesh->alphaCutoff = mat->alpha_cutoff;
           dstMesh->doubleSided = mat->double_sided ? 1 : 0;
 
+          if (mat->has_sheen) {
+            const float *c = mat->sheen.sheen_color_factor;
+            uint8_t r = (uint8_t)(c[0] * 255.0f), g = (uint8_t)(c[1] * 255.0f), b = (uint8_t)(c[2] * 255.0f);
+            dstMesh->rim = (r << 16) | (g << 8) | b;
+            if (dstMesh->rim)
+              printf("Mesh %d material has a rim light (sheen) %02X%02X%02X\n", meshIndex, r, g, b);
+          }
+
           if (mat->has_pbr_metallic_roughness) {
             cgltf_pbr_metallic_roughness *pbr =
                 &mat->pbr_metallic_roughness;
@@ -1718,6 +1728,26 @@ bool LoadGLTF(const char *filename) {
                   dstMesh->alphaMode = 2;
                 }
               }
+
+              /* And the other way: BLEND with nothing see-through in it (a
+                 common export slip) would only cost a place in the
+                 transparent list and its sort. */
+              if (dstMesh->alphaMode == 2 && bc[3] >= 0.999f) {
+                char srcDir[256] = ".";
+                strncpy(srcDir, filename, sizeof(srcDir) - 1);
+                char *sl = strrchr(srcDir, '/');
+                if (!sl) sl = strrchr(srcDir, '\\');
+                if (sl) *sl = '\0'; else strcpy(srcDir, ".");
+                if (CgltfImageAlphaKind(img, srcDir) != 0) goto keep_blend;
+                printf("Mesh %d: BLEND but the texture and colour are opaque, demoting TRANSPARENT -> OPAQUE\n",
+                       meshIndex);
+                dstMesh->alphaMode = 0;
+              }
+              keep_blend:;
+            } else if (dstMesh->alphaMode == 2 && bc[3] >= 0.999f) {
+              printf("Mesh %d: BLEND but no texture and an opaque colour, demoting TRANSPARENT -> OPAQUE\n",
+                     meshIndex);
+              dstMesh->alphaMode = 0;
             }
           }
 
@@ -1864,6 +1894,7 @@ bool LoadGLTF(const char *filename) {
           } break;
 
           case cgltf_attribute_type_color: {
+            if (attr->index != 0) break;   // Only COLOR_0, as with TEXCOORD_0
             for (size_t v = 0; v < accessor->count; v++) {
               float color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
               cgltf_accessor_read_float(accessor, v, color, 4);
@@ -1929,12 +1960,15 @@ void WeldVertices(Mesh *mesh, float threshold = 0.001f) {
   std::vector<Vertex> weldedVerts;
   std::vector<int> remapTable(mesh->vertexCount);
 
-  // Build map with position AND UV as key
+  // Two vertices are one only if everything the PVR sees matches: place,
+  // UV, colour and normal. Welding on place and UV alone merged a black
+  // painted wall into the white wall it touched, and a hard edge into a
+  // soft one
   for (int i = 0; i < mesh->vertexCount; i++) {
-    char key[128];
-    snprintf(key, sizeof(key), "%.3f,%.3f,%.3f|%.4f,%.4f", mesh->vertices[i].x,
-             mesh->vertices[i].y, mesh->vertices[i].z, mesh->vertices[i].u,
-             mesh->vertices[i].v);
+    const Vertex &vv = mesh->vertices[i];
+    char key[160];
+    snprintf(key, sizeof(key), "%.3f,%.3f,%.3f|%.4f,%.4f|%02x%02x%02x%02x|%d,%d,%d",
+             vv.x, vv.y, vv.z, vv.u, vv.v, vv.r, vv.g, vv.b, vv.a, (int)vv.nx, (int)vv.ny, (int)vv.nz);
 
     auto it = vertexMap.find(key);
     if (it == vertexMap.end()) {
@@ -2117,7 +2151,7 @@ static bool SameMaterial(const Mesh &a, const Mesh &b) {
          a.alphaMode == b.alphaMode && a.alphaCutoff == b.alphaCutoff &&
          a.doubleSided == b.doubleSided && a.wrapU == b.wrapU &&
          a.wrapV == b.wrapV && a.collisionOnly == b.collisionOnly &&
-         a.metallic == b.metallic && a.glow == b.glow;
+         a.metallic == b.metallic && a.glow == b.glow && a.rim == b.rim;
 }
 
 void BuildBlocks(Model *m) {
@@ -2356,6 +2390,7 @@ void CreateTristrippedModel(const Model *sourceModel, Model *destModel) {
     dstMesh->collisionOnly = srcMesh->collisionOnly;
     dstMesh->metallic = srcMesh->metallic;
     dstMesh->glow = srcMesh->glow;
+    dstMesh->rim = srcMesh->rim;
     memcpy(dstMesh->materialName, srcMesh->materialName,
            sizeof(dstMesh->materialName));
 
@@ -3614,7 +3649,7 @@ void ExportTristrippedModel(const Model *model, const char *filename,
     // Write mesh header
     fwrite(&totalVerts, sizeof(uint32_t), 1, file);
     fwrite(&mesh->textureId, sizeof(int), 1, file);
-    fwrite(&mesh->materialColor, sizeof(uint32_t), 1, file);
+    fwrite(&mesh->rim, sizeof(uint32_t), 1, file);   /* the base colour is baked in; this slot is the rim */
 
     // Write bounding sphere
     fwrite(&bsCx, sizeof(float), 1, file);

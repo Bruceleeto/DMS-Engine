@@ -40,6 +40,8 @@ typedef struct {
 typedef struct {
     char name[64];
     int  parent;
+    bool skinned;           /* owns vertices: a control or IK bone does not, and
+                             * it can sit anywhere, so it stays out of the bounds */
     DMSTransform bindPose;
     DMSTransform localPose;
     shz_mat4x4_t worldPose          __attribute__((aligned(32)));
@@ -62,6 +64,7 @@ typedef struct {
     int           animCount;
     int           currentAnim;
     float         currentTime;
+    int           loops;        /* times the clip has run through since it was set */
 } DMSSkeleton;
 
 /* ================================================================
@@ -76,6 +79,9 @@ typedef struct __attribute__((aligned(32))) {
     uint32_t flags;
 } DMSVertex;
 
+/* material_flags bit 2: the glTF material is double sided. Single-sided
+ * meshes have their back faces culled by the PVR */
+#define DMS_MAT_DOUBLE_SIDED   (1u << 2)
 /* material_flags bit 12: mesh is collided with but never drawn */
 #define DMS_MAT_COLLISION_ONLY (1u << 12)
 /* material_flags bit 13: glTF metallic of 0.5 or more. Reflects the environment
@@ -95,15 +101,20 @@ typedef struct __attribute__((aligned(32))) {
 typedef struct {
     uint32_t vertex_count;
     int32_t  texture_id;
-    uint32_t material_color;
+    uint32_t rim_color;             /* 0xRRGGBB the edges light up (Fresnel), 0 for none */
     float    bound_cx, bound_cy, bound_cz;
     float    bound_radius;
+    float    bound_min[3], bound_max[3];   /* the box round its vertices, computed at load */
     uint32_t material_flags;        /* packed material bits */
     float    alpha_cutoff;          /* for CUTOUT alpha mode */
     uint32_t tri_count;             /* triangles across all strips (computed at load) */
     uint32_t block;                 /* block this mesh belongs to */
     DMSVertex *vertices;            /* bind-pose / static verts */
     DMSVertex *animated_vertices;   /* skinned output (NULL if static) */
+    float    scroll_u, scroll_v;    /* dc_model_scroll(): texture widths a second */
+    float    flip_w, flip_h;        /* dc_model_flipbook(): one frame, as a fraction of the sheet */
+    uint16_t flip_across, flip_count;
+    float    flip_fps;
     pvr_poly_hdr_t header __attribute__((aligned(32)));
 } DMSMesh;
 
@@ -130,7 +141,7 @@ typedef struct {
     uint32_t block, first, count;
 } DMSBlockRun;
 
-typedef struct {
+typedef struct DMSModel {
     uint32_t    mesh_count;
     uint32_t    opaque_count;       /* meshes [0..opaque-1] → OP list */
     uint32_t    cutout_count;       /* meshes [opaque..+cutout-1] → PT list */
@@ -146,6 +157,7 @@ typedef struct {
     float        anim_bound_cx, anim_bound_cy, anim_bound_cz;
     float        anim_bound_radius;
     float        max_bind_radius;
+    shz_vec3_t   bound_min, bound_max;  /* the box round every vertex, in its own units */
     uint32_t     metallic_count;    /* meshes that reflect the environment */
     uint32_t     mirror_count;      /* of those, mirrors */
     uint32_t     glow_count;        /* meshes that give off light (bloom) */
