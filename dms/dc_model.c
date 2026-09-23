@@ -9,6 +9,20 @@
  * Module state
  * ================================================================ */
 
+/* pvr_dr_target() writes the new store queue address back before the vertex
+ * is written to it. That cached store right in front of the store queue
+ * writes costs the SH4 about two cycles a vertex (the fast loop below lost
+ * 5 fps at 55k vertices), so the vertex goes out first and the address is
+ * written back after, with the commit. The dr argument is kept for the
+ * callers; this KOS's pvr_dr_target() does not use it either. */
+static inline pvr_vertex_t* dr_vertex(void) {
+    return __builtin_assume_aligned((void*)(pvr_dr_addr ^ 32), 32);
+}
+static inline void dr_send(pvr_vertex_t* pv) {
+    pvr_dr_addr = (uint32_t)pv;
+    pvr_dr_commit(pv);
+}
+
 static ClipVertex* g_clip_buffer = NULL;
 static uint32_t    g_clip_buffer_size = 0;
 
@@ -123,7 +137,7 @@ static int clip_tri_near(const ClipVertex* const in[3], ClipVertex* out) {
 static inline void submit_vert(ClipVertex* v, uint32_t flags) {
     g_vtx_left -= 32;
     float inv_w = shz_invf_fsrra(v->w);
-    pvr_vertex_t* pv = pvr_dr_target(*g_dr);
+    pvr_vertex_t* pv = dr_vertex();
     pv->flags = flags;
     pv->x = v->x * inv_w;
     pv->y = v->y * inv_w;
@@ -131,7 +145,7 @@ static inline void submit_vert(ClipVertex* v, uint32_t flags) {
     pv->u = v->u;
     pv->v = v->v;
     pv->argb = v->argb;
-    pvr_dr_commit(pv);
+    dr_send(pv);
 }
 
 /* ================================================================
@@ -425,27 +439,31 @@ static inline uint32_t shade(const DMSVertex* s) {
  * vertex's u and v by the loops below. Set per mesh from the clock, wrapped
  * to a texture width so it never grows. */
 static float g_uv_u = 0.0f, g_uv_v = 0.0f;
+static bool  g_uv_on;   /* an offset to add: the plain loops stay as they are without one */
 
 static inline void uv_scroll_set(const DMSMesh* m) {
     if (m->flip_count) {   /* dc_model_flipbook(): jump to this moment's frame */
         uint32_t frame = (uint32_t)((float)(dc_time_ms() % 3600000u) * 0.001f * m->flip_fps) % m->flip_count;
         g_uv_u = (frame % m->flip_across) * m->flip_w;
         g_uv_v = (frame / m->flip_across) * m->flip_h;
+        g_uv_on = true;
         return;
     }
-    if (m->scroll_u == 0.0f && m->scroll_v == 0.0f) { g_uv_u = g_uv_v = 0.0f; return; }
+    if (m->scroll_u == 0.0f && m->scroll_v == 0.0f) { g_uv_u = g_uv_v = 0.0f; g_uv_on = false; return; }
     float t = (float)(dc_time_ms() % 3600000u) * 0.001f;
     float u = m->scroll_u * t, v = m->scroll_v * t;
     g_uv_u = u - floorf(u);
     g_uv_v = v - floorf(v);
+    g_uv_on = true;
 }
 
 /* The lit copy of the loop below. The shading goes between the matrix multiply
  * and the divide that wants its result, which is where the unlit loop stalls,
  * so this one has no software pipeline to keep it busy. */
-static void render_fast_lit(const DMSVertex* src, int count,
-                            pvr_dr_state_t* dr) {
-    const float uv_u = g_uv_u, uv_v = g_uv_v;
+static inline __attribute__((always_inline))
+void render_fast_lit_impl(const DMSVertex* src, int count,
+                          pvr_dr_state_t* dr, const bool uv) {
+    const float uv_u = uv ? g_uv_u : 0.0f, uv_v = uv ? g_uv_v : 0.0f;
     SHZ_PREFETCH(&src[0]);
     SHZ_PREFETCH(&src[1]);
 
@@ -459,7 +477,7 @@ static void render_fast_lit(const DMSVertex* src, int count,
         t = shz_vec4_swizzle(t, 1, 2, 3, 0);
 
         float inv_w = shz_invf_fsrra(t.w);
-        pvr_vertex_t* pv = pvr_dr_target(*dr);
+        pvr_vertex_t* pv = dr_vertex();
         pv->flags = src[i].flags;
         pv->x     = t.x * inv_w;
         pv->y     = t.y * inv_w;
@@ -467,12 +485,13 @@ static void render_fast_lit(const DMSVertex* src, int count,
         pv->u     = src[i].u + uv_u;
         pv->v     = src[i].v + uv_v;
         pv->argb  = argb;
-        pvr_dr_commit(pv);
+        dr_send(pv);
     }
 }
 
-static void render_fast(const DMSVertex* src, int count,
-                        pvr_dr_state_t* dr) {
+static inline __attribute__((always_inline))
+void render_fast_impl(const DMSVertex* src, int count,
+                      pvr_dr_state_t* dr, const bool uv) {
     if (count < 1) return;
 
     SHZ_PREFETCH(&src[0]);
@@ -489,7 +508,7 @@ static void render_fast(const DMSVertex* src, int count,
     float    cur_sx    = t0.x * cur_invw;
     float    cur_sy    = t0.y * cur_invw;
     uint32_t cur_flags = src[0].flags;
-    const float uv_u = g_uv_u, uv_v = g_uv_v;
+    const float uv_u = uv ? g_uv_u : 0.0f, uv_v = uv ? g_uv_v : 0.0f;
     float    cur_u     = src[0].u + uv_u;
     float    cur_v     = src[0].v + uv_v;
     uint32_t cur_argb  = src[0].argb;
@@ -509,7 +528,7 @@ static void render_fast(const DMSVertex* src, int count,
             shz_vec4_init(nx, ny, nz, 1.0f)
         );
 
-        pvr_vertex_t* pv = pvr_dr_target(*dr);
+        pvr_vertex_t* pv = dr_vertex();
         pv->flags = cur_flags;
         pv->x     = cur_sx;
         pv->y     = cur_sy;
@@ -517,7 +536,7 @@ static void render_fast(const DMSVertex* src, int count,
         pv->u     = cur_u;
         pv->v     = cur_v;
         pv->argb  = cur_argb;
-        pvr_dr_commit(pv);
+        dr_send(pv);
 
         next_t = shz_vec4_swizzle(next_t, 1, 2, 3, 0);
         cur_invw  = shz_invf_fsrra(next_t.w);
@@ -529,7 +548,7 @@ static void render_fast(const DMSVertex* src, int count,
         cur_argb  = nargb;
     }
 
-    pvr_vertex_t* pv = pvr_dr_target(*dr);
+    pvr_vertex_t* pv = dr_vertex();
     pv->flags = cur_flags;
     pv->x     = cur_sx;
     pv->y     = cur_sy;
@@ -537,7 +556,23 @@ static void render_fast(const DMSVertex* src, int count,
     pv->u     = cur_u;
     pv->v     = cur_v;
     pv->argb  = cur_argb;
-    pvr_dr_commit(pv);
+    dr_send(pv);
+}
+
+/* The plain loops, and the same with a texture offset (dc_model_scroll,
+ * dc_model_flipbook). The offset is folded out of the plain ones: two adds
+ * a vertex showed on the highpoly test, run 55k times a frame. */
+static void render_fast(const DMSVertex* src, int count, pvr_dr_state_t* dr) {
+    render_fast_impl(src, count, dr, false);
+}
+static __attribute__((noinline)) void render_fast_uv(const DMSVertex* src, int count, pvr_dr_state_t* dr) {
+    render_fast_impl(src, count, dr, true);
+}
+static void render_fast_lit(const DMSVertex* src, int count, pvr_dr_state_t* dr) {
+    render_fast_lit_impl(src, count, dr, false);
+}
+static __attribute__((noinline)) void render_fast_lit_uv(const DMSVertex* src, int count, pvr_dr_state_t* dr) {
+    render_fast_lit_impl(src, count, dr, true);
 }
 
 /* The same, in black. It is how the bloom pass stops a lamp shining through
@@ -580,7 +615,7 @@ static void render_fast_flat(const DMSVertex* src, int count,
             shz_vec4_init(nx, ny, nz, 1.0f)
         );
 
-        pvr_vertex_t* pv = pvr_dr_target(*dr);
+        pvr_vertex_t* pv = dr_vertex();
         pv->flags = cur_flags;
         pv->x     = cur_sx;
         pv->y     = cur_sy;
@@ -588,7 +623,7 @@ static void render_fast_flat(const DMSVertex* src, int count,
         pv->u     = cur_u;
         pv->v     = cur_v;
         pv->argb  = 0xFF000000u;
-        pvr_dr_commit(pv);
+        dr_send(pv);
 
         next_t = shz_vec4_swizzle(next_t, 1, 2, 3, 0);
         cur_invw  = shz_invf_fsrra(next_t.w);
@@ -599,7 +634,7 @@ static void render_fast_flat(const DMSVertex* src, int count,
         cur_v     = nv;
     }
 
-    pvr_vertex_t* pv = pvr_dr_target(*dr);
+    pvr_vertex_t* pv = dr_vertex();
     pv->flags = cur_flags;
     pv->x     = cur_sx;
     pv->y     = cur_sy;
@@ -607,7 +642,7 @@ static void render_fast_flat(const DMSVertex* src, int count,
     pv->u     = cur_u;
     pv->v     = cur_v;
     pv->argb  = 0xFF000000u;
-    pvr_dr_commit(pv);
+    dr_send(pv);
 }
 
 /* ================================================================
@@ -647,7 +682,7 @@ static void render_clipped(const DMSVertex* src, int count,
         for (int i = 0; i < count; i++) {
             ClipVertex* cv = &g_clip_buffer[i];
             float inv_w = shz_invf_fsrra(cv->w);
-            pvr_vertex_t* pv = pvr_dr_target(*dr);
+            pvr_vertex_t* pv = dr_vertex();
             pv->flags = src[i].flags;
             pv->x     = cv->x * inv_w;
             pv->y     = cv->y * inv_w;
@@ -655,7 +690,7 @@ static void render_clipped(const DMSVertex* src, int count,
             pv->u     = cv->u;
             pv->v     = cv->v;
             pv->argb  = cv->argb;
-            pvr_dr_commit(pv);
+            dr_send(pv);
         }
         return;
     }
@@ -843,7 +878,7 @@ static void render_skinned(const DMSVertex* src, int count,
         );
 
         /* Submit previous vertex while next_t result settles */
-        pvr_vertex_t* pv = pvr_dr_target(*dr);
+        pvr_vertex_t* pv = dr_vertex();
         pv->flags = cur_flags;
         pv->x     = cur_sx;
         pv->y     = cur_sy;
@@ -851,7 +886,7 @@ static void render_skinned(const DMSVertex* src, int count,
         pv->u     = cur_u;
         pv->v     = cur_v;
         pv->argb  = cur_argb;
-        pvr_dr_commit(pv);
+        dr_send(pv);
 
         next_t = shz_vec4_swizzle(next_t, 1, 2, 3, 0);
         cur_invw  = shz_invf_fsrra(next_t.w);
@@ -864,7 +899,7 @@ static void render_skinned(const DMSVertex* src, int count,
     }
 
     /* Flush last vertex */
-    pvr_vertex_t* pv = pvr_dr_target(*dr);
+    pvr_vertex_t* pv = dr_vertex();
     pv->flags = cur_flags;
     pv->x     = cur_sx;
     pv->y     = cur_sy;
@@ -872,7 +907,7 @@ static void render_skinned(const DMSVertex* src, int count,
     pv->u     = cur_u;
     pv->v     = cur_v;
     pv->argb  = cur_argb;
-    pvr_dr_commit(pv);
+    dr_send(pv);
 }
 
 /* ================================================================
@@ -1161,8 +1196,8 @@ static void draw_blocks_list(DMSModel* model, shz_vec3_t pos, float scale,
                 } else {
                     g_stats.verts_xformed += mesh->vertex_count;
                     if (g_flat)      render_fast_flat(mesh->vertices, mesh->vertex_count, dr);
-                    else if (shaded) render_fast_lit(mesh->vertices, mesh->vertex_count, dr);
-                    else             render_fast(mesh->vertices, mesh->vertex_count, dr);
+                    else if (shaded) (g_uv_on ? render_fast_lit_uv : render_fast_lit)(mesh->vertices, mesh->vertex_count, dr);
+                    else             (g_uv_on ? render_fast_uv : render_fast)(mesh->vertices, mesh->vertex_count, dr);
                 }
             }
         }
@@ -2319,7 +2354,7 @@ void dc_model_submit_quads(const DMSVertex* verts, int quads, pvr_dr_state_t* dr
         g_vtx_left -= 4 * 32;
         for (int i = 0; i < 4; i++) {
             float inv_w = shz_invf_fsrra(t[i].w);
-            pvr_vertex_t* pv = pvr_dr_target(*dr);
+            pvr_vertex_t* pv = dr_vertex();
             pv->flags = src[i].flags;
             pv->x     = t[i].x * inv_w;
             pv->y     = t[i].y * inv_w;
@@ -2327,7 +2362,7 @@ void dc_model_submit_quads(const DMSVertex* verts, int quads, pvr_dr_state_t* dr
             pv->u     = src[i].u;
             pv->v     = src[i].v;
             pv->argb  = src[i].argb;
-            pvr_dr_commit(pv);
+            dr_send(pv);
         }
         g_stats.tris_drawn += 2;
         g_stats.verts_xformed += 4;
