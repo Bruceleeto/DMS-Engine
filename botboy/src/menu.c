@@ -317,7 +317,6 @@ static void on_options_choice(int choice) {
         dialogue_queue_add(&dialogue, "3D Modelers: DC.all, StatycTyr", NULL);
         dialogue_queue_add(&dialogue, "Composer/Sound: DakodaComposer", NULL);
         dialogue_queue_add(&dialogue, "Created for N64brew Game Jam 2025", NULL);
-        dialogue_queue_add(&dialogue, "Dreamcast port on DMS", NULL);
         dialogue_queue_add(&dialogue, "Thanks for playing!", NULL);
         dialogue_queue_start(&dialogue);
         menuState = MENU_IDLE;

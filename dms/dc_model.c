@@ -1,6 +1,8 @@
+#include <dc/perfctr.h>
 #include "dc_model.h"
 #include "dc_engine.h"
 #include "pvrtex.h"
+#include "dt_colours.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -21,6 +23,60 @@ static inline pvr_vertex_t* dr_vertex(void) {
 static inline void dr_send(pvr_vertex_t* pv) {
     pvr_dr_addr = (uint32_t)pv;
     pvr_dr_commit(pv);
+}
+
+/* A word read or written through another type's pointer */
+typedef uint32_t __attribute__((may_alias)) uint32_alias;
+
+/* The hot loops keep the store queue address in a register rather than
+ * pvr_dr_addr: a store to the queue could be to that global as far as the
+ * compiler knows, so it loaded and stored it every vertex. sq_next() flips to
+ * the other half of the queue, sq_put() writes a whole vertex there and
+ * sends it, and sq_end() gives the address back.
+ * The vertex is written from its last word back to its first, each store
+ * moving the address down 4 (@-r), as Ninja's njDirectDraw: GCC has no
+ * such store and fmov has no offset, so it built each address with a mov
+ * and an add, 14 instructions a vertex. The stores are not volatile: GCC
+ * holds a volatile asm as a wall nothing is moved across, and 8 a vertex
+ * left the float work nowhere to go (24.2ms against 21.4ms on the Toyota).
+ * They keep their order through the address each hands the next, and the
+ * pref that sends them takes the last one's. */
+static inline uint32_t sq_next(uint32_t sq) { return sq ^ 32; }
+static inline __attribute__((always_inline)) void sq_f(uint32_t* p, float f) {
+    __asm__("fmov %1,@-%0" : "+r"(*p) : "f"(f));
+}
+static inline __attribute__((always_inline)) void sq_w(uint32_t* p, uint32_t w) {
+    __asm__("mov.l %1,@-%0" : "+r"(*p) : "r"(w));
+}
+static inline __attribute__((always_inline)) void sq_send(uint32_t sq) {
+    __asm__ volatile("pref @%0" : : "r"(sq));
+}
+static inline __attribute__((always_inline))
+void sq_put(uint32_t sq, uint32_t flags, float x, float y, float z, float a, float b,
+            float c, float d) {
+    uint32_t p = sq + 32;
+    sq_f(&p, d); sq_f(&p, c); sq_f(&p, b); sq_f(&p, a);
+    sq_f(&p, z); sq_f(&p, y); sq_f(&p, x); sq_w(&p, flags);
+    sq_send(p);
+}
+/* The same for a vertex with a packed colour (the offset colour left out) */
+static inline __attribute__((always_inline))
+void sq_put_argb(uint32_t sq, uint32_t flags, float x, float y, float z, float u, float v,
+                 uint32_t argb) {
+    uint32_t p = sq + 28;
+    sq_w(&p, argb); sq_f(&p, v); sq_f(&p, u);
+    sq_f(&p, z); sq_f(&p, y); sq_f(&p, x); sq_w(&p, flags);
+    sq_send(p);
+}
+static inline void sq_end(uint32_t sq) { pvr_dr_addr = sq; }
+/* The same with the offset colour too (a highlight) */
+static inline __attribute__((always_inline))
+void sq_put_argb2(uint32_t sq, uint32_t flags, float x, float y, float z, float u, float v,
+                  uint32_t argb, uint32_t oargb) {
+    uint32_t p = sq + 32;
+    sq_w(&p, oargb); sq_w(&p, argb); sq_f(&p, v); sq_f(&p, u);
+    sq_f(&p, z); sq_f(&p, y); sq_f(&p, x); sq_w(&p, flags);
+    sq_send(p);
 }
 
 static ClipVertex* g_clip_buffer = NULL;
@@ -69,11 +125,19 @@ static void vtxbuf_warn_need(int32_t need) {
 
 static void vtxbuf_warn(void) { vtxbuf_warn_need(0); }
 
-/* Clipped meshes are mostly plain strips, so both paths are estimated at
- * 32 bytes/vertex to get in. A clipped mesh then counts what it really
- * sends (render_clipped) and guards its per-triangle output. */
+/* The chip keeps a strip as blocks of six triangles, each eight vertices
+ * (24 bytes textured, 28 with an offset colour) after 12 bytes of its own:
+ * 34 and 39 a vertex along a long strip. Estimated at 36 and 44 to get in;
+ * at 32 for everything it wrote past the end of the buffer on the police car
+ * and hung. A clipped mesh then counts what it really sends (render_clipped)
+ * and guards its per-triangle output. */
+static inline int32_t vtxbuf_need(const DMSMesh* mesh) {
+    int32_t per = DMS_MAT_SHINE_POWER(mesh->material_flags) ? 44 : 36;
+    return (int32_t)(64 + mesh->vertex_count * per);
+}
+
 static inline int vtxbuf_full(const DMSMesh* mesh, int clip) {
-    int32_t need = (int32_t)(32 + mesh->vertex_count * 32);
+    int32_t need = vtxbuf_need(mesh);
     if (SHZ_LIKELY(need <= g_vtx_left)) {
         g_vtx_left -= clip ? 32 : need;
         return 0;
@@ -174,6 +238,9 @@ static ModelLight g_ml[DC_MAX_LIGHTS];     /* the lights in the space of the mod
 static int        g_ml_n;
 static float      g_ml_ambient;            /* the first light's, times 127 */
 static float      g_ml_model[DC_MAX_LIGHTS][3];   /* the same before a bone moved them (skinned) */
+static ModelLight g_ml_place[DC_MAX_LIGHTS];      /* as light_to_model left them, see lights_at() */
+static bool       g_ml_to_sun;                    /* lights_at() has lights to turn into suns */
+static bool       g_ml_suns;                      /* every light is a sun (after lights_at()) */
 static int        g_lit;     /* this draw call shades instead of copying argb */
 static int        g_tint_on; /* dc_model_set_tint(): every colour multiplied by it */
 static uint32_t   g_tint_r, g_tint_g, g_tint_b;   /* 0 to 256, so 255 is "as it is" */
@@ -310,6 +377,8 @@ int dc_model_points(DMSModel* model, const char* material,
  * so its transpose brings a world direction back the other way. */
 static void light_to_model(shz_vec3_t pos, float scale, const float* cols) {
     g_lit = g_light_n > 0 && scale > 0.0f;
+    g_ml_to_sun = false;
+    g_ml_suns = true;
     if (!g_lit) return;
     g_ml_n = g_light_n;
     g_ml_ambient = (g_light.ambient > 0.0f ? g_light.ambient : 0.25f) * 127.0f;
@@ -349,6 +418,42 @@ static void light_to_model(shz_vec3_t pos, float scale, const float* cols) {
         ml->r = (white ? 1.0f : l->r) * k;
         ml->g = (white ? 1.0f : l->g) * k;
         ml->b = (white ? 1.0f : l->b) * k;
+        g_ml_place[i] = *ml;
+        if (ml->pos_w != 0.0f && g_light_n > 1) g_ml_to_sun = true;
+        if (ml->pos_w != 0.0f) g_ml_suns = false;
+    }
+    if (g_ml_to_sun) g_ml_suns = true;
+}
+
+/* With more than one light, each light in a place becomes a sun for the mesh
+ * about to be drawn: its direction and fade from the middle of the mesh (c,
+ * in the model's space), worked out once instead of at every vertex. GTA III
+ * did the same for each car and person; per mesh, the parts of a long car
+ * each get their own. A vertex working out its own distance, square root and
+ * fade for four lights cost more than the rest of it put together, and over
+ * a mesh the direction barely changes.
+ * The fade rides in inv_range: with the direction of unit length, a sun's
+ * fade is 1 - inv_range, and a real sun's is 0. One light keeps the exact
+ * sums: there are loops for it that cost little. */
+static void lights_at(float cx, float cy, float cz) {
+    if (!g_ml_to_sun) return;
+    for (int i = 0; i < g_ml_n; i++) {
+        const ModelLight* pl = &g_ml_place[i];
+        if (pl->pos_w == 0.0f) continue;
+        ModelLight* ml = &g_ml[i];
+        float dx = pl->x - cx, dy = pl->y - cy, dz = pl->z - cz;
+        float d2 = dx * dx + dy * dy + dz * dz;
+        float fade = 0.0f;
+        if (d2 > 0.0f) {
+            float inv = shz_inv_sqrtf(d2);
+            fade = 1.0f - d2 * inv * pl->inv_range;
+            if (fade < 0.0f) fade = 0.0f;
+            dx *= inv; dy *= inv; dz *= inv;
+        }
+        ml->x = dx; ml->y = dy; ml->z = dz;
+        ml->pos_w = 0.0f;
+        ml->inv_range = 1.0f - fade;
+        g_ml_model[i][0] = dx; g_ml_model[i][1] = dy; g_ml_model[i][2] = dz;
     }
 }
 
@@ -409,15 +514,33 @@ static inline float catch_light(const DMSVertex* s, const ModelLight* ml) {
     return ndl * att;    /* 0 to 127, the length of an int8 normal */
 }
 
+/* The same for a sun: its direction is of unit length and its fade is
+ * 1 - inv_range (see lights_at()), so there is no distance to work out */
+static inline float catch_sun(const DMSVertex* s, const ModelLight* ml) {
+    float ndl = s->nx * ml->x + s->ny * ml->y + s->nz * ml->z;
+    if (ndl < 0.0f) ndl = 0.0f;
+    return ndl * (1.0f - ml->inv_range);
+}
+
 static inline uint32_t shade(const DMSVertex* s) {
     uint32_t c = s->argb;
     if (g_lit) {
         /* The first light carries the ambient; the others only add */
-        float lit = g_ml_ambient + catch_light(s, &g_ml[0]);
-        float lr = lit * g_ml[0].r, lg = lit * g_ml[0].g, lb = lit * g_ml[0].b;
-        for (int i = 1; i < g_ml_n; i++) {
-            lit = catch_light(s, &g_ml[i]);
-            lr += lit * g_ml[i].r; lg += lit * g_ml[i].g; lb += lit * g_ml[i].b;
+        float lr, lg, lb;
+        if (g_ml_suns) {
+            float lit = g_ml_ambient + catch_sun(s, &g_ml[0]);
+            lr = lit * g_ml[0].r; lg = lit * g_ml[0].g; lb = lit * g_ml[0].b;
+            for (int i = 1; i < g_ml_n; i++) {
+                lit = catch_sun(s, &g_ml[i]);
+                lr += lit * g_ml[i].r; lg += lit * g_ml[i].g; lb += lit * g_ml[i].b;
+            }
+        } else {
+            float lit = g_ml_ambient + catch_light(s, &g_ml[0]);
+            lr = lit * g_ml[0].r; lg = lit * g_ml[0].g; lb = lit * g_ml[0].b;
+            for (int i = 1; i < g_ml_n; i++) {
+                lit = catch_light(s, &g_ml[i]);
+                lr += lit * g_ml[i].r; lg += lit * g_ml[i].g; lb += lit * g_ml[i].b;
+            }
         }
         uint32_t r = (((c >> 16) & 0xff) * (uint32_t)lr) >> 8;
         uint32_t g = (((c >>  8) & 0xff) * (uint32_t)lg) >> 8;
@@ -466,6 +589,7 @@ void render_fast_lit_impl(const DMSVertex* src, int count,
     const float uv_u = uv ? g_uv_u : 0.0f, uv_v = uv ? g_uv_v : 0.0f;
     SHZ_PREFETCH(&src[0]);
     SHZ_PREFETCH(&src[1]);
+    uint32_t sq = pvr_dr_addr;
 
     for (int i = 0; i < count; i++) {
         SHZ_PREFETCH(&src[i + 2]);
@@ -477,22 +601,17 @@ void render_fast_lit_impl(const DMSVertex* src, int count,
         t = shz_vec4_swizzle(t, 1, 2, 3, 0);
 
         float inv_w = shz_invf_fsrra(t.w);
-        pvr_vertex_t* pv = dr_vertex();
-        pv->flags = src[i].flags;
-        pv->x     = t.x * inv_w;
-        pv->y     = t.y * inv_w;
-        pv->z     = inv_w;
-        pv->u     = src[i].u + uv_u;
-        pv->v     = src[i].v + uv_v;
-        pv->argb  = argb;
-        dr_send(pv);
+        sq = sq_next(sq);
+        sq_put_argb(sq, src[i].flags, t.x * inv_w, t.y * inv_w, inv_w, src[i].u + uv_u, src[i].v + uv_v, argb);
     }
+    sq_end(sq);
 }
 
 static inline __attribute__((always_inline))
 void render_fast_impl(const DMSVertex* src, int count,
                       pvr_dr_state_t* dr, const bool uv) {
     if (count < 1) return;
+    uint32_t sq = pvr_dr_addr;
 
     SHZ_PREFETCH(&src[0]);
     SHZ_PREFETCH(&src[1]);
@@ -528,15 +647,8 @@ void render_fast_impl(const DMSVertex* src, int count,
             shz_vec4_init(nx, ny, nz, 1.0f)
         );
 
-        pvr_vertex_t* pv = dr_vertex();
-        pv->flags = cur_flags;
-        pv->x     = cur_sx;
-        pv->y     = cur_sy;
-        pv->z     = cur_invw;
-        pv->u     = cur_u;
-        pv->v     = cur_v;
-        pv->argb  = cur_argb;
-        dr_send(pv);
+        sq = sq_next(sq);
+        sq_put_argb(sq, cur_flags, cur_sx, cur_sy, cur_invw, cur_u, cur_v, cur_argb);
 
         next_t = shz_vec4_swizzle(next_t, 1, 2, 3, 0);
         cur_invw  = shz_invf_fsrra(next_t.w);
@@ -548,15 +660,9 @@ void render_fast_impl(const DMSVertex* src, int count,
         cur_argb  = nargb;
     }
 
-    pvr_vertex_t* pv = dr_vertex();
-    pv->flags = cur_flags;
-    pv->x     = cur_sx;
-    pv->y     = cur_sy;
-    pv->z     = cur_invw;
-    pv->u     = cur_u;
-    pv->v     = cur_v;
-    pv->argb  = cur_argb;
-    dr_send(pv);
+    sq = sq_next(sq);
+    sq_put_argb(sq, cur_flags, cur_sx, cur_sy, cur_invw, cur_u, cur_v, cur_argb);
+    sq_end(sq);
 }
 
 /* The plain loops, and the same with a texture offset (dc_model_scroll,
@@ -573,6 +679,940 @@ static void render_fast_lit(const DMSVertex* src, int count, pvr_dr_state_t* dr)
 }
 static __attribute__((noinline)) void render_fast_lit_uv(const DMSVertex* src, int count, pvr_dr_state_t* dr) {
     render_fast_lit_impl(src, count, dr, true);
+}
+
+/* ================================================================
+ * Render: one light over one colour (the PVR's intensity mode)
+ *
+ * Most models keep their colour in the material and the detail in the
+ * texture, so every vertex of a mesh has the same colour. Such a mesh sends
+ * that colour once, in the header, and each vertex only how bright it is; the
+ * graphics chip multiplies the two. The CPU is left a dot product a vertex
+ * instead of three multiplies, three clamps and a repack -- how Sega's Ninja
+ * library lit its car viewer.
+ *
+ * The header's second colour, the offset, is added after the texture, which
+ * is what a highlight is: it sits on the paint rather than being tinted by
+ * it. A glossy material gets one, from its glTF roughness and clear coat.
+ * ================================================================ */
+
+static bool g_add;   /* dc_model_set_add(), below */
+static const dttex_info_t* g_env;   /* dc_model_set_environment(), below */
+
+/* A vertex of the intensity mode: brightness in place of the colours */
+typedef struct __attribute__((aligned(32))) {
+    uint32_t flags;
+    float x, y, z, u, v;
+    float base, offset;
+} IntensityVertex;
+
+/* One light, a mesh of one colour, fully in view: the other cases (more
+ * lights, a rim, the additive or flat passes) keep render_fast_lit */
+static inline bool intensity_ok(const DMSMesh* mesh) {
+    return g_lit && g_ml_n == 1 && !g_rim_on && !g_add && !g_flat &&
+           (mesh->material_flags & DMS_MAT_ONE_COLOUR);
+}
+
+bool dc_model_reflects(const DMSMesh* mesh);
+
+/* Metal with no texture of its own, under one sun, shows the environment
+ * image AS its texture, tinted by its colour and shaded by the sun, in the
+ * one pass -- how Sega's Katana car viewer drew its body. The second,
+ * additive pass would send every vertex again. */
+static inline bool env_single(const DMSMesh* mesh) {
+    uint32_t f = mesh->material_flags;
+    return g_env && g_light.sun && !mesh->header.m0.txr_en &&
+           (f & DMS_MAT_METALLIC) && !(f & DMS_MAT_MIRROR) && !mesh->rim_color &&
+           (f & DMS_MAT_ONE_COLOUR) && dc_model_reflects(mesh);
+}
+
+/* The camera's right and up in model space, scaled so a full-length int8
+ * normal gives 0.5: a normal's lookup into the sphere-map environment image */
+static float g_env_right[3], g_env_up[3];
+static float g_half_x, g_half_y, g_half_z;   /* sun_half_set(), below */
+
+static void env_axes(const DCCamera* cam, const float* cols) {
+    shz_xmtrx_init_identity();
+    shz_xmtrx_apply_rotation_y(-cam->yaw);
+    shz_xmtrx_apply_rotation_x(-cam->pitch);
+    shz_vec4_t wr = shz_xmtrx_transform_vec4(shz_vec4_init(-1.0f, 0.0f, 0.0f, 0.0f));
+    shz_vec4_t wu = shz_xmtrx_transform_vec4(shz_vec4_init(0.0f, 1.0f, 0.0f, 0.0f));
+    wr.z = -wr.z;
+    wu.z = -wu.z;
+    const float k = 0.5f / 127.0f;
+    for (int j = 0; j < 3; j++) {
+        g_env_right[j] = (cols[j*3] * wr.x + cols[j*3+1] * wr.y + cols[j*3+2] * wr.z) * k;
+        g_env_up[j]    = (cols[j*3] * wu.x + cols[j*3+1] * wu.y + cols[j*3+2] * wu.z) * k;
+    }
+}
+
+/* The mesh's header with the colour format switched, and the colours: the
+ * mesh's own times the light's (and the tint), the highlight's white, or for
+ * metal its own colour. A highlight needs the 64-byte header, which carries
+ * both; without one the 32-byte header carries the face colour alone. */
+/* ---- Packed vertices ----
+ * A one-colour mesh on a model with no skeleton is kept packed for the sun
+ * loops by hand: one 32-byte read a vertex. x y z u v are where they always
+ * are; the colour, the int8 normal and the flags make way for the normal as
+ * floats. The colour is the mesh's (colour). The normal came from int8, so
+ * as floats their low 16 bits are otherwise 0: the vertex's shine (pad) is
+ * the low byte of nx, and the end of a strip bit 12 of nz. A 0 is stored as
+ * 2^-16, which has those bits free and is still 0 as an int8. Everything
+ * else reads the mesh through mesh_verts(), which unpacks it into a buffer
+ * of its own. */
+typedef struct { float x, y, z, u, v, nx, ny, nz; } DMSPacked;
+#define PACK_END 0x1000u
+
+static DMSVertex*      g_view;
+static uint32_t        g_view_cap;
+static const DMSMesh*  g_view_mesh;
+
+static inline void unpack_vertex(DMSVertex* d, const DMSPacked* s, const DMSMesh* mesh) {
+    DMSPacked p = *s;                   /* d and s may be the same vertex */
+    uint32_t nx, nz;
+    memcpy(&nx, &p.nx, 4);
+    memcpy(&nz, &p.nz, 4);
+    int end = (nz & PACK_END) != 0;
+    uint8_t shine = nx & 0xFFu;
+    nx &= ~0xFFu;
+    nz &= ~PACK_END;
+    memcpy(&p.nx, &nx, 4);
+    memcpy(&p.nz, &nz, 4);
+    d->x = p.x; d->y = p.y; d->z = p.z; d->u = p.u; d->v = p.v;
+    d->argb = mesh->colour;
+    d->nx = (int8_t)p.nx; d->ny = (int8_t)p.ny; d->nz = (int8_t)p.nz;
+    d->pad = shine;
+    d->flags = end ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
+}
+
+/* The mesh's vertices as DMSVertex, packed or not */
+static const DMSVertex* mesh_verts(const DMSMesh* mesh) {
+    if (!mesh->packed) return mesh->vertices;
+    if (g_view_mesh == mesh) return g_view;
+    if (mesh->vertex_count > g_view_cap) {
+        free(g_view);
+        g_view = memalign(32, mesh->vertex_count * sizeof(DMSVertex));
+        g_view_cap = g_view ? mesh->vertex_count : 0;
+        g_view_mesh = NULL;
+        if (!g_view) return mesh->vertices;
+    }
+    const DMSPacked* src = (const DMSPacked*)mesh->vertices;
+    for (uint32_t i = 0; i < mesh->vertex_count; i++)
+        unpack_vertex(&g_view[i], &src[i], mesh);
+    g_view_mesh = mesh;
+    return g_view;
+}
+
+/* The plain loop over a packed mesh, read as it is stored: one colour, the
+ * mesh's, and the end of a strip bit 12 of nz, which moved up 16 is the bit
+ * PVR_CMD_VERTEX_EOL adds. Through mesh_verts() an unlit packed mesh was
+ * unpacked into a buffer every frame and then read again. */
+static void render_fast_packed(const DMSMesh* mesh) {
+    const DMSPacked* src = (const DMSPacked*)mesh->vertices;
+    const int count = (int)mesh->vertex_count;
+    const uint32_t argb = mesh->colour;
+    const float uv_u = g_uv_u, uv_v = g_uv_v;
+    uint32_t sq = pvr_dr_addr;
+
+    SHZ_PREFETCH(&src[0]);
+    SHZ_PREFETCH(&src[1]);
+    SHZ_PREFETCH(&src[2]);
+    SHZ_PREFETCH(&src[3]);
+
+    for (int i = 0; i < count; i++) {
+        SHZ_PREFETCH(&src[i + 4]);
+
+        shz_vec4_t t = shz_xmtrx_transform_vec4(
+            shz_vec4_init(src[i].x, src[i].y, -src[i].z, 1.0f)
+        );
+        const uint32_t nz = ((const uint32_alias*)&src[i])[7];
+        uint32_t flags = PVR_CMD_VERTEX | ((nz & PACK_END) << 16);
+        t = shz_vec4_swizzle(t, 1, 2, 3, 0);
+
+        float inv_w = shz_invf_fsrra(t.w);
+        sq = sq_next(sq);
+        sq_put_argb(sq, flags, t.x * inv_w, t.y * inv_w, inv_w,
+                    src[i].u + uv_u, src[i].v + uv_v, argb);
+    }
+    sq_end(sq);
+}
+
+static uint32_t mesh_colour(const DMSMesh* mesh) {
+    return mesh->packed ? mesh->colour : mesh->vertices[0].argb;
+}
+
+/* Back to DMSVertex for good, before anything changes the vertices */
+void dc_model_mesh_unpack(DMSMesh* mesh) {
+    if (!mesh || !mesh->packed) return;
+    DMSPacked* src = (DMSPacked*)mesh->vertices;
+    for (uint32_t i = 0; i < mesh->vertex_count; i++)
+        unpack_vertex(&mesh->vertices[i], &src[i], mesh);
+    mesh->packed = 0;
+    g_view_mesh = NULL;
+}
+
+/* Packed if it can be: one colour, no skeleton (pad is the bone there), and
+ * plain strip flags */
+static void mesh_pack(DMSMesh* mesh, bool skinned) {
+    if (skinned || mesh->packed || !mesh->vertex_count) return;
+    uint32_t f = mesh->material_flags;
+    if (!(f & DMS_MAT_ONE_COLOUR)) return;
+    /* The reflection pass reads a packed mesh as it is (render_env_packed),
+     * but not a mirror (drawn there alone), textured glass's three passes or
+     * a rim: those would unpack every frame, so are left as they are */
+    if (dc_model_reflects(mesh) &&
+        ((f & DMS_MAT_MIRROR) || mesh->rim_color ||
+         ((f & 0x3) == 2 && mesh->texture_id >= 0))) return;
+    const DMSVertex* v = mesh->vertices;
+    for (uint32_t i = 0; i < mesh->vertex_count; i++)
+        if (v[i].flags != PVR_CMD_VERTEX && v[i].flags != PVR_CMD_VERTEX_EOL) return;
+    mesh->colour = v[0].argb;
+    DMSPacked* dst = (DMSPacked*)mesh->vertices;
+    for (uint32_t i = 0; i < mesh->vertex_count; i++) {
+        DMSVertex s = v[i];
+        DMSPacked p = { s.x, s.y, s.z, s.u, s.v, s.nx, s.ny, s.nz };
+        uint32_t nx, nz;
+        if (p.nx == 0.0f) p.nx = 1.0f / 65536.0f;   /* 0 has no bits to spare */
+        if (p.nz == 0.0f) p.nz = 1.0f / 65536.0f;
+        memcpy(&nx, &p.nx, 4);
+        memcpy(&nz, &p.nz, 4);
+        nx |= s.pad;
+        if (s.flags == PVR_CMD_VERTEX_EOL) nz |= PACK_END;
+        memcpy(&p.nx, &nx, 4);
+        memcpy(&p.nz, &nz, 4);
+        dst[i] = p;
+    }
+    mesh->packed = 1;
+    g_view_mesh = NULL;
+}
+
+/* ================================================================
+ * Render: several lights over a packed mesh
+ *
+ * A light in a place becomes a sun for each mesh: its direction and its fade
+ * are worked out once, from the middle of the mesh, as GTA III did for each
+ * car and person (per mesh here, so a long car's ends each get their own).
+ * Every vertex working out its own distance, square root and fade cost about
+ * 130 cycles a vertex for two lights; over a mesh the direction barely
+ * changes and the result is the same to look at.
+ *
+ * So all four lights are suns by the time the loop sees them, one to a row of
+ * the matrix unit: one ftrv of the normal gives the normal against all four.
+ * With the matrix busy, the position goes to the screen by three fipr. A
+ * light out of range, or not there, is a row of nothing.
+ * ================================================================ */
+
+/* With the sheen the one-light loops give: the sun's highlight as the offset colour, and metal
+ * with no texture showing the environment image as its texture.
+ *
+ * k, in the order the loop reads it:
+ *   the w, x and y rows of mvp (z negated)
+ *   u = (normal, u).(4) + (1), v = (normal, v).(4) + (1): the stored u and v
+ *     plus the scroll, or the environment image's lookup
+ *   if power: the half vector / 2, the sun * 4/127 (the highlight fades in
+ *     over the first quarter past the shadow line), the highlight's colour / 4
+ *   the red, green and blue each light adds (over 16, with the mesh colour
+ *   in), then (ambient - 255) / 2 per colour: the clamp
+ *   to 255 is min(v - 255, 0) + 255, the min being (h - |h|) of h = half of it */
+
+/* LOOP_CONSTS: the numbers a loop needs every vertex go in its k too. The
+ * SH4 has no way to put most of them in an instruction, so the compiler keeps
+ * them in a pool beside the code and reads them from there, through the data
+ * cache. The stack (k, spills) never moves but the code does with every
+ * build, and when a pool shares a cache line's slot with the stack the two
+ * throw each other out every vertex: 1431 -> 1790ns a vertex on the police car
+ * from moving the code alone. In k they sit by the rest and can't.
+ *   2.0f, PACK_END in the command word's place, the vertex command, 255. */
+static inline void loop_consts(float* k) {
+    const uint32_t c[4] = { 0x40000000u /* 2.0f */, PACK_END << 16, PVR_CMD_VERTEX, 255 };
+    memcpy(k, c, sizeof c);
+}
+
+/* Four of k, in order */
+typedef struct { float a, b, c, d; } K4;
+static inline __attribute__((always_inline)) K4 k4(const float** k) {
+    const float* p = *k;
+    K4 r = { p[0], p[1], p[2], p[3] };
+    *k = p + 4;
+    return r;
+}
+
+/* The loop itself, shaped for the SH4 rather than written the obvious way.
+ * The SH4 can't load a float from an offset, so a table read at fixed
+ * places costs an address each, which the compiler works out once, runs out
+ * of registers for and keeps on the stack. So k is walked instead, from the
+ * start each vertex, read through a volatile so the compiler can't work the
+ * addresses out ahead. One fipr per colour, the clamps as sums of absolute
+ * values, and nothing to branch on but the highlight's squaring. shine is a
+ * constant in each copy the compiler makes; power is only how many times to
+ * square. */
+static inline __attribute__((always_inline))
+uint32_t lights_loop(const DMSPacked* src, int count, const float* k0, uint32_t sq,
+                     uint32_t alpha, int power, const bool shine) {
+    /* k in three parts, each from its own start: past 127 bytes from where
+     * it starts, a read's offset won't fit in the instruction and comes from
+     * a pool in the code (see LOOP_CONSTS) */
+    const float* volatile kstart = k0;
+    const float* volatile klight = k0 + 12 + 10;
+    const float* volatile kcolour = k0 + 12 + 10 + (shine ? 11 : 0);
+    for (int i = 0; i < count; i++) {
+        SHZ_PREFETCH(&src[i + 2]);
+        const float* k = kstart;
+        const float* kz = kcolour + 12 + 3;   /* LOOP_CONSTS */
+        const float two = kz[0];
+        const uint32_t end_bit = ((const uint32_alias*)kz)[1];
+        const uint32_t cmd = ((const uint32_alias*)kz)[2];
+        const int c255 = ((const int32_t __attribute__((may_alias))*)kz)[3];
+        const float x = src[i].x, y = src[i].y, z = src[i].z;
+        const float nx = src[i].nx, ny = src[i].ny, nz = src[i].nz;
+        /* the shine and the end of the strip, in the normal's spare bits */
+        const uint32_t nxb = ((const uint32_alias*)&src[i])[5];
+        const uint32_t nzb = ((const uint32_alias*)&src[i])[7];
+
+        /* To the screen */
+        K4 m = k4(&k);
+        float tw = shz_dot8f(m.a, m.b, m.c, m.d, x, y, z, 1.0f);
+        m = k4(&k);
+        float tx = shz_dot8f(m.a, m.b, m.c, m.d, x, y, z, 1.0f);
+        m = k4(&k);
+        float ty = shz_dot8f(m.a, m.b, m.c, m.d, x, y, z, 1.0f);
+        float inv_w = shz_inv_sqrtf_fsrra(tw * tw);
+
+        /* u and v: the stored ones plus the scroll, or the environment image */
+        m = k4(&k);
+        float u = shz_dot8f(nx, ny, nz, src[i].u, m.a, m.b, m.c, m.d);
+        m = k4(&k);
+        float v = shz_dot8f(nx, ny, nz, src[i].v, m.a, m.b, m.c, m.d);
+        u += k[0];
+        v += k[1];
+        k = klight;
+
+        /* The sun's highlight, as the offset colour */
+        uint32_t oargb = 0;
+        if (shine) {
+            m = k4(&k);
+            float ndh = shz_dot8f(nx, ny, nz, 0.0f, m.a, m.b, m.c, 0.0f);
+            m = k4(&k);
+            float q = shz_dot8f(nx, ny, nz, 0.0f, m.a, m.b, m.c, 0.0f);
+            float h = ndh + shz_fabsf(ndh);                       /* max(ndh, 0) */
+#pragma GCC unroll 1
+            for (int p = 0; p < power; p++) h *= h;
+            float o = h * (shz_fabsf(q) - shz_fabsf(q - 1.0f) + 1.0f);   /* 2 x the fade */
+            o = (o + two - shz_fabsf(o - two)) * (float)(nxb & 0xffu);  /* 4 min(, 1) x shine */
+            oargb = alpha | ((uint32_t)(int)(o * k[0]) << 16) |
+                    ((uint32_t)(int)(o * k[1]) << 8) | (uint32_t)(int)(o * k[2]);
+            k += 3;
+        }
+
+        /* The lights: -N.L for all four in one go, then 2 max(N.L, 0) each */
+        shz_vec4_t mv = shz_xmtrx_transform_vec4(shz_vec4_init(nx, ny, nz, 0.0f));
+        const float l0 = shz_fabsf(mv.x) - mv.x, l1 = shz_fabsf(mv.y) - mv.y,
+                    l2 = shz_fabsf(mv.z) - mv.z, l3 = shz_fabsf(mv.w) - mv.w;
+        k = kcolour;
+        m = k4(&k);
+        float r = shz_dot8f(l0, l1, l2, l3, m.a, m.b, m.c, m.d);
+        m = k4(&k);
+        float g = shz_dot8f(l0, l1, l2, l3, m.a, m.b, m.c, m.d);
+        m = k4(&k);
+        float b = shz_dot8f(l0, l1, l2, l3, m.a, m.b, m.c, m.d);
+        r += k[0]; g += k[1]; b += k[2];
+        uint32_t argb = alpha |
+            ((uint32_t)(c255 + (int)(r - shz_fabsf(r))) << 16) |
+            ((uint32_t)(c255 + (int)(g - shz_fabsf(g))) << 8) |
+             (uint32_t)(c255 + (int)(b - shz_fabsf(b)));
+        uint32_t flags = cmd | ((nzb << 16) & end_bit);
+
+        sq = sq_next(sq);
+        sq_put_argb2(sq, flags, tx * inv_w, ty * inv_w, inv_w, u, v, argb, oargb);
+    }
+    return sq;
+}
+
+static uint32_t lights_c(const DMSPacked* src, int count, const float* k, uint32_t sq,
+                         uint32_t alpha, int power) {
+    return power ? lights_loop(src, count, k, sq, alpha, power, true)
+                 : lights_loop(src, count, k, sq, alpha, 0, false);
+}
+
+/* Returns true when it sent a header of its own (a highlight or the image) */
+static bool render_packed_lights(pvr_dr_state_t* dr, const DMSMesh* mesh,
+                                 const shz_mat4x4_t* mvp) {
+    uint32_t c = mesh->colour;
+    const bool sun = g_light.sun;
+    const bool env = sun && !g_add && env_single(mesh);
+    /* The PVR adds an offset colour to textured polygons only. Showing the
+     * environment, the image is its shine: no highlight, as Ninja */
+    int power = sun && !g_add && mesh->header.m0.txr_en ?
+                (int)DMS_MAT_SHINE_POWER(mesh->material_flags) : 0;
+    if (power > 8) power = 8;
+    const bool metal = (mesh->material_flags & DMS_MAT_METALLIC) != 0;
+    /* Metal that shows the image is mostly what it reflects (as the
+     * intensity header has it) */
+    const float dim = metal && g_env && dc_model_reflects(mesh) && !env ? 0.5f : 1.0f;
+    const float cr = (float)((c >> 16) & 0xff) * (1.0f / 256.0f) * dim;
+    const float cg = (float)((c >>  8) & 0xff) * (1.0f / 256.0f) * dim;
+    const float cb = (float)( c        & 0xff) * (1.0f / 256.0f) * dim;
+
+    if (env) ((DMSMesh*)mesh)->env_frame = dc_frame_count() + 1;
+    if (power || env) {
+        alignas(32) uint32_t h[8];
+        if (env)
+            dc_model_compile_header(mesh, (pvr_poly_hdr_t*)h, g_env->pvrformat,
+                                    g_env->width, g_env->height, g_env->ptr);
+        else
+            memcpy(h, &mesh->header, 32);
+        h[0] = (h[0] | dc_clip_cmd) & ~(PVR_TA_CMD_CLRFMT_MASK | PVR_TA_CMD_SPECULAR_MASK);
+        h[0] |= PVR_CLRFMT_ARGBPACKED << PVR_TA_CMD_CLRFMT_SHIFT;
+        if (power) h[0] |= PVR_TA_CMD_SPECULAR_MASK;
+        shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), h);
+    }
+
+    alignas(8) shz_vec4_t row[4];
+    alignas(4) float k[12 + 10 + 11 + 12 + 3 + 4];
+    const float* m = mvp->elem;
+    float* p = k;
+    const float rows[12] = { m[0], m[4], -m[8],  m[12],
+                             m[1], m[5], -m[9],  m[13],
+                             m[2], m[6], -m[10], m[14] };
+    memcpy(p, rows, sizeof rows); p += 12;
+    if (env) {
+        const float uv[10] = { g_env_right[0], g_env_right[1], g_env_right[2], 0.0f,
+                               -g_env_up[0], -g_env_up[1], -g_env_up[2], 0.0f, 0.5f, 0.5f };
+        memcpy(p, uv, sizeof uv);
+    } else {
+        const float uv[10] = { 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, g_uv_u, g_uv_v };
+        memcpy(p, uv, sizeof uv);
+    }
+    p += 10;
+    if (power) {
+        const float to_light = 127.0f / 256.0f / 255.0f;   /* as send_intensity_header */
+        float s = (float)DMS_MAT_SHINE_STRENGTH(mesh->material_flags) * (1.0f / 255.0f);
+        float sr = metal ? (float)((c >> 16) & 0xff) : 255.0f;
+        float sg = metal ? (float)((c >>  8) & 0xff) : 255.0f;
+        float sb = metal ? (float)( c        & 0xff) : 255.0f;
+        float hr = sr * g_ml[0].r * to_light * s, hg = sg * g_ml[0].g * to_light * s,
+              hb = sb * g_ml[0].b * to_light * s;
+        float l = shz_inv_sqrtf(g_ml[0].x * g_ml[0].x + g_ml[0].y * g_ml[0].y +
+                                g_ml[0].z * g_ml[0].z) * (4.0f / 127.0f);
+        const float hl[11] = {
+            g_half_x * 0.5f, g_half_y * 0.5f, g_half_z * 0.5f, 0.0f,
+            g_ml[0].x * l, g_ml[0].y * l, g_ml[0].z * l, 0.0f,
+            (hr > 1.0f ? 1.0f : hr) * 0.25f, (hg > 1.0f ? 1.0f : hg) * 0.25f,
+            (hb > 1.0f ? 1.0f : hb) * 0.25f,
+        };
+        memcpy(p, hl, sizeof hl);
+        p += 11;
+    }
+    /* Each light as a sun (lights_at() has made them so, bar a single light
+     * in a place, done the same way here): a row of -4 fade L (unit), so with
+     * the 127-long normal the loop's 2 max(N.L, 0) comes to 1016 fade cos,
+     * the scale the colours below were set for. */
+    float* kc = p;
+    for (int i = 0; i < 4; i++) {
+        float lx = 0.0f, ly = 0.0f, lz = 0.0f, r = 0.0f, g = 0.0f, b = 0.0f;
+        if (i < g_ml_n) {
+            const ModelLight* ml = &g_ml[i];
+            float fade = 1.0f - ml->inv_range;   /* a sun's, see lights_at() */
+            lx = ml->x; ly = ml->y; lz = ml->z;
+            if (ml->pos_w != 0.0f) {
+                lx -= mesh->bound_cx; ly -= mesh->bound_cy; lz -= mesh->bound_cz;
+            }
+            float d2 = lx * lx + ly * ly + lz * lz;
+            float inv = d2 > 0.0f ? shz_inv_sqrtf(d2) : 0.0f;
+            if (ml->pos_w != 0.0f) {
+                fade = 1.0f - d2 * inv * ml->inv_range;
+                if (fade < 0.0f) fade = 0.0f;
+            }
+            float s = -4.0f * fade * inv;
+            lx *= s; ly *= s; lz *= s;
+            r = ml->r * cr * (1.0f / 16.0f);
+            g = ml->g * cg * (1.0f / 16.0f);
+            b = ml->b * cb * (1.0f / 16.0f);
+        }
+        row[i] = shz_vec4_init(lx, ly, lz, 0.0f);
+        kc[i] = r; kc[4 + i] = g; kc[8 + i] = b;
+    }
+    kc[12] = (g_ml_ambient * g_ml[0].r * cr - 255.0f) * 0.5f;
+    kc[13] = (g_ml_ambient * g_ml[0].g * cg - 255.0f) * 0.5f;
+    kc[14] = (g_ml_ambient * g_ml[0].b * cb - 255.0f) * 0.5f;
+    loop_consts(&kc[15]);
+
+    shz_xmtrx_load_rows_4x4(&row[0], &row[1], &row[2], &row[3]);
+    pvr_dr_addr = lights_c((const DMSPacked*)mesh->vertices, (int)mesh->vertex_count, k,
+                           pvr_dr_addr, c & 0xff000000u, power);
+    return power || env;
+}
+
+static void send_intensity_header(pvr_dr_state_t* dr, const DMSMesh* mesh, bool shine,
+                                  bool env) {
+    alignas(32) uint32_t h[16];
+    if (env)
+        dc_model_compile_header(mesh, (pvr_poly_hdr_t*)h, g_env->pvrformat,
+                                g_env->width, g_env->height, g_env->ptr);
+    else
+        memcpy(h, &mesh->header, 32);
+    h[0] = (h[0] | dc_clip_cmd) & ~(PVR_TA_CMD_CLRFMT_MASK | PVR_TA_CMD_SPECULAR_MASK);
+    h[0] |= PVR_CLRFMT_INTENSITY << PVR_TA_CMD_CLRFMT_SHIFT;
+
+    uint32_t c = mesh_colour(mesh);
+    if (g_tint_on) c = tint_argb(c);
+    const float to_light = 127.0f / 256.0f / 255.0f;   /* undo ModelLight's k, bytes to 0-1 */
+    float lr = g_ml[0].r * to_light, lg = g_ml[0].g * to_light, lb = g_ml[0].b * to_light;
+    float cr = (float)((c >> 16) & 0xff), cg = (float)((c >> 8) & 0xff), cb = (float)(c & 0xff);
+    bool metal = (mesh->material_flags & DMS_MAT_METALLIC) != 0;
+    /* Metal that shows the image is mostly what it reflects */
+    float dim = metal && g_env && dc_model_reflects(mesh) && !env ? 0.5f : 1.0f;
+
+    float* col = (float*)&h[shine ? 8 : 4];
+    col[0] = (float)(c >> 24) * (1.0f / 255.0f);
+    col[1] = cr * lr * dim; col[2] = cg * lg * dim; col[3] = cb * lb * dim;
+    if (shine) {
+        h[0] |= PVR_TA_CMD_SPECULAR_MASK;
+        float s = (float)DMS_MAT_SHINE_STRENGTH(mesh->material_flags) * (1.0f / 255.0f);
+        float sr = metal ? cr : 255.0f, sg = metal ? cg : 255.0f, sb = metal ? cb : 255.0f;
+        col[4] = 1.0f;
+        col[5] = sr * lr * s; col[6] = sg * lg * s; col[7] = sb * lb * s;
+        for (int i = 1; i < 8; i++) if (col[i] > 1.0f) col[i] = 1.0f;
+        shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &h[0]);
+        shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &h[8]);
+    } else {
+        for (int i = 1; i < 4; i++) if (col[i] > 1.0f) col[i] = 1.0f;
+        shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &h[0]);
+    }
+}
+
+/* A light in a place: the direction to it, and to the eye, change across the
+ * mesh. power is how many times the highlight is squared, 1 to 8. */
+static inline __attribute__((always_inline))
+void render_fast_point_impl(const DMSVertex* src, int count, const bool shine, int power) {
+    const ModelLight* ml = &g_ml[0];
+    const float lx = ml->x, ly = ml->y, lz = ml->z, ir = ml->inv_range;
+    const float amb = g_ml_ambient * (1.0f / 127.0f);
+    const float ex = g_rim.x, ey = g_rim.y, ez = g_rim.z;   /* the camera */
+    const float uv_u = g_uv_u, uv_v = g_uv_v;
+    SHZ_PREFETCH(&src[0]);
+    SHZ_PREFETCH(&src[1]);
+    uint32_t sq = pvr_dr_addr;
+
+    for (int i = 0; i < count; i++) {
+        SHZ_PREFETCH(&src[i + 2]);
+        const DMSVertex* s = &src[i];
+
+        shz_vec4_t t = shz_xmtrx_transform_vec4(shz_vec4_init(s->x, s->y, -s->z, 1.0f));
+
+        float nx = s->nx, ny = s->ny, nz = s->nz;
+        float dx = lx - s->x, dy = ly - s->y, dz = lz - s->z;
+        float d2 = dx * dx + dy * dy + dz * dz;
+        float inv = shz_inv_sqrtf_fsrra(d2);
+        float ndl = (nx * dx + ny * dy + nz * dz) * inv * (1.0f / 127.0f);
+        float att = 1.0f - d2 * inv * ir;
+        if (att < 0.0f) att = 0.0f;
+
+        float base = amb, offset = 0.0f;
+        if (ndl > 0.0f) {
+            base += ndl * att;
+            if (shine) {
+                /* Blinn: the normal against halfway between light and eye */
+                float vx = ex - s->x, vy = ey - s->y, vz = ez - s->z;
+                float vinv = shz_inv_sqrtf_fsrra(vx * vx + vy * vy + vz * vz);
+                float hx = dx * inv + vx * vinv, hy = dy * inv + vy * vinv, hz = dz * inv + vz * vinv;
+                float hinv = shz_inv_sqrtf_fsrra(hx * hx + hy * hy + hz * hz);
+                float ndh = (nx * hx + ny * hy + nz * hz) * hinv * (1.0f / 127.0f);
+                if (ndh > 0.0f) {
+                    for (int k = 0; k < power; k++) ndh *= ndh;
+                    float fade = ndl * 4.0f;
+                    offset = (fade < 1.0f ? ndh * fade : ndh) * att *
+                             ((float)s->pad * (1.0f / 255.0f));
+                }
+            }
+        }
+        if (base > 1.0f) base = 1.0f;
+
+        t = shz_vec4_swizzle(t, 1, 2, 3, 0);
+        float inv_w = shz_invf_fsrra(t.w);
+        sq = sq_next(sq);
+        sq_put(sq, s->flags, t.x * inv_w, t.y * inv_w, inv_w, s->u + uv_u, s->v + uv_v, base, offset);
+    }
+    sq_end(sq);
+}
+
+/* The halfway vector of a sun, for one draw: the eye is taken from the
+ * model's centre rather than from each vertex (fixed-function OpenGL's
+ * default, the "infinite viewer"), so it is the same all across the model and
+ * a vertex's highlight is one dot product. The whole model, not each mesh: a
+ * body cut into blocks is several meshes, and a direction each put a step in
+ * the highlight where they meet. Over 1/127, the int8 normal's length. */
+
+static void sun_half_set(shz_vec3_t centre) {
+    float vx = g_rim.x - centre.x, vy = g_rim.y - centre.y, vz = g_rim.z - centre.z;
+    float vinv = shz_inv_sqrtf(vx * vx + vy * vy + vz * vz);
+    float hx = g_ml[0].x + vx * vinv, hy = g_ml[0].y + vy * vinv, hz = g_ml[0].z + vz * vinv;
+    float hinv = shz_inv_sqrtf(hx * hx + hy * hy + hz * hz) * (1.0f / 127.0f);
+    g_half_x = hx * hinv; g_half_y = hy * hinv; g_half_z = hz * hinv;
+}
+
+/* A sun on a mesh that isn't packed (a packed one takes sun_loop, below): the
+ * light is the same direction everywhere, so a vertex is two dot products and
+ * nothing else. power (0 for no highlight) is how many times to square; env
+ * is a constant in each of the two copies. */
+typedef struct {
+    float lx, ly, lz, hx, hy, hz, amb, uv_u, uv_v, rx, ry, rz, ux, uy, uz;
+    float quarter, four, pad_k;
+} SunConsts;
+
+typedef struct {
+    float u, v, base, offset;
+} SunShade;
+
+static inline __attribute__((always_inline))
+SunShade sun_shade(const DMSVertex* s, const SunConsts* c, const int power, const bool env) {
+    SunShade o;
+    float nx = s->nx, ny = s->ny, nz = s->nz;
+    float ndl = nx * c->lx + ny * c->ly + nz * c->lz;
+    o.u = s->u + c->uv_u;
+    o.v = s->v + c->uv_v;
+    if (env) {
+        o.u = 0.5f + (nx * c->rx + ny * c->ry + nz * c->rz);
+        o.v = 0.5f - (nx * c->ux + ny * c->uy + nz * c->uz);
+    }
+    o.base = c->amb;
+    o.offset = 0.0f;
+    if (ndl > 0.0f) {
+        o.base += ndl;
+        if (power) {
+            float ndh = nx * c->hx + ny * c->hy + nz * c->hz;
+            if (ndh > 0.0f) {
+                for (int p = 0; p < power; p++) ndh *= ndh;
+                /* Faded in over the first stretch past the shadow line,
+                 * so it does not stop dead at the vertex that crosses it.
+                 * pad is how much of the mesh's shine this vertex has. */
+                if (ndl < c->quarter) ndh *= ndl * c->four;
+                o.offset = ndh * ((float)s->pad * c->pad_k);
+            }
+        }
+    }
+    if (o.base > 1.0f) o.base = 1.0f;
+    return o;
+}
+
+static inline __attribute__((always_inline))
+void render_fast_sun_impl(const DMSVertex* src, int count, int power, const bool env) {
+    if (count < 1) return;
+    const float k = 1.0f / 127.0f;
+    const SunConsts c = {
+        g_ml[0].x * k, g_ml[0].y * k, g_ml[0].z * k,
+        g_half_x, g_half_y, g_half_z,
+        g_ml_ambient * k, g_uv_u, g_uv_v,
+        g_env_right[0], g_env_right[1], g_env_right[2],
+        g_env_up[0], g_env_up[1], g_env_up[2],
+        0.25f, 4.0f, 1.0f / 255.0f,
+    };
+    SHZ_PREFETCH(&src[0]);
+    SHZ_PREFETCH(&src[1]);
+    SHZ_PREFETCH(&src[2]);
+    SHZ_PREFETCH(&src[3]);
+
+    uint32_t sq = pvr_dr_addr;
+    for (int i = 0; i < count; i++) {
+        SHZ_PREFETCH(&src[i + 2]);
+        const DMSVertex* s = &src[i];
+        shz_vec4_t t = shz_xmtrx_transform_vec4(shz_vec4_init(s->x, s->y, -s->z, 1.0f));
+        SunShade o = sun_shade(s, &c, power, env);
+        /* The projection leaves w in the first lane (see render_fast_impl's swizzle) */
+        float inv_w = shz_invf_fsrra(t.x);
+        sq = sq_next(sq);
+        sq_put(sq, s->flags, t.y * inv_w, t.z * inv_w, inv_w, o.u, o.v, o.base, o.offset);
+    }
+    sq_end(sq);
+}
+
+static __attribute__((noinline)) void render_fast_sun(const DMSVertex* src, int count,
+                                                      int power, bool env) {
+    if (env) render_fast_sun_impl(src, count, power, true);
+    else     render_fast_sun_impl(src, count, power, false);
+}
+
+static __attribute__((noinline)) void render_fast_point(const DMSVertex* src, int count, int power) {
+    if (power) render_fast_point_impl(src, count, true, power);
+    else       render_fast_point_impl(src, count, false, 0);
+}
+
+/* The sun over a packed mesh: one light the same direction everywhere, so a
+ * vertex is a transform and two or three dot products. The constants are
+ * read into locals once, and the dot products written out rather than
+ * fipr's: its operands are fixed registers the transform wants too, which
+ * cost moves and spills. shine and env are constants in each copy the
+ * compiler makes, and power too, so its squares are written out.
+ *   k: light/2 (xyz 0), half vector (xyz 0, see below), (1-amb)/2,
+ *      (1-amb)/2 + amb, 1/8, then with env the camera's right and 0.5 (u)
+ *      and its up negated and 0.5 (v), without it the scroll (u, v), then
+ *      at 19 LOOP_CONSTS.
+ * The base is amb + clamp(N.L, 0, 1-amb): with d = N.L/2 and h = (1-amb)/2
+ * that is h + amb + |d| - |d - h|. The fade, 2 clamp(d, 0, 1/8), is
+ * |d| + 1/8 - |d - 1/8|. */
+static inline __attribute__((always_inline))
+void sun_shade_packed(float d, float hd, uint32_t nxb, float h, float h_amb, float eighth,
+               const int power, const bool shine, float* base, float* offset) {
+    *base = h_amb + shz_fabsf(d) - shz_fabsf(d - h);
+    *offset = 0.0f;
+    if (shine) {
+        float o = hd + shz_fabsf(hd);                          /* 2 max(hd, 0) */
+#pragma GCC unroll 8
+        for (int p = 0; p < power; p++) o *= o;
+        float fade = shz_fabsf(d) + eighth - shz_fabsf(d - eighth);
+        *offset = o * fade * (float)(nxb & 0xffu);
+    }
+}
+
+static inline __attribute__((always_inline))
+uint32_t sun_loop(const DMSPacked* src, int count, const float* k, uint32_t sq,
+                  const int power, const bool shine) {
+    const float lx = k[0], ly = k[1], lz = k[2];
+    const float hx = k[4], hy = k[5], hz = k[6];
+    const float h = k[8], h_amb = k[9], eighth = k[10];
+    const float su = k[11], sv = k[12];
+    const uint32_t end_bit = ((const uint32_alias*)k)[19 + 1];   /* LOOP_CONSTS */
+    const uint32_t cmd = ((const uint32_alias*)k)[19 + 2];
+    for (const DMSPacked* s = src; s < src + count; s++) {
+        SHZ_PREFETCH(s + 3);
+        const float nx = s->nx, ny = s->ny, nz = s->nz;
+        /* the shine and the end of the strip, in the normal's spare bits */
+        const uint32_alias* w = (const uint32_alias*)s;
+        __asm__("" : "+r"(w));   /* read as words apart from the floats, not moved over */
+        const uint32_t nxb = w[5];
+        const uint32_t nzb = w[7];
+
+        /* The projection leaves w in the first lane */
+        shz_vec4_t t = shz_xmtrx_transform_vec4(shz_vec4_init(s->x, s->y, s->z, 1.0f));
+        float inv_w = shz_inv_sqrtf_fsrra(t.x * t.x);
+
+        float base, offset;
+        sun_shade_packed(nx * lx + ny * ly + nz * lz, nx * hx + ny * hy + nz * hz, nxb,
+                  h, h_amb, eighth, power, shine, &base, &offset);
+        uint32_t flags = cmd | ((nzb << 16) & end_bit);
+
+        sq = sq_next(sq);
+        sq_put(sq, flags, t.y * inv_w, t.z * inv_w, inv_w, s->u + su, s->v + sv, base, offset);
+    }
+    return sq;
+}
+
+/* The same with the environment image as the texture (env_single). Its
+ * normal has four dot products (the sun, the half vector, the image's u and
+ * v), more constants than the float registers hold beside the transform. As
+ * Ninja does, the matrix unit does them: a run of vertices has its normals
+ * put through a matrix of the four, and what they give kept, then its
+ * positions through the projection. */
+#define ENV_RUN 64
+static inline __attribute__((always_inline))
+uint32_t sun_env_loop(const DMSPacked* src, int count, const float* k, uint32_t sq,
+                      const int power, const bool shine) {
+    alignas(32) float lit[ENV_RUN * 4];
+    shz_mat4x4_t proj;
+    shz_xmtrx_store_4x4(&proj);
+    const shz_vec4_t rl = shz_vec4_init(k[0], k[1], k[2], 0.0f);
+    const shz_vec4_t rh = shz_vec4_init(k[4], k[5], k[6], 0.0f);
+    const shz_vec4_t ru = shz_vec4_init(k[11], k[12], k[13], k[14]);
+    const shz_vec4_t rv = shz_vec4_init(k[15], k[16], k[17], k[18]);
+    const float h = k[8], h_amb = k[9], eighth = k[10];
+    const uint32_t end_bit = ((const uint32_alias*)k)[19 + 1];   /* LOOP_CONSTS */
+    const uint32_t cmd = ((const uint32_alias*)k)[19 + 2];
+    for (int done = 0; done < count; done += ENV_RUN) {
+        const DMSPacked* run = src + done;
+        const int n = count - done < ENV_RUN ? count - done : ENV_RUN;
+
+        shz_xmtrx_load_rows_4x4(&rl, &rh, &ru, &rv);
+        float* o = lit;
+        for (const DMSPacked* s = run; s < run + n; s++, o += 4) {
+            SHZ_PREFETCH(s + 3);
+            const uint32_alias* w = (const uint32_alias*)s;
+            __asm__("" : "+r"(w));
+            shz_vec4_t r = shz_xmtrx_transform_vec4(shz_vec4_init(s->nx, s->ny, s->nz, 1.0f));
+            sun_shade_packed(r.x, r.y, w[5], h, h_amb, eighth, power, shine, &o[2], &o[3]);
+            o[0] = r.z;
+            o[1] = r.w;
+        }
+
+        shz_xmtrx_load_4x4(&proj);
+        o = lit;
+        for (const DMSPacked* s = run; s < run + n; s++, o += 4) {
+            const uint32_alias* w = (const uint32_alias*)s;
+            __asm__("" : "+r"(w));
+            shz_vec4_t t = shz_xmtrx_transform_vec4(shz_vec4_init(s->x, s->y, s->z, 1.0f));
+            float inv_w = shz_inv_sqrtf_fsrra(t.x * t.x);
+            uint32_t flags = cmd | ((w[7] << 16) & end_bit);
+            sq = sq_next(sq);
+            sq_put(sq, flags, t.y * inv_w, t.z * inv_w, inv_w, o[0], o[1], o[2], o[3]);
+        }
+    }
+    return sq;
+}
+
+static __attribute__((noinline)) uint32_t sun_c(const DMSPacked* src, int count, const float* k, uint32_t sq,
+                      int power, bool env) {
+    /* A copy for each power, its squares written out */
+#define SUN_POWERS(loop)                                                  \
+    switch (power) {                                                      \
+    case 0: return loop(src, count, k, sq, 0, false);                     \
+    case 1: return loop(src, count, k, sq, 1, true);                      \
+    case 2: return loop(src, count, k, sq, 2, true);                      \
+    case 3: return loop(src, count, k, sq, 3, true);                      \
+    case 4: return loop(src, count, k, sq, 4, true);                      \
+    case 5: return loop(src, count, k, sq, 5, true);                      \
+    case 6: return loop(src, count, k, sq, 6, true);                      \
+    case 7: return loop(src, count, k, sq, 7, true);                      \
+    default: return loop(src, count, k, sq, 8, true);                     \
+    }
+    if (env) SUN_POWERS(sun_env_loop)
+    SUN_POWERS(sun_loop)
+#undef SUN_POWERS
+}
+
+static void render_fast_sun_packed(const DMSMesh* mesh, int power, bool env) {
+    float amb = g_ml_ambient * (1.0f / 127.0f);
+    if (amb > 1.0f) amb = 1.0f;
+    float h = (1.0f - amb) * 0.5f;
+    const float l = 0.5f / 127.0f;
+    /* The highlight is multiplied by the vertex's shine as it is stored,
+     * 0-255; the 4/255 that makes it the fade's 4 times 0-1 goes on the half
+     * vector instead, as its 2^power-th root, since the highlight is the half
+     * vector's dot to that power. */
+    static float root[9];
+    if (!root[1])
+        for (int p = 1; p <= 8; p++) root[p] = powf(4.0f / 255.0f, 1.0f / (float)(1 << p));
+    const float hs = power ? 0.5f * root[power] : 0.5f;
+    alignas(8) float k[19 + 4] = {
+        g_ml[0].x * l, g_ml[0].y * l, g_ml[0].z * l, 0.0f,
+        g_half_x * hs, g_half_y * hs, g_half_z * hs, 0.0f,
+        h, h + amb, 0.125f,
+        g_env_right[0], g_env_right[1], g_env_right[2], 0.5f,
+        -g_env_up[0], -g_env_up[1], -g_env_up[2], 0.5f,
+    };
+    if (!env) { k[11] = g_uv_u; k[12] = g_uv_v; }
+    loop_consts(&k[19]);
+    /* The loop takes z as it is; the unpacked ones negate it going in */
+    shz_xmtrx_apply_scale(1.0f, 1.0f, -1.0f);
+    uint64_t t0 = perf_cntr_timer_ns();
+    pvr_dr_addr = sun_c((const DMSPacked*)mesh->vertices, (int)mesh->vertex_count, k,
+                        pvr_dr_addr, power, env);
+    int b = env ? 2 : power ? 1 : 0;
+    g_stats.ns_sun[b] += perf_cntr_timer_ns() - t0;
+    g_stats.verts_sun[b] += mesh->vertex_count;
+    g_stats.sun_power_v += power * mesh->vertex_count;
+}
+
+/* Debug: the sun loop's parts, each over all the model's packed meshes into
+ * a RAM buffer (the TA never sees it). The data is bigger than the cache, so
+ * every pass reads it cold as a frame does. */
+void dc_model_bench_sun(const DMSModel* model) {
+    static uint32_t fake[32] __attribute__((aligned(64)));
+    static volatile float sink;
+    uint64_t ns[6] = {0};
+    uint32_t verts = 0, pv = 0, hist[9] = {0};
+    alignas(8) float k[19 + 4] = {
+        0.002f, -0.003f, 0.001f, 0.0f,  0.3f, 0.4f, 0.5f, 0.0f,
+        0.3f, 0.65f, 0.125f,  0.001f, 0.002f, 0.003f, 0.5f,  0.003f, 0.002f, 0.001f, 0.5f,
+    };
+    loop_consts(&k[19]);
+    for (int pass = 0; pass < 2; pass++) {
+        for (uint32_t m = 0; m < model->mesh_count; m++) {
+            const DMSMesh* mesh = &model->meshes[m];
+            if (!mesh->packed || !mesh->vertex_count) continue;
+            const DMSPacked* src = (const DMSPacked*)mesh->vertices;
+            int count = (int)mesh->vertex_count;
+            int power = mesh->header.m0.txr_en ? (int)DMS_MAT_SHINE_POWER(mesh->material_flags) : 0;
+            if (power > 8) power = 8;
+            if (pass) { verts += count; pv += power * count; hist[power] += count; }
+            shz_xmtrx_init_identity();
+            shz_xmtrx_apply_scale(0.5f, 0.5f, -0.5f);
+            uint64_t t;
+
+            /* read: the vertex data alone */
+            t = perf_cntr_timer_ns();
+            float acc = 0.0f;
+            SHZ_PREFETCH(&src[0]); SHZ_PREFETCH(&src[1]); SHZ_PREFETCH(&src[2]);
+            for (int i = 0; i < count; i++) {
+                SHZ_PREFETCH(&src[i + 3]);
+                acc += src[i].x + src[i].nx;
+            }
+            sink = acc;
+            (void)sink;
+            if (pass) ns[0] += perf_cntr_timer_ns() - t;
+
+            /* read + store: the vertex copied out as it is, no maths */
+            t = perf_cntr_timer_ns();
+            uint32_t sq = (uint32_t)fake;
+            for (int i = 0; i < count; i++) {
+                SHZ_PREFETCH(&src[i + 4]);
+                const uint32_t nz = ((const uint32_alias*)&src[i])[7];
+                sq = sq_next(sq);
+                sq_put_argb(sq, PVR_CMD_VERTEX | ((nz & PACK_END) << 16), src[i].x,
+                            src[i].y, src[i].z, src[i].u, src[i].v, 0xffffffffu);
+            }
+            if (pass) ns[1] += perf_cntr_timer_ns() - t;
+
+            /* transform + store: the plain packed loop */
+            t = perf_cntr_timer_ns();
+            sq = (uint32_t)fake;
+            for (int i = 0; i < count; i++) {
+                SHZ_PREFETCH(&src[i + 4]);
+                shz_vec4_t v = shz_xmtrx_transform_vec4(
+                    shz_vec4_init(src[i].x, src[i].y, -src[i].z, 1.0f));
+                const uint32_t nz = ((const uint32_alias*)&src[i])[7];
+                v = shz_vec4_swizzle(v, 1, 2, 3, 0);
+                float inv_w = shz_invf_fsrra(v.w);
+                sq = sq_next(sq);
+                sq_put_argb(sq, PVR_CMD_VERTEX | ((nz & PACK_END) << 16), v.x * inv_w,
+                            v.y * inv_w, inv_w, src[i].u, src[i].v, 0xffffffffu);
+            }
+            if (pass) ns[2] += perf_cntr_timer_ns() - t;
+
+            /* the sun, no highlight */
+            t = perf_cntr_timer_ns();
+            sun_c(src, count, k, (uint32_t)fake, 0, false);
+            if (pass) ns[3] += perf_cntr_timer_ns() - t;
+
+            /* the sun as the mesh has it */
+            t = perf_cntr_timer_ns();
+            sun_c(src, count, k, (uint32_t)fake, power, false);
+            if (pass) ns[4] += perf_cntr_timer_ns() - t;
+
+            /* the sun with the environment image, as the mesh has it */
+            t = perf_cntr_timer_ns();
+            sun_c(src, count, k, (uint32_t)fake, power, true);
+            if (pass) ns[5] += perf_cntr_timer_ns() - t;
+        }
+    }
+    if (!verts) { printf("BENCH: no packed meshes\n"); return; }
+    float v = (float)verts;
+    printf("BENCH: %lu packed v, avg power %.2f  ns a vertex (into RAM): read %.0f  "
+           "read+store %.0f  transform+store %.0f  sun %.0f  sun+highlight %.0f  env %.0f\n",
+           (unsigned long)verts, (float)pv / v, ns[0] / v, ns[1] / v, ns[2] / v,
+           ns[3] / v, ns[4] / v, ns[5] / v);
+    printf("BENCH: power:");
+    for (int p = 0; p <= 8; p++) if (hist[p]) printf("  %d: %lu v", p, (unsigned long)hist[p]);
+    printf("\n");
+}
+
+/* One mesh in the intensity mode, the header sent with it. The header's copy
+ * uses the matrix registers, so mvp is loaded after it. */
+static void render_fast_intensity(pvr_dr_state_t* dr, const DMSMesh* mesh,
+                                  const shz_mat4x4_t* mvp) {
+    bool env = env_single(mesh);
+    if (env && g_ml[0].pos_w == 0.0f) ((DMSMesh*)mesh)->env_frame = dc_frame_count() + 1;
+    /* The PVR adds an offset colour to textured polygons only. Showing the
+     * environment, the image is its shine: no highlight, as Ninja */
+    int power = mesh->header.m0.txr_en ? (int)DMS_MAT_SHINE_POWER(mesh->material_flags) : 0;
+    if (power > 8) power = 8;
+    send_intensity_header(dr, mesh, power != 0, env);
+    shz_xmtrx_load_4x4(mvp);
+    if (g_ml[0].pos_w == 0.0f && mesh->packed) {
+        if (mesh->vertex_count > 0) render_fast_sun_packed(mesh, power, env);
+    } else if (g_ml[0].pos_w == 0.0f) {
+        render_fast_sun(mesh_verts(mesh), mesh->vertex_count, power, env);
+    } else {
+        render_fast_point(mesh_verts(mesh), mesh->vertex_count, power);
+    }
 }
 
 /* The same, in black. It is how the bloom pass stops a lamp shining through
@@ -808,106 +1848,76 @@ static inline void light_to_bone(const shz_mat4x4_t* skin) {
     }
 }
 
-static void render_skinned(const DMSVertex* src, int count,
-                           const DMSSkeleton* sk,
-                           const shz_mat4x4_t* mvp,
-                           pvr_dr_state_t* dr) {
-    if (count < 1 || !sk) return;
+enum { SKIN_PLAIN, SKIN_TINT, SKIN_LIT };
 
-    int last_bone = -1;
+/* A vertex's bone differs from the last one's: its skin matrix goes in */
+static inline __attribute__((always_inline))
+void skin_bone(const DMSSkeleton* sk, int bone_id, const shz_mat4x4_t* mvp, const int mode) {
+    if (mode == SKIN_LIT) light_to_bone(&sk->bones[bone_id].skinMatrix);
+    shz_xmtrx_load_apply_4x4(mvp, &sk->bones[bone_id].skinMatrix);
+    g_stats.skin_bone_loads++;
+}
+
+/* One loop, built three times by render_skinned with the mode fixed: with
+ * shade() in the same loop GCC kept every value on the stack even unlit. Each
+ * vertex is sent in the loop pass that transforms it: a bone change loads a
+ * matrix, which takes every FP register, so a vertex carried over to the next
+ * pass lived on the stack. */
+static inline __attribute__((always_inline))
+void skin_loop(const DMSVertex* src, int count, const DMSSkeleton* sk,
+               const shz_mat4x4_t* mvp, const int mode) {
+    uint32_t sq = pvr_dr_addr;
 
     SHZ_PREFETCH(&src[0]);
     SHZ_PREFETCH(&src[1]);
     SHZ_PREFETCH(&src[2]);
     SHZ_PREFETCH(&src[3]);
 
-    const int lit = g_lit;
-
-    /* Prime: load bone matrix for vertex 0 */
-    {
-        uint8_t bone_id = src[0].pad;
-        if (bone_id != last_bone) {
-            if (lit) light_to_bone(&sk->bones[bone_id].skinMatrix);
-            shz_xmtrx_load_apply_4x4(mvp, &sk->bones[bone_id].skinMatrix);
-            last_bone = bone_id;
-        }
-    }
-
-    /* No -z: Z negation is baked into MVP scale */
-    shz_vec4_t t0 = shz_xmtrx_transform_vec4(
-        shz_vec4_init(src[0].x, src[0].y, src[0].z, 1.0f)
-    );
-    t0 = shz_vec4_swizzle(t0, 1, 2, 3, 0);
-
-    float    cur_invw  = shz_invf_fsrra(t0.w);
-    float    cur_sx    = t0.x * cur_invw;
-    float    cur_sy    = t0.y * cur_invw;
-    uint32_t cur_flags = src[0].flags;
     const float uv_u = g_uv_u, uv_v = g_uv_v;
-    float    cur_u     = src[0].u + uv_u;
-    float    cur_v     = src[0].v + uv_v;
+    int last_bone = -1;
     /* Tinted, a colour is worked out once and reused while it repeats, which
      * on a skinned model is most of the time. Lit, every vertex is its own. */
-    const int tint     = g_tint_on && !lit;
-    uint32_t raw_prev  = src[0].argb;
-    uint32_t cur_argb  = lit ? shade(&src[0]) : tint ? tint_argb(raw_prev) : raw_prev;
+    uint32_t raw_prev = 0, tint_prev = 0;
+    if (mode == SKIN_TINT) { raw_prev = src[0].argb; tint_prev = tint_argb(raw_prev); }
 
-    for (int i = 1; i < count; i++) {
+    for (int i = 0; i < count; i++) {
         SHZ_PREFETCH(&src[i + 4]);
 
-        uint8_t bone_id = src[i].pad;
-
+        int bone_id = src[i].pad;
         if (bone_id != last_bone) {
-            if (lit) light_to_bone(&sk->bones[bone_id].skinMatrix);
-            shz_xmtrx_load_apply_4x4(mvp, &sk->bones[bone_id].skinMatrix);
+            skin_bone(sk, bone_id, mvp, mode);
             last_bone = bone_id;
         }
 
-        float    nx     = src[i].x;
-        float    ny     = src[i].y;
-        float    nz     = src[i].z;  /* no negation — baked into MVP */
-        uint32_t nflags = src[i].flags;
-        float    nu     = src[i].u + uv_u;
-        float    nv     = src[i].v + uv_v;
-        uint32_t nargb  = src[i].argb;
-        if (lit) nargb = shade(&src[i]);
-        else if (tint) nargb = nargb == raw_prev ? cur_argb : (raw_prev = nargb, tint_argb(nargb));
-
-        shz_vec4_t next_t = shz_xmtrx_transform_vec4(
-            shz_vec4_init(nx, ny, nz, 1.0f)
+        /* No -z: Z negation is baked into MVP scale */
+        shz_vec4_t t = shz_xmtrx_transform_vec4(
+            shz_vec4_init(src[i].x, src[i].y, src[i].z, 1.0f)
         );
+        uint32_t argb = src[i].argb;
+        if (mode == SKIN_LIT) argb = shade(&src[i]);
+        else if (mode == SKIN_TINT) {
+            if (argb != raw_prev) { raw_prev = argb; tint_prev = tint_argb(argb); }
+            argb = tint_prev;
+        }
+        t = shz_vec4_swizzle(t, 1, 2, 3, 0);
 
-        /* Submit previous vertex while next_t result settles */
-        pvr_vertex_t* pv = dr_vertex();
-        pv->flags = cur_flags;
-        pv->x     = cur_sx;
-        pv->y     = cur_sy;
-        pv->z     = cur_invw;
-        pv->u     = cur_u;
-        pv->v     = cur_v;
-        pv->argb  = cur_argb;
-        dr_send(pv);
-
-        next_t = shz_vec4_swizzle(next_t, 1, 2, 3, 0);
-        cur_invw  = shz_invf_fsrra(next_t.w);
-        cur_sx    = next_t.x * cur_invw;
-        cur_sy    = next_t.y * cur_invw;
-        cur_flags = nflags;
-        cur_u     = nu;
-        cur_v     = nv;
-        cur_argb  = nargb;
+        float inv_w = shz_invf_fsrra(t.w);
+        sq = sq_next(sq);
+        sq_put_argb(sq, src[i].flags, t.x * inv_w, t.y * inv_w, inv_w,
+                    src[i].u + uv_u, src[i].v + uv_v, argb);
     }
+    sq_end(sq);
+}
 
-    /* Flush last vertex */
-    pvr_vertex_t* pv = dr_vertex();
-    pv->flags = cur_flags;
-    pv->x     = cur_sx;
-    pv->y     = cur_sy;
-    pv->z     = cur_invw;
-    pv->u     = cur_u;
-    pv->v     = cur_v;
-    pv->argb  = cur_argb;
-    dr_send(pv);
+static void render_skinned(const DMSVertex* src, int count,
+                           const DMSSkeleton* sk,
+                           const shz_mat4x4_t* mvp,
+                           pvr_dr_state_t* dr) {
+    (void)dr;
+    if (count < 1 || !sk) return;
+    if (g_lit)          skin_loop(src, count, sk, mvp, SKIN_LIT);
+    else if (g_tint_on) skin_loop(src, count, sk, mvp, SKIN_TINT);
+    else                skin_loop(src, count, sk, mvp, SKIN_PLAIN);
 }
 
 /* ================================================================
@@ -917,8 +1927,6 @@ static void render_skinned(const DMSVertex* src, int count,
 /* Additive drawing (dc_draw_ex .add): every mesh goes in the transparent list
  * and is added to what is behind it, so black adds nothing. The mesh header
  * is sent with its list, blend and depth write changed. */
-static bool g_add;
-
 void dc_model_set_add(bool add) {
     g_add = add;
 }
@@ -986,6 +1994,7 @@ static int draw_skinned_mesh(DMSMesh* mesh, DMSModel* model,
                       0.0f, stretch.y, 0.0f,
                       -sc.sin * stretch.z, 0.0f, sc.cos * stretch.z };
     light_to_model(pos, scale, cols);
+    lights_at(mesh->bound_cx, mesh->bound_cy, mesh->bound_cz);
     if (g_glow_only) g_lit = 0;
     g_rim_on = 0;
 
@@ -1000,7 +2009,10 @@ static int draw_skinned_mesh(DMSMesh* mesh, DMSModel* model,
 
     g_stats.verts_xformed += mesh->vertex_count;
     uv_scroll_set(mesh);
+    uint64_t t0 = perf_cntr_timer_ns();
     render_skinned(mesh->vertices, mesh->vertex_count, model->skeleton, &mvp, dr);
+    g_stats.ns_skin += perf_cntr_timer_ns() - t0;
+    g_stats.verts_skin += mesh->vertex_count;
     return 1;
 }
 
@@ -1028,7 +2040,6 @@ static inline int sphere_visible(const WorldFrustum* fr, shz_vec3_t c, float r, 
 
 /* The environment image (dc_set_environment), NULL for none. Mirrors are
  * left out of the normal draw while it is set: draw_reflections draws them. */
-static const dttex_info_t* g_env;
 
 /* The bloom pass (dc_set_bloom): only meshes that give off light are drawn,
  * so what lands in the small picture is the glow and nothing else.
@@ -1074,6 +2085,8 @@ static void draw_blocks_list(DMSModel* model, shz_vec3_t pos, float scale,
     float yaw_cols[9] = { sc.cos, 0.0f, sc.sin,  0.0f, 1.0f, 0.0f,  -sc.sin, 0.0f, sc.cos };
     light_to_model(pos, scale, rot ? rot : yaw_cols);
     cam_to_model(pos, scale, rot ? rot : yaw_cols, cam);
+    if (g_lit) sun_half_set(shz_vec3_scale(shz_vec3_add(model->bound_min, model->bound_max), 0.5f));
+    if (g_lit && g_env && model->metallic_count) env_axes(cam, rot ? rot : yaw_cols);
     /* The glow pass draws what a mesh gives off, which a light cannot change */
     if (g_glow_only) g_lit = 0;
     /* Cel shaded solid meshes go out with their baked colours; draw_cel lays
@@ -1143,6 +2156,7 @@ static void draw_blocks_list(DMSModel* model, shz_vec3_t pos, float scale,
                 shz_xmtrx_load_4x4((shz_mat4x4_t*)&fr->side_planes);
                 xm = XM_PLANES;
             }
+            uint64_t tc0 = perf_cntr_timer_ns();
             for (; m < run_end && n < DRAW_BATCH; m++) {
                 const DMSMesh* mesh = &model->meshes[m];
                 if (mesh->material_flags & skip) continue;
@@ -1160,6 +2174,8 @@ static void draw_blocks_list(DMSModel* model, shz_vec3_t pos, float scale,
                 batch[n++] = m | (clip ? 0x80000000u : 0);
             }
 
+            g_stats.ns_cull += perf_cntr_timer_ns() - tc0;
+
             /* Draw the survivors */
             for (int i = 0; i < n; i++) {
                 DMSMesh* mesh = &model->meshes[batch[i] & 0x7fffffffu];
@@ -1174,30 +2190,71 @@ static void draw_blocks_list(DMSModel* model, shz_vec3_t pos, float scale,
                 g_stats.meshes_drawn++;
                 g_stats.tris_drawn += mesh->tri_count;
 
+                /* In the glow pass everything that is not a lamp is still
+                 * drawn, in black, so it blocks what is behind it */
+                g_flat = g_glow_only && !(mesh->material_flags & DMS_MAT_GLOW);
+                rim_set(mesh);
+                lights_at(mesh->bound_cx, mesh->bound_cy, mesh->bound_cz);
+                uv_scroll_set(mesh);
+                bool clipped = (batch[i] & 0x80000000u) != 0;
+                uint64_t t0 = perf_cntr_timer_ns();
+                if (!clipped && intensity_ok(mesh)) {
+                    uint64_t c0 = perf_cntr_count(PRFC1);
+                    render_fast_intensity(dr, mesh, &mvp);   /* sends its own header, */
+                    if (env_single(mesh)) {
+                        g_stats.ns_env += perf_cntr_timer_ns() - t0;
+                        g_stats.stall_env += perf_cntr_count(PRFC1) - c0;
+                        g_stats.verts_env += mesh->vertex_count;
+                    } else {
+                        g_stats.ns_lit += perf_cntr_timer_ns() - t0;
+                        g_stats.stall_lit += perf_cntr_count(PRFC1) - c0;
+                        g_stats.verts_lit += mesh->vertex_count;
+                    }
+                    last_hdr = NULL;                         /* so the next mesh does too */
+                    xm = XM_MVP;
+                    g_stats.verts_xformed += mesh->vertex_count;
+                    continue;
+                }
+
+                uint64_t th0 = perf_cntr_timer_ns();
                 if (!last_hdr || memcmp(last_hdr, &mesh->header, sizeof(pvr_poly_hdr_t))) {
                     send_header(dr, mesh);
                     last_hdr = &mesh->header;
                     xm = XM_OTHER;
+                    g_stats.hdrs_sent++;
                 }
 
                 if (xm != XM_MVP) {
                     shz_xmtrx_load_4x4(&mvp);
                     xm = XM_MVP;
                 }
-                /* In the glow pass everything that is not a lamp is still
-                 * drawn, in black, so it blocks what is behind it */
-                g_flat = g_glow_only && !(mesh->material_flags & DMS_MAT_GLOW);
-                rim_set(mesh);
-                uv_scroll_set(mesh);
+                g_stats.ns_hdr += perf_cntr_timer_ns() - th0;
                 int shaded = g_lit || g_rim_on || g_tint_on;
-                if (batch[i] & 0x80000000u) {
+                if (clipped) {
                     g_stats.verts_clipped += mesh->vertex_count;
-                    render_clipped(mesh->vertices, mesh->vertex_count, dr, shaded);
+                    render_clipped(mesh_verts(mesh), mesh->vertex_count, dr, shaded);
+                    g_stats.ns_clip += perf_cntr_timer_ns() - t0;
                 } else {
                     g_stats.verts_xformed += mesh->vertex_count;
-                    if (g_flat)      render_fast_flat(mesh->vertices, mesh->vertex_count, dr);
-                    else if (shaded) (g_uv_on ? render_fast_lit_uv : render_fast_lit)(mesh->vertices, mesh->vertex_count, dr);
-                    else             (g_uv_on ? render_fast_uv : render_fast)(mesh->vertices, mesh->vertex_count, dr);
+                    if (g_flat)      render_fast_flat(mesh_verts(mesh), mesh->vertex_count, dr);
+                    else if (g_lit && mesh->packed && !g_rim_on && !g_tint_on) {
+                        uint64_t t1 = perf_cntr_timer_ns();
+                        uint64_t c1 = perf_cntr_count(PRFC1);
+                        if (render_packed_lights(dr, mesh, &mvp))
+                            last_hdr = NULL;   /* sent its own: the next mesh sends again */
+                        uint64_t dt = perf_cntr_timer_ns() - t1;
+                        g_stats.ns_lights += dt;
+                        g_stats.stall_lights += perf_cntr_count(PRFC1) - c1;
+                        g_stats.verts_lights += mesh->vertex_count;
+                        g_stats.ns_plain -= dt;          /* plain keeps the rest: header, setup */
+                        g_stats.verts_plain -= mesh->vertex_count;
+                        xm = XM_OTHER;   /* the lights are in the matrix now */
+                    }
+                    else if (shaded) (g_uv_on ? render_fast_lit_uv : render_fast_lit)(mesh_verts(mesh), mesh->vertex_count, dr);
+                    else if (mesh->packed) render_fast_packed(mesh);
+                    else             (g_uv_on ? render_fast_uv : render_fast)(mesh_verts(mesh), mesh->vertex_count, dr);
+                    g_stats.ns_plain += perf_cntr_timer_ns() - t0;
+                    g_stats.verts_plain += mesh->vertex_count;
                 }
             }
         }
@@ -1238,7 +2295,12 @@ void dc_model_draw_list_rotated(DMSModel* model, shz_vec3_t pos, float scale,
         draw_skinned_list(model, pos, scale, yaw, shz_vec3_init(1.0f, 1.0f, 1.0f), cam, target_list);
     else {
         draw_blocks_list(model, pos, scale, yaw, NULL, cam, target_list);
-        if (!g_add) draw_reflections(model, pos, scale, yaw, NULL, cam, target_list);
+        if (!g_add) {
+            uint64_t t0 = perf_cntr_timer_ns(), c0 = perf_cntr_count(PRFC1);
+            draw_reflections(model, pos, scale, yaw, NULL, cam, target_list);
+            g_stats.ns_reflect += perf_cntr_timer_ns() - t0;
+            g_stats.stall_reflect += perf_cntr_count(PRFC1) - c0;
+        }
         if (!g_add) draw_cel(model, pos, scale, yaw, NULL, cam, target_list);
     }
 }
@@ -1260,7 +2322,12 @@ void dc_model_draw_list_oriented(DMSModel* model, shz_vec3_t pos, float scale,
     if (!model || model->mesh_count == 0 || model->skeleton) return;
 
     draw_blocks_list(model, pos, scale, 0.0f, rot, cam, target_list);
-    if (!g_add) draw_reflections(model, pos, scale, 0.0f, rot, cam, target_list);
+    if (!g_add) {
+        uint64_t t0 = perf_cntr_timer_ns(), c0 = perf_cntr_count(PRFC1);
+        draw_reflections(model, pos, scale, 0.0f, rot, cam, target_list);
+        g_stats.ns_reflect += perf_cntr_timer_ns() - t0;
+        g_stats.stall_reflect += perf_cntr_count(PRFC1) - c0;
+    }
     if (!g_add) draw_cel(model, pos, scale, 0.0f, rot, cam, target_list);
 }
 
@@ -1291,7 +2358,17 @@ void dc_model_draw_rotated(DMSModel* model, shz_vec3_t pos, float scale,
  * texture cuts it out by its alpha, and the result is laid over the frame.
  * ================================================================ */
 
-#define SHINE_ALPHA 0x80000000u   /* strength of the image over a solid mesh */
+/* Anything glossy enough reflects, metal or not: a car body is mostly the sky
+ * it shows. Rough metal (brushed, cast) does not: a sharp image on it reads
+ * as chrome. Metal's reflection is tinted by its colour, paint and plastic's
+ * is the image as it is; both at half the strength of their highlight. */
+
+/* Metal shows the environment, and so does anything smooth enough (glass).
+ * Paint and plastic keep their highlight, which costs nothing, where a
+ * reflection sends them all again */
+bool dc_model_reflects(const DMSMesh* mesh) {
+    return (mesh->material_flags & (DMS_MAT_METALLIC | DMS_MAT_GLOSSY)) != 0;
+}
 
 static pvr_poly_hdr_t g_env_mirror_hdr __attribute__((aligned(32)));
 static pvr_poly_hdr_t g_env_shine_hdr __attribute__((aligned(32)));
@@ -1345,15 +2422,135 @@ void dc_model_set_environment(const dttex_info_t* tex) {
 /* The mesh's vertices with their UVs swapped for a lookup into the
  * environment image. right and up are the camera's axes in model space,
  * already scaled so a full-length normal gives 0.5. */
+/* A vertex's colour in a reflection pass. shine_a, when not 0, is the
+ * highlight's alpha, scaled by how much of the mesh's shine the vertex has */
+static inline __attribute__((always_inline))
+uint32_t env_colour(const DMSVertex* s, uint32_t argb_and, uint32_t argb_or, uint32_t shine_a) {
+    uint32_t argb = (s->argb & argb_and) | argb_or;
+    if (shine_a) argb = (argb & 0x00FFFFFFu) | ((shine_a * s->pad + 255) >> 8) << 24;
+    return g_rim_on ? rim_light(argb, s) : argb;
+}
+
+/* The environment pass of a mesh fully in view: the lookup made as each
+ * vertex is sent, laid out as render_fast_impl, so the mesh is not copied
+ * first. The clipped way still copies (env_vertices). */
+static void render_env_fast(const DMSVertex* src, int count, pvr_dr_state_t* dr,
+                            const float* right, const float* up,
+                            uint32_t argb_and, uint32_t argb_or, uint32_t shine_a) {
+    if (count < 1) return;
+    uint32_t sq = pvr_dr_addr;
+    const float rx = right[0], ry = right[1], rz = right[2];
+    const float ux = up[0], uy = up[1], uz = up[2];
+    SHZ_PREFETCH(&src[0]);
+    SHZ_PREFETCH(&src[1]);
+    SHZ_PREFETCH(&src[2]);
+    SHZ_PREFETCH(&src[3]);
+
+    shz_vec4_t t0 = shz_xmtrx_transform_vec4(shz_vec4_init(src[0].x, src[0].y, -src[0].z, 1.0f));
+    t0 = shz_vec4_swizzle(t0, 1, 2, 3, 0);
+    float    cur_invw  = shz_invf_fsrra(t0.w);
+    float    cur_sx    = t0.x * cur_invw;
+    float    cur_sy    = t0.y * cur_invw;
+    uint32_t cur_flags = src[0].flags;
+    float    n0x = src[0].nx, n0y = src[0].ny, n0z = src[0].nz;
+    float    cur_u     = 0.5f + (n0x * rx + n0y * ry + n0z * rz);
+    float    cur_v     = 0.5f - (n0x * ux + n0y * uy + n0z * uz);
+    uint32_t cur_argb  = env_colour(&src[0], argb_and, argb_or, shine_a);
+
+    for (int i = 1; i < count; i++) {
+        SHZ_PREFETCH(&src[i + 4]);
+        const DMSVertex* s = &src[i];
+        shz_vec4_t next_t = shz_xmtrx_transform_vec4(shz_vec4_init(s->x, s->y, -s->z, 1.0f));
+        float nx = s->nx, ny = s->ny, nz = s->nz;
+        uint32_t nflags = s->flags;
+        float nu = 0.5f + (nx * rx + ny * ry + nz * rz);
+        float nv = 0.5f - (nx * ux + ny * uy + nz * uz);
+        uint32_t nargb = env_colour(s, argb_and, argb_or, shine_a);
+
+        sq = sq_next(sq);
+        sq_put_argb(sq, cur_flags, cur_sx, cur_sy, cur_invw, cur_u, cur_v, cur_argb);
+
+        next_t = shz_vec4_swizzle(next_t, 1, 2, 3, 0);
+        cur_invw  = shz_invf_fsrra(next_t.w);
+        cur_sx    = next_t.x * cur_invw;
+        cur_sy    = next_t.y * cur_invw;
+        cur_flags = nflags;
+        cur_u     = nu;
+        cur_v     = nv;
+        cur_argb  = nargb;
+    }
+
+    sq = sq_next(sq);
+    sq_put_argb(sq, cur_flags, cur_sx, cur_sy, cur_invw, cur_u, cur_v, cur_argb);
+    sq_end(sq);
+}
+
+/* render_env_fast reading a packed mesh: the normal is floats already, the
+ * colour the mesh's (argb), the shine the low byte of nx and the end of a
+ * strip bit 12 of nz. Written like sun_loop. k: the camera's up negated and
+ * 0.5 (v), its right and 0.5 (u), then as words the colour, the alpha's
+ * (a * shine + b) >> 8 -- a the shine's, or 0 and b the colour's own alpha --
+ * and LOOP_CONSTS (whose first, 2.0f, it doesn't use). */
+static __attribute__((noinline))
+uint32_t refl_loop(const DMSPacked* src, int count, const float* k0, uint32_t sq) {
+    const uint32_alias* kw = (const uint32_alias*)(k0 + 8);
+    const uint32_t rgb = kw[0], sa = kw[1], sb = kw[2];
+    const uint32_t end_bit = kw[3 + 1], cmd = kw[3 + 2];
+    const float* volatile kstart = k0;
+    for (int i = 0; i < count; i++) {
+        SHZ_PREFETCH(&src[i + 3]);
+        const float* k = kstart;
+        const float x = src[i].x, y = src[i].y, z = src[i].z;
+        const float nx = src[i].nx, ny = src[i].ny, nz = src[i].nz;
+        const uint32_t nxb = ((const uint32_alias*)&src[i])[5];
+        const uint32_t nzb = ((const uint32_alias*)&src[i])[7];
+
+        /* The projection leaves w in the first lane */
+        shz_vec4_t t = shz_xmtrx_transform_vec4(shz_vec4_init(x, y, z, 1.0f));
+        float inv_w = shz_inv_sqrtf_fsrra(t.x * t.x);
+
+        K4 m = k4(&k);
+        float v = shz_dot8f(nx, ny, nz, 1.0f, m.a, m.b, m.c, m.d);
+        m = k4(&k);
+        float u = shz_dot8f(nx, ny, nz, 1.0f, m.a, m.b, m.c, m.d);
+
+        uint32_t argb = ((((nxb & 0xffu) * sa + sb) >> 8) << 24) | rgb;
+        uint32_t flags = cmd | ((nzb << 16) & end_bit);
+
+        sq = sq_next(sq);
+        sq_put_argb2(sq, flags, t.y * inv_w, t.z * inv_w, inv_w, u, v, argb, 0);
+    }
+    return sq;
+}
+
+static void render_env_packed(const DMSPacked* src, int count, pvr_dr_state_t* dr,
+                              const float* right, const float* up,
+                              uint32_t argb, uint32_t shine_a) {
+    (void)dr;
+    if (count < 1) return;
+    alignas(4) float k[8 + 3 + 4] = {
+        -up[0], -up[1], -up[2], 0.5f,
+        right[0], right[1], right[2], 0.5f,
+    };
+    uint32_t w[3] = { argb & 0x00FFFFFFu, shine_a,
+                      shine_a ? 255u : (argb >> 24) << 8 };
+    memcpy(&k[8], w, sizeof w);
+    loop_consts(&k[11]);
+    /* The loop takes z as it is; the C ones negate it going in */
+    shz_xmtrx_apply_scale(1.0f, 1.0f, -1.0f);
+    pvr_dr_addr = refl_loop(src, count, k, pvr_dr_addr);
+}
+
 static const DMSVertex* env_vertices(const DMSMesh* mesh, const float* right,
-                                     const float* up, uint32_t argb_and, uint32_t argb_or) {
+                                     const float* up, uint32_t argb_and, uint32_t argb_or,
+                                     uint32_t shine_a) {
     if (mesh->vertex_count > g_env_verts_size) {
         free(g_env_verts);
         g_env_verts = memalign(32, mesh->vertex_count * sizeof(DMSVertex));
         g_env_verts_size = g_env_verts ? mesh->vertex_count : 0;
         if (!g_env_verts) return NULL;
     }
-    const DMSVertex* src = mesh->vertices;
+    const DMSVertex* src = mesh_verts(mesh);
     DMSVertex* dst = g_env_verts;
     for (uint32_t i = 0; i < mesh->vertex_count; i++) {
         SHZ_PREFETCH(&src[i + 4]);
@@ -1363,8 +2560,7 @@ static const DMSVertex* env_vertices(const DMSMesh* mesh, const float* right,
         dst[i].z = src[i].z;
         dst[i].u = 0.5f + (nx * right[0] + ny * right[1] + nz * right[2]);
         dst[i].v = 0.5f - (nx * up[0] + ny * up[1] + nz * up[2]);
-        uint32_t argb = (src[i].argb & argb_and) | argb_or;
-        dst[i].argb = g_rim_on ? rim_light(argb, &src[i]) : argb;
+        dst[i].argb = env_colour(&src[i], argb_and, argb_or, shine_a);
         dst[i].flags = src[i].flags;
     }
     return dst;
@@ -1389,19 +2585,9 @@ static void draw_reflections(DMSModel* model, shz_vec3_t pos, float scale, float
 
     /* Camera right and up in the world, the same way the frustum is turned,
      * then into model space */
-    shz_xmtrx_init_identity();
-    shz_xmtrx_apply_rotation_y(-cam->yaw);
-    shz_xmtrx_apply_rotation_x(-cam->pitch);
-    shz_vec4_t wr = shz_xmtrx_transform_vec4(shz_vec4_init(-1.0f, 0.0f, 0.0f, 0.0f));
-    shz_vec4_t wu = shz_xmtrx_transform_vec4(shz_vec4_init(0.0f, 1.0f, 0.0f, 0.0f));
-    wr.z = -wr.z;
-    wu.z = -wu.z;
-    const float k = 0.5f / 127.0f;
-    float right[3], up[3];
-    for (int j = 0; j < 3; j++) {
-        right[j] = (cols[j*3] * wr.x + cols[j*3+1] * wr.y + cols[j*3+2] * wr.z) * k;
-        up[j]    = (cols[j*3] * wu.x + cols[j*3+1] * wu.y + cols[j*3+2] * wu.z) * k;
-    }
+    env_axes(cam, cols);
+    const float* right = g_env_right;
+    const float* up = g_env_up;
 
     cam_to_model(pos, scale, cols, cam);
     const shz_mat4x4_t* pv = dc_camera_get_pv(cam);
@@ -1426,9 +2612,10 @@ static void draw_reflections(DMSModel* model, shz_vec3_t pos, float scale, float
 
     for (uint32_t m = 0; m < model->mesh_count; m++) {
         DMSMesh* mesh = &model->meshes[m];
-        if (!(mesh->material_flags & DMS_MAT_METALLIC)) continue;
+        if (!dc_model_reflects(mesh)) continue;
         if (mesh->material_flags & DMS_MAT_COLLISION_ONLY) continue;
         int mirror = (mesh->material_flags & DMS_MAT_MIRROR) != 0;
+        int metal = (mesh->material_flags & DMS_MAT_METALLIC) != 0;
         if (mirror != want_mirror) continue;
         if (g_glow_only && !(mesh->material_flags & DMS_MAT_GLOW)) continue;
         rim_set(mesh);
@@ -1441,6 +2628,9 @@ static void draw_reflections(DMSModel* model, shz_vec3_t pos, float scale, float
         shz_xmtrx_load_4x4((shz_mat4x4_t*)&fr->side_planes);
         if (!sphere_visible(fr, mc, mr, &nd)) continue;
         int clip = nd < mr && nd > -mr;
+        /* Already shown in its own pass this frame (env_single). Not when
+         * it went another way there: clipped, cel, tinted, the glow pass */
+        if (mesh->env_frame == dc_frame_count() + 1) continue;
 
         /* See-through with a texture of its own: Katana's passes. Anything
          * else gets the image added over it. */
@@ -1448,14 +2638,21 @@ static void draw_reflections(DMSModel* model, shz_vec3_t pos, float scale, float
         int glass = (mesh->material_flags & 0x3) == 2 && tid >= 0 &&
                     tid < model->texture_count && model->textures[tid].ptr;
 
-        const DMSVertex* env = mirror ? env_vertices(mesh, right, up, 0xFFFFFFFFu, 0)
-                             : glass  ? env_vertices(mesh, right, up, 0, 0xFFFFFFFFu)
-                                      : env_vertices(mesh, right, up, 0x00FFFFFFu, SHINE_ALPHA);
-        if (!env) return;
+        /* The pass's colour: a mirror its own, glass white, and a shine the
+         * metal's colour or white, as bright as the vertex shines */
+        uint32_t argb_and = mirror ? 0xFFFFFFFFu : glass || !metal ? 0 : 0x00FFFFFFu;
+        uint32_t argb_or  = mirror ? 0 : glass ? 0xFFFFFFFFu : metal ? 0 : 0x00FFFFFFu;
+        uint32_t shine_a  = mirror || glass ? 0 : DMS_MAT_SHINE_STRENGTH(mesh->material_flags) >> 1;
+        /* Only the clipped way and glass's later passes need it copied */
+        const DMSVertex* env = NULL;
+        if (clip || glass) {
+            env = env_vertices(mesh, right, up, argb_and, argb_or, shine_a);
+            if (!env) return;
+        }
 
         pvr_poly_hdr_t cut_hdr __attribute__((aligned(32)));
         const pvr_poly_hdr_t* hdrs[3] = { mirror ? &g_env_mirror_hdr : &g_env_shine_hdr, NULL, NULL };
-        const DMSVertex*      vtx[3]  = { env, mesh->vertices, mesh->vertices };
+        const DMSVertex*      vtx[3]  = { env, NULL, NULL };
         int passes = 1;
         if (mirror) {
             g_stats.meshes_drawn++;
@@ -1474,9 +2671,17 @@ static void draw_reflections(DMSModel* model, shz_vec3_t pos, float scale, float
             hdrs[0] = &g_env_accum_hdr;
             hdrs[1] = &cut_hdr;
             hdrs[2] = &g_env_flush_hdr;
+            vtx[1] = vtx[2] = mesh_verts(mesh);
             passes = 3;
         }
 
+        /* Glass's passes go in together or not at all: the first alone
+         * leaves the accumulation half done, and the glass shows it */
+        if (passes > 1 && vtxbuf_need(mesh) * passes > g_vtx_left) {
+            vtxbuf_warn_need(vtxbuf_need(mesh) * passes);
+            g_stats.meshes_vtxfull++;
+            continue;
+        }
         for (int p = 0; p < passes; p++) {
             if (vtxbuf_full(mesh, clip)) return;
             if (!dr) {
@@ -1486,12 +2691,21 @@ static void draw_reflections(DMSModel* model, shz_vec3_t pos, float scale, float
             dc_send_hdr(dr, hdrs[p]);
             shz_xmtrx_load_4x4(&mvp);
             g_stats.tris_drawn += mesh->tri_count;
+            g_stats.verts_reflect += mesh->vertex_count;
             if (clip) {
                 g_stats.verts_clipped += mesh->vertex_count;
                 render_clipped(vtx[p], mesh->vertex_count, dr, 0);
             } else {
                 g_stats.verts_xformed += mesh->vertex_count;
-                render_fast(vtx[p], mesh->vertex_count, dr);
+                if (vtx[p])
+                    render_fast(vtx[p], mesh->vertex_count, dr);
+                else if (mesh->packed && !g_rim_on)
+                    render_env_packed((const DMSPacked*)mesh->vertices, mesh->vertex_count,
+                                      dr, right, up, (mesh->colour & argb_and) | argb_or,
+                                      shine_a);
+                else
+                    render_env_fast(mesh_verts(mesh), mesh->vertex_count, dr, right, up,
+                                    argb_and, argb_or, shine_a);
             }
         }
     }
@@ -1518,7 +2732,7 @@ static const DMSVertex* cel_vertices(const DMSMesh* mesh, uint32_t argb) {
      * inside the ramp */
     const float k = (CEL_RAMP_W - 1.0f) / (CEL_RAMP_W * 127.0f);
     const float u0 = 0.5f / CEL_RAMP_W;
-    const DMSVertex* src = mesh->vertices;
+    const DMSVertex* src = mesh_verts(mesh);
     DMSVertex* dst = g_cel_verts;
     for (uint32_t i = 0; i < mesh->vertex_count; i++) {
         SHZ_PREFETCH(&src[i + 4]);
@@ -1769,6 +2983,16 @@ static void mesh_bounds(DMSMesh* mesh) {
     for (int k = 0; k < 3; k++) { mesh->bound_min[k] = lo[k]; mesh->bound_max[k] = hi[k]; }
 }
 
+/* Whether every vertex has the same colour (render_fast_intensity) */
+static void one_colour_mark(DMSMesh* mesh) {
+    mesh->material_flags &= ~DMS_MAT_ONE_COLOUR;
+    if (!mesh->vertex_count) return;
+    uint32_t c = mesh->vertices[0].argb;
+    for (uint32_t v = 1; v < mesh->vertex_count; v++)
+        if (mesh->vertices[v].argb != c) return;
+    mesh->material_flags |= DMS_MAT_ONE_COLOUR;
+}
+
 static void model_bounds(DMSModel* model) {
     float lo[3] = {  1e30f,  1e30f,  1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
     for (uint32_t m = 0; m < model->mesh_count; m++) {
@@ -1799,6 +3023,51 @@ DCBounds dc_model_bounds(const DMSModel* model, const char* material) {
     b.min = shz_vec3_init(lo[0], lo[1], lo[2]);
     b.max = shz_vec3_init(hi[0], hi[1], hi[2]);
     return b;
+}
+
+/* dc_model_recolour: every vertex of the meshes wearing the material, its
+ * colour from the function. The alpha stays as it was. */
+int dc_model_recolour(DMSModel* model, const char* material,
+                      uint32_t (*colour)(shz_vec3_t pos, void* user), void* user) {
+    if (!model || !colour || !model->material_names) return 0;
+    int n = 0;
+    for (uint32_t m = 0; m < model->mesh_count; m++) {
+        if (strcasecmp(model->material_names[m], material)) continue;
+        dc_model_mesh_unpack(&model->meshes[m]);
+        DMSVertex* v = model->meshes[m].vertices;
+        for (uint32_t i = 0; i < model->meshes[m].vertex_count; i++, n++) {
+            uint32_t c = colour(shz_vec3_init(v[i].x, v[i].y, v[i].z), user);
+            v[i].argb = (v[i].argb & 0xff000000u) | (c & 0x00ffffffu);
+        }
+        one_colour_mark(&model->meshes[m]);
+        mesh_pack(&model->meshes[m], model->skeleton != NULL);
+    }
+    return n;
+}
+
+/* dc_model_texture_colours: read back out of video memory, where the texture
+ * went at load, a 32 bits at a time (the video memory is not read a byte at a
+ * time), then read by dt_read_colours */
+int dc_model_texture_colours(const DMSModel* model, const char* material,
+                             uint32_t* out, int n) {
+    if (!model || !out || n <= 0 || !model->material_names) return 0;
+    for (uint32_t m = 0; m < model->mesh_count; m++) {
+        if (strcasecmp(model->material_names[m], material)) continue;
+        int tid = model->meshes[m].texture_id;
+        if (tid < 0 || tid >= model->texture_count || !model->textures[tid].ptr) return 0;
+        const dttex_info_t* t = &model->textures[tid];
+        size_t head = fDtGetHeaderSize(&t->hdr);
+        size_t size = t->hdr.chunk_size;
+        uint32_t* buf = malloc((size + 3) & ~(size_t)3);
+        if (!buf) return 0;
+        memcpy(buf, &t->hdr, sizeof(t->hdr) < head ? sizeof(t->hdr) : head);
+        const volatile uint32_t* vram = (const volatile uint32_t*)t->ptr;
+        for (size_t i = 0; i < (size - head) / 4; i++) buf[head / 4 + i] = vram[i];
+        int ok = dt_read_colours(buf, size, out, (uint32_t)n);
+        free(buf);
+        return ok;
+    }
+    return 0;
 }
 
 /* The clip buffer is shared and grows to the largest mesh ever loaded */
@@ -1927,8 +3196,6 @@ DMSModel* dc_model_load(const char* filename) {
 
     /* ---- Load skeleton ---- */
     if (is_animated) {
-        printf("DMS: Loading skeleton with %lu bones\n", (unsigned long)bone_count);
-
         DMSSkeleton* sk = calloc(1, sizeof(DMSSkeleton));
         sk->boneCount = bone_count;
         sk->bones = memalign(32, bone_count * sizeof(DMSBone));
@@ -1941,9 +3208,6 @@ DMSModel* dc_model_load(const char* filename) {
             mf_read(&bone->bindPose, sizeof(DMSTransform), 1, f);
             mf_read(&bone->inverseBindMatrix, sizeof(shz_mat4x4_t), 1, f);
             bone->localPose = bone->bindPose;
-
-            printf("  Bone %lu: %s (parent=%d)\n",
-                   (unsigned long)i, bone->name, bone->parent);
         }
 
         /* Build initial world poses from bind pose hierarchy */
@@ -1968,7 +3232,8 @@ DMSModel* dc_model_load(const char* filename) {
         /* Load animations */
         uint32_t anim_count;
         mf_read(&anim_count, 4, 1, f);
-        printf("DMS: %lu animations\n", (unsigned long)anim_count);
+        printf("DMS: %lu bones, %lu animations\n", (unsigned long)bone_count,
+               (unsigned long)anim_count);
 
         if (anim_count > 0) {
             sk->animCount = anim_count;
@@ -1984,10 +3249,6 @@ DMSModel* dc_model_load(const char* filename) {
                 size_t total_poses = anim->frameCount * anim->boneCount;
                 anim->framePoses = calloc(total_poses, sizeof(DMSTransform));
                 mf_read(anim->framePoses, sizeof(DMSTransform), total_poses, f);
-
-                printf("  Anim %lu: '%s' %d bones, %d frames, %.2fs\n",
-                       (unsigned long)i, anim->name,
-                       anim->boneCount, anim->frameCount, anim->duration);
             }
         }
 
@@ -2047,8 +3308,21 @@ DMSModel* dc_model_load(const char* filename) {
             max_verts = mesh->vertex_count;
 
         mesh_bounds(mesh);
+        one_colour_mark(mesh);
+        mesh_pack(mesh, is_animated);
     }
     model_bounds(model);
+    {
+        uint32_t pm = 0, pv = 0, om = 0, ov = 0;
+        for (uint32_t m = 0; m < mesh_count; m++) {
+            const DMSMesh* mesh = &model->meshes[m];
+            if (!(mesh->material_flags & DMS_MAT_ONE_COLOUR)) continue;
+            if (mesh->packed) { pm++; pv += mesh->vertex_count; }
+            else              { om++; ov += mesh->vertex_count; }
+        }
+        printf("DMS: one colour: %lu meshes packed (%lu v), %lu not (%lu v)\n",
+               (unsigned long)pm, (unsigned long)pv, (unsigned long)om, (unsigned long)ov);
+    }
 
     /* ---- Block runs: meshes are sorted by list, then block ---- */
     if (!is_animated) {
@@ -2167,7 +3441,7 @@ DMSModel* dc_model_load(const char* filename) {
             dc_model_compile_header(mesh, &mesh->header, 0, 0, 0, NULL);
         }
 
-        if ((mesh->material_flags & DMS_MAT_METALLIC) && !model->skeleton &&
+        if (dc_model_reflects(mesh) && !model->skeleton &&
             !(mesh->material_flags & DMS_MAT_COLLISION_ONLY)) {
             model->metallic_count++;
             if (mesh->material_flags & DMS_MAT_MIRROR) model->mirror_count++;
@@ -2178,6 +3452,10 @@ DMSModel* dc_model_load(const char* filename) {
     }
 
     mf_close(f);
+    /* The built-in reflection goes into video memory now, not in the middle of
+     * a frame: loading it then shares the store queues with the vertices on
+     * their way to the graphics chip */
+    if (model->metallic_count) dc_env_default_prepare();
     return model;
 }
 
@@ -2271,9 +3549,12 @@ int dc_model_see_through(DMSModel* model, const char* material, uint8_t alpha) {
         }
 
         /* Translucent blending takes its alpha from the vertex colour */
+        dc_model_mesh_unpack(mesh);
         for (uint32_t v = 0; v < mesh->vertex_count; v++)
             mesh->vertices[v].argb = (mesh->vertices[v].argb & 0x00FFFFFFu) |
                                      ((uint32_t)alpha << 24);
+        one_colour_mark(mesh);
+        mesh_pack(mesh, model->skeleton != NULL);
 
         int tid = mesh->texture_id;
         if (tid >= 0 && tid < model->texture_count && model->textures[tid].ptr) {
@@ -2595,7 +3876,7 @@ void dc_model_draw_shadow(DMSModel* model, shz_vec3_t pos, float scale, float ya
         } else {
             g_stats.verts_clipped += mesh->vertex_count;
             shz_xmtrx_load_4x4(&mvp);
-            render_clipped(mesh->vertices, mesh->vertex_count, dr, 0);
+            render_clipped(mesh_verts(mesh), mesh->vertex_count, dr, 0);
         }
     }
 
@@ -2824,7 +4105,7 @@ void dc_model_draw_modified(DMSModel* model, shz_vec3_t pos, float scale, float 
     g_stats.meshes_drawn++;
     shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), (pvr_poly_hdr_t*)model->mod_headers);
 
-    const DMSVertex* src = mesh->vertices;
+    const DMSVertex* src = mesh_verts(mesh);
     int last_bone = -1;
 
 #if DMS_VOLUME_DEBUG
@@ -2958,8 +4239,8 @@ void dc_model_draw_volume(DMSModel* model, shz_vec3_t pos, float scale, float ya
 
 /* A triangle of the strip that is whole and in front of the near plane */
 #define VOL_TRI_OK(i)                                                \
-    (mesh->vertices[(i) - 2].flags != PVR_CMD_VERTEX_EOL &&          \
-     mesh->vertices[(i) - 1].flags != PVR_CMD_VERTEX_EOL &&          \
+    (!dms_strip_end(mesh, (i) - 2) &&                                \
+     !dms_strip_end(mesh, (i) - 1) &&                                \
      g_clip_buffer[(i) - 2].w >= NEAR_Z &&                           \
      g_clip_buffer[(i) - 1].w >= NEAR_Z &&                           \
      g_clip_buffer[(i)].w >= NEAR_Z)
@@ -3057,6 +4338,7 @@ void dc_model_compile_header(const DMSMesh* mesh, pvr_poly_hdr_t* out, int pvrfo
 void dc_model_free(DMSModel* model) {
     if (!model) return;
 
+    g_view_mesh = NULL;
     for (uint32_t m = 0; m < model->mesh_count; m++) {
         free(model->meshes[m].vertices);
         if (model->meshes[m].animated_vertices)

@@ -84,6 +84,10 @@ void dc_model_draw_shadow(DMSModel* model, shz_vec3_t pos, float scale, float ya
                           const float* rot, const DCCamera* cam,
                           shz_vec3_t light, bool sun, float floor_y, float dark);
 
+/* Engine use (dc_draw): a packed mesh (one colour, no skeleton) back to
+ * plain DMSVertex for good, before its vertices are changed */
+void dc_model_mesh_unpack(DMSMesh* mesh);
+
 /* Engine use (dc_particles): squares of 4 world-space vertices, submitted
  * with the matrix now in xmtrx. A square that reaches the near plane is
  * dropped whole, not clipped. Stops if the vertex buffer is full. */
@@ -142,6 +146,13 @@ void dc_model_compile_header(const DMSMesh* mesh, pvr_poly_hdr_t* out, int pvrfo
 /* ================================================================
  * Reflections
  * ================================================================ */
+
+/* Engine use: whether the mesh shows the environment image -- metal, or a
+ * glossy enough non-metal (from the glTF roughness and clear coat) */
+bool dc_model_reflects(const DMSMesh* mesh);
+
+/* Engine use: puts the built-in reflection image into video memory (dc_draw.c) */
+void dc_env_default_prepare(void);
 
 /* Engine use (dc_set_environment): the image metallic meshes reflect, or NULL */
 void dc_model_set_environment(const dttex_info_t* tex);
@@ -256,6 +267,21 @@ typedef struct {
 } DCBounds;
 DCBounds dc_model_bounds(const DMSModel* model, const char* material);
 
+/* Sets the colour of every vertex of the meshes wearing a material, from a
+ * function given where each vertex is (the model's own units, the bind pose
+ * for a skinned one). Alpha is kept. Cheap enough every frame for a few
+ * thousand vertices: light worked out by hand, a pattern thrown on a floor.
+ * Returns how many vertices were set. */
+int dc_model_recolour(DMSModel* model, const char* material,
+                      uint32_t (*colour)(shz_vec3_t pos, void* user), void* user);
+
+/* The texture a material wears, shrunk to n by n (n a power of two), into
+ * out[n * n] as 0xAARRGGBB, row by row from v = 0 up. For reading what a
+ * texture looks like in code, e.g. the colours of a stained glass window.
+ * Twiddled 16 bit textures, compressed or not. Returns 1 if it was read. */
+int dc_model_texture_colours(const DMSModel* model, const char* material,
+                             uint32_t* out, int n);
+
 /* A white cube one unit across (-0.5 to 0.5), no texture, drawn like any
  * model: a marker, a dot, a debug box, with DCDrawOpts.tint for its colour.
  * Free it with dc_model_free(). */
@@ -276,6 +302,19 @@ typedef struct {
     uint32_t verts_clipped;
     uint32_t tris_drawn;
     uint32_t meshes_vtxfull;   /* skipped: PVR vertex buffer nearly full */
+    /* Profiling: nanoseconds spent, and vertices sent, in each kind of draw */
+    uint64_t ns_lit, ns_plain, ns_clip, ns_reflect, ns_env;
+    uint32_t verts_lit, verts_plain, verts_reflect, verts_env;
+    uint64_t stall_lit, stall_env, stall_reflect;   /* cycles frozen on data cache misses */
+    uint64_t ns_lights, stall_lights;   /* several lights over a packed mesh: the loop alone */
+    uint32_t verts_lights;
+    uint64_t ns_skin;          /* skinned meshes: skin + submit */
+    uint32_t verts_skin, skin_bone_loads;   /* bone_loads: skin matrix changes */
+    uint64_t ns_cull, ns_hdr;  /* static meshes: sphere tests; header + matrix reload */
+    uint32_t hdrs_sent;
+    /* The sun loop over packed meshes: [0] no highlight, [1] highlight, [2] env image */
+    uint64_t ns_sun[3];
+    uint32_t verts_sun[3], sun_power_v;   /* power_v: highlight power x vertices */
 } DCModelStats;
 
 /* Reset counters to zero. */
@@ -283,5 +322,8 @@ void dc_model_reset_stats(void);
 
 /* Get accumulated stats since last reset. */
 const DCModelStats* dc_model_get_stats(void);
+/* Debug: times the sun loop's parts over a model's packed meshes into RAM,
+ * once, and prints ns a vertex for each */
+void dc_model_bench_sun(const DMSModel* model);
 
 #endif /* DC_MODEL_H */

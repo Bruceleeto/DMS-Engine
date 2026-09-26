@@ -1,6 +1,7 @@
 *.o
 *.a
 *.dms
+*.dt
 *.elf
 *.cdi
 
@@ -15,3 +16,5 @@ botboy/pc/
 arcade/pc/
 fresnel/pc/
 teapot/pc/
+refraction/pc/
+bump/pc/

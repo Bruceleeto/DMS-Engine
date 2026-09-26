@@ -110,8 +110,6 @@ void dc_debug_stats(void) {
     snprintf(line, sizeof(line), "FPS: %.1f", dc_fps());
     dc_draw_text(line, 10, 10, 16, DC_COLOR_GREEN);
 
-    dc_frame_stats_log();
-
     const DCFrameStats* st = dc_frame_stats();
     if (!st->valid) return;
 

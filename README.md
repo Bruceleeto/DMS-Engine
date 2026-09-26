@@ -269,6 +269,50 @@ Credits:
 - Model: [Michaelangelo](https://sketchfab.com/3d-models/michaelangelo-c59ff51a24dd41c1837da37ab9106d10)
   by [saidovspiderman](https://sketchfab.com/saidovspiderman)
 
+### arcade
+
+![arcade](arcade/resources/example.png)
+
+An arcade cabinet with a game playing on its screen. The screen is a flipbook
+of 64 frames shown 12 times a second, with the video's sound looping along.
+
+### fresnel
+
+![fresnel](fresnel/resources/example.png)
+
+A rounded block drawn as a mirror of a small environment image, turning so the
+reflection slides over it.
+
+### teapot
+
+![teapot](teapot/resources/example.png)
+
+A chrome teapot over a blurred photo, with bloom: the bright parts of its
+reflection flare.
+
+### stained
+
+![stained](stained/resources/example.png)
+
+A lamp behind a wall shines through a stained glass window onto the floor,
+after Katana's stained glass sample. Each frame every floor vertex takes the
+glass's colour, shadow or light, depending on what lies between it and the lamp.
+
+### police
+
+![police](police/resources/example.png)
+
+A police car under a sun, with a paint highlight, a flashing siren, headlights
+and their beams on the road.
+
+### botboy
+
+![botboy](botboy/resources/example.png)
+
+BotBoy!64 from the N64brew Game Jam 2025, being rewritten on DMS as a test of
+the engine on a whole game: the menu room, the levels and two player split
+screen.
+
 ## Blender settings
 
 Export as `.glb`. The converter reads these from the material (Principled

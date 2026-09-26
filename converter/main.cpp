@@ -53,7 +53,10 @@ typedef struct {
   uint8_t boneId;     // 1
   int8_t nx, ny, nz;  // 3
   float boneWeight;   // 4
-} Vertex;             // 32 bytes
+  uint8_t dull;       // how far below the mesh's shine strength this vertex
+                      // is, 0 (as strong) to 255 (none): read from the
+                      // metallic-roughness texture where it paints parts
+} Vertex;
 
 typedef struct {
   Vertex *vertices;         // Dynamic vertex array
@@ -80,10 +83,16 @@ typedef struct {
   char materialName[32];  // glTF material name, so code can find the mesh
   int metallic;           // glTF metallicFactor of 0.5 or more: 1 = reflects the
                           // environment, 2 = a mirror (roughness near 0)
+  int glossy;             // not metal, roughness GLOSS_ROUGHNESS or less (glass,
+                          // polished plastic): reflects the environment too
   int glow;               // glTF emissiveFactor is not black: the material gives
                           // off light, so dc_set_bloom() blooms it
   uint32_t rim;           // Blender's Sheen colour, 0xRRGGBB: the edges facing
                           // away from the camera light up this colour (Fresnel)
+  int shinePower;         // the highlight a light makes on it: 0 for none, else
+                          // 1 to 8, how tight it is (glossier is tighter)
+  int shineStrength;      // how bright that highlight is, 0 to 255
+  int vertexShine;        // the shine was read at each vertex (Vertex.dull)
 
 } Mesh;
 
@@ -244,6 +253,9 @@ struct StripInfo {
 
 // Metallic materials smoother than this are mirrors
 #define MIRROR_ROUGHNESS 0.25f
+/* Smooth enough that anything shows a reflection, metal or not: glass is
+ * near 0, paint and plastic 0.4 and up */
+#define GLOSS_ROUGHNESS 0.15f
 
 struct MeshTriStrips {
   std::vector<Vertex> vertices;         // Optimized vertex buffer
@@ -615,6 +627,49 @@ static bool CgltfImageAverage(cgltf_image *img, const char *inputDir, float *rgb
     }
     rgb[0] = it->second[0]; rgb[1] = it->second[1]; rgb[2] = it->second[2];
     return it->second[3] != 0.0f;
+}
+
+/* Pixels of an image as RGBA, or NULL. Kept for the whole run. */
+static const unsigned char *CgltfImagePixels(cgltf_image *img, const char *inputDir,
+                                             int *w, int *h) {
+    struct Px { unsigned char *px; int w, h; };
+    static std::map<cgltf_image *, Px> cache;
+    auto it = cache.find(img);
+    if (it == cache.end()) {
+        Px p = {NULL, 0, 0};
+        int n;
+        if (img->buffer_view) {
+            const stbi_uc *d = (const stbi_uc *)img->buffer_view->buffer->data
+                               + img->buffer_view->offset;
+            p.px = stbi_load_from_memory(d, (int)img->buffer_view->size, &p.w, &p.h, &n, 4);
+        } else if (img->uri && strncmp(img->uri, "data:", 5) != 0) {
+            char path[512];
+            snprintf(path, sizeof(path), "%s/%s", inputDir, img->uri);
+            p.px = stbi_load(path, &p.w, &p.h, &n, 4);
+        }
+        it = cache.insert({img, p}).first;
+    }
+    *w = it->second.w; *h = it->second.h;
+    return it->second.px;
+}
+
+/* How bright the highlight a light makes is, 0 to 1, and how glossy (so how
+ * tight). Smoother is tighter and brighter; paint and plastic are far dimmer
+ * than metal. A clear coat is a glossy layer over the paint (car bodies), so
+ * it shines on its own. */
+static float ShineOf(float metal, float rough, const cgltf_material *mat, float *glossOut) {
+    float gloss = 1.0f - (rough < 0.0f ? 0.0f : rough > 1.0f ? 1.0f : rough);
+    float strength = metal >= 0.5f ? gloss : gloss * gloss * 0.5f;
+    if (mat->has_clearcoat && mat->clearcoat.clearcoat_factor > 0.0f) {
+        float ccGloss = 1.0f - mat->clearcoat.clearcoat_roughness_factor;
+        float ccStrength = mat->clearcoat.clearcoat_factor * ccGloss;
+        if (ccStrength > strength) {
+            strength = ccStrength;
+            gloss = ccGloss;
+        }
+    }
+    *glossOut = gloss;
+    return strength >= 0.05f && gloss >= 0.2f ? strength : 0.0f;
 }
 
 void ExtractAndConvertTextures(cgltf_data *data, const char *inputFilename) {
@@ -1298,6 +1353,62 @@ static void BakeNodeTransform(Mesh *mesh, const float *m) {
   }
 }
 
+/* A mesh whose shine was read at each vertex (an atlas: chrome, rubber and
+ * plastic in one) is split in two: the triangles that shine, and the ones
+ * that do not. The second has no highlight and no reflection pass, so the
+ * whole of it is not sent again for a bumper along its edge. */
+static void SplitDullTriangles(Model *m) {
+  int count = m->meshCount;
+  for (int i = 0; i < count; i++) {
+    Mesh *src = &m->meshes[i];
+    if (!src->vertexShine || src->indexCount < 3) continue;
+    std::vector<unsigned int> lit, dull;
+    for (int t = 0; t + 2 < src->indexCount; t += 3) {
+      const unsigned int *tri = &src->indices[t];
+      bool any = false;
+      for (int k = 0; k < 3; k++) any |= src->vertices[tri[k]].dull < 255;
+      (any ? lit : dull).insert((any ? lit : dull).end(), tri, tri + 3);
+    }
+    if (lit.empty() || dull.empty()) continue;
+
+    // The dull part: its own vertices, gathered from the triangles
+    std::vector<int> remap(src->vertexCount, -1);
+    std::vector<Vertex> verts;
+    for (unsigned int &ix : dull) {
+      if (remap[ix] < 0) { remap[ix] = (int)verts.size(); verts.push_back(src->vertices[ix]); }
+      ix = remap[ix];
+    }
+    m->meshes = (Mesh *)realloc(m->meshes, (m->meshCount + 1) * sizeof(Mesh));
+    src = &m->meshes[i];
+    Mesh *d = &m->meshes[m->meshCount];
+    *d = *src;
+    d->vertexCount = (int)verts.size();
+    d->indexCount = (int)dull.size();
+    d->vertices = (Vertex *)calloc(d->vertexCount, sizeof(Vertex));
+    d->originalVertices = (Vertex *)calloc(d->vertexCount, sizeof(Vertex));
+    d->animatedVertices = (Vertex *)calloc(d->vertexCount, sizeof(Vertex));
+    memcpy(d->vertices, verts.data(), d->vertexCount * sizeof(Vertex));
+    memcpy(d->originalVertices, verts.data(), d->vertexCount * sizeof(Vertex));
+    d->indices = (unsigned int *)calloc(d->indexCount, sizeof(unsigned int));
+    memcpy(d->indices, dull.data(), d->indexCount * sizeof(unsigned int));
+    d->shinePower = 0;
+    d->shineStrength = 0;
+    d->vertexShine = 0;
+    d->metallic = 0;
+    d->glossy = 0;
+    d->looseIndexCount = d->indexCount;
+
+    // The shining part keeps the mesh, its unused vertices left for the
+    // strip builder to drop
+    src->indexCount = (int)lit.size();
+    src->looseIndexCount = src->indexCount;
+    memcpy(src->indices, lit.data(), lit.size() * sizeof(unsigned int));
+    printf("Mesh %d split: %zu triangles shine, %zu do not (now mesh %d)\n", i,
+           lit.size() / 3, dull.size() / 3, m->meshCount);
+    m->meshCount++;
+  }
+}
+
 bool LoadGLTF(const char *filename) {
   cgltf_options options = {};
   cgltf_data *data = NULL;
@@ -1634,6 +1745,12 @@ bool LoadGLTF(const char *filename) {
         if (dstMesh->collisionOnly)
           printf("Mesh %d is collision-only (not drawn)\n", meshIndex);
 
+        // The metallic-roughness texture, when it is read at each vertex
+        const unsigned char *mrPx = NULL;
+        int mrW = 0, mrH = 0;
+        float mrMetal = 1.0f, mrRough = 1.0f;
+        const cgltf_material *mrMat = NULL;
+
         // Get material data for this primitive
         if (primitive->material) {
           cgltf_material *mat = primitive->material;
@@ -1659,13 +1776,70 @@ bool LoadGLTF(const char *filename) {
             cgltf_pbr_metallic_roughness *pbr =
                 &mat->pbr_metallic_roughness;
 
-            if (pbr->metallic_factor >= 0.5f)
-              dstMesh->metallic =
-                  pbr->roughness_factor < MIRROR_ROUGHNESS ? 2 : 1;
+            /* The factors multiply the metallic-roughness texture (blue is
+             * metal, green roughness), and a factor left out counts as 1.0.
+             * Exporters often leave the factors at 1 and put the real values
+             * in the texture, so take its average too. A texture that cannot
+             * be read counts as not metal. */
+            float metal = pbr->metallic_factor, rough = pbr->roughness_factor;
+            if (pbr->metallic_roughness_texture.texture) {
+              char srcDir[256] = ".";
+              strncpy(srcDir, filename, sizeof(srcDir) - 1);
+              char *sl = strrchr(srcDir, '/');
+              if (!sl) sl = strrchr(srcDir, '\\');
+              if (sl) *sl = '\0'; else strcpy(srcDir, ".");
+              float mr[3];
+              if (pbr->metallic_roughness_texture.texture->image &&
+                  CgltfImageAverage(pbr->metallic_roughness_texture.texture->image,
+                                    srcDir, mr)) {
+                metal *= mr[2];
+                rough *= mr[1];
+              } else {
+                metal = 0.0f;
+              }
+            }
+            if (metal >= 0.5f)
+              dstMesh->metallic = rough < MIRROR_ROUGHNESS ? 2 : 1;
+            else if (rough <= GLOSS_ROUGHNESS)
+              dstMesh->glossy = 1;
+            if (dstMesh->glossy)
+              printf("Mesh %d material is glossy (roughness %.2f)\n", meshIndex, rough);
             if (dstMesh->metallic)
               printf("Mesh %d material is metallic (%.2f, roughness %.2f)%s\n",
-                     meshIndex, pbr->metallic_factor, pbr->roughness_factor,
+                     meshIndex, metal, rough,
                      dstMesh->metallic == 2 ? ": a mirror" : "");
+
+            /* A texture that paints the parts of an atlas (chrome bumper,
+             * rubber tyre) is read at each vertex once they are loaded. One
+             * tiled small across the surface is detail (flakes in paint),
+             * which vertices far apart would only sample at random, so that
+             * keeps the average. */
+            const cgltf_texture_view *mrv = &pbr->metallic_roughness_texture;
+            if (mrv->texture && mrv->texture->image && !mrv->has_transform &&
+                mrv->texcoord == 0) {
+              char srcDir[256] = ".";
+              strncpy(srcDir, filename, sizeof(srcDir) - 1);
+              char *sl = strrchr(srcDir, '/');
+              if (!sl) sl = strrchr(srcDir, '\\');
+              if (sl) *sl = '\0'; else strcpy(srcDir, ".");
+              mrPx = CgltfImagePixels(mrv->texture->image, srcDir, &mrW, &mrH);
+              mrMetal = pbr->metallic_factor;
+              mrRough = pbr->roughness_factor;
+              mrMat = mat;
+            }
+
+            float gloss;
+            float strength = ShineOf(metal, rough, mat, &gloss);
+            if (strength > 0.0f) {
+              /* Lit at the vertices, so no tighter than 16 (four squarings):
+               * past that the highlight takes the shape of the triangles */
+              dstMesh->shinePower = 1 + (int)(gloss * 3.0f + 0.5f);
+              dstMesh->shineStrength = (int)(strength * 255.0f + 0.5f);
+              if (dstMesh->shineStrength > 255) dstMesh->shineStrength = 255;
+              if (!mrPx)
+                printf("Mesh %d material shines (power %d, strength %.2f)\n",
+                     meshIndex, dstMesh->shinePower, strength);
+            }
 
             float *bc = pbr->base_color_factor;
             uint8_t a = (uint8_t)(bc[3] * 255.0f);
@@ -1915,6 +2089,42 @@ bool LoadGLTF(const char *filename) {
           }
         }
 
+        /* Shine read at each vertex: the mesh takes its strongest, and each
+         * vertex how far below that it is */
+        if (mrPx && !dstMesh->collisionOnly) {
+          std::vector<float> vs(totalVertices);
+          float best = 0.0f, bestGloss = 0.0f;
+          for (int v = 0; v < totalVertices; v++) {
+            float fu = dstMesh->vertices[v].u, fv = dstMesh->vertices[v].v;
+            int x = (int)floorf((fu - floorf(fu)) * mrW) % mrW;
+            int y = (int)floorf((fv - floorf(fv)) * mrH) % mrH;
+            const unsigned char *t = mrPx + ((size_t)y * mrW + x) * 4;
+            float gloss;
+            vs[v] = ShineOf(mrMetal * t[2] / 255.0f, mrRough * t[1] / 255.0f, mrMat, &gloss);
+            if (vs[v] > best) { best = vs[v]; bestGloss = gloss; }
+          }
+          dstMesh->shinePower = 0;
+          dstMesh->shineStrength = 0;
+          /* A few stray vertices on a sliver of the atlas are not a part
+           * that shines, and would cost the mesh a reflection pass */
+          int shining = 0;
+          for (int v = 0; v < totalVertices; v++) shining += vs[v] > 0.0f;
+          if (shining * 50 < totalVertices) best = 0.0f;
+          if (best > 0.0f) {
+            for (int v = 0; v < totalVertices; v++) {
+              int d = 255 - (int)(vs[v] / best * 255.0f + 0.5f);
+              dstMesh->vertices[v].dull = (uint8_t)(d < 0 ? 0 : d);
+              dstMesh->originalVertices[v].dull = dstMesh->vertices[v].dull;
+            }
+            dstMesh->shinePower = 1 + (int)(bestGloss * 3.0f + 0.5f);
+            dstMesh->shineStrength = (int)(best * 255.0f + 0.5f);
+            if (dstMesh->shineStrength > 255) dstMesh->shineStrength = 255;
+            dstMesh->vertexShine = 1;
+            printf("Mesh %d shines at %d of %d vertices, read from its texture (power %d, strength %.2f)\n",
+                   meshIndex, shining, totalVertices, dstMesh->shinePower, best);
+          }
+        }
+
         if (primitive->indices) {
           for (size_t i = 0; i < primitive->indices->count; i++) {
             dstMesh->indices[i] =
@@ -1945,6 +2155,8 @@ bool LoadGLTF(const char *filename) {
       }
     }
   }
+
+  SplitDullTriangles(&model);
 
   ExtractAndConvertTextures(data, filename);
 
@@ -2151,7 +2363,8 @@ static bool SameMaterial(const Mesh &a, const Mesh &b) {
          a.alphaMode == b.alphaMode && a.alphaCutoff == b.alphaCutoff &&
          a.doubleSided == b.doubleSided && a.wrapU == b.wrapU &&
          a.wrapV == b.wrapV && a.collisionOnly == b.collisionOnly &&
-         a.metallic == b.metallic && a.glow == b.glow && a.rim == b.rim;
+         a.metallic == b.metallic && a.glossy == b.glossy && a.glow == b.glow && a.rim == b.rim &&
+         a.shinePower == b.shinePower && a.shineStrength == b.shineStrength;
 }
 
 void BuildBlocks(Model *m) {
@@ -2389,8 +2602,11 @@ void CreateTristrippedModel(const Model *sourceModel, Model *destModel) {
     dstMesh->blockId = srcMesh->blockId;
     dstMesh->collisionOnly = srcMesh->collisionOnly;
     dstMesh->metallic = srcMesh->metallic;
+    dstMesh->glossy = srcMesh->glossy;
     dstMesh->glow = srcMesh->glow;
     dstMesh->rim = srcMesh->rim;
+    dstMesh->shinePower = srcMesh->shinePower;
+    dstMesh->shineStrength = srcMesh->shineStrength;
     memcpy(dstMesh->materialName, srcMesh->materialName,
            sizeof(dstMesh->materialName));
 
@@ -3672,6 +3888,11 @@ void ExportTristrippedModel(const Model *model, const char *filename,
     // bit  15:   marker (set at runtime by dc_model_points, never written here)
     // bit  16:   glow (the material has an Emission colour: it gives off light
     //            rather than only catching it, and blooms)
+    // bit  17:   one colour (set at load when every vertex shares a colour)
+    // bit  18:   glossy (not metal, roughness near 0: glass, polished
+    //            plastic; reflects the environment image as metal does)
+    // bits 20-23: shine power (0 = no highlight, 1-8 tighter as it goes up)
+    // bits 24-31: shine strength (0-255)
     uint32_t material_flags = 0;
     material_flags |= (mesh->alphaMode & 0x3);
     material_flags |= (mesh->doubleSided & 0x1) << 2;
@@ -3684,9 +3905,27 @@ void ExportTristrippedModel(const Model *model, const char *filename,
     // lighting_mode: baked=0, dynamic=1
     material_flags |= (bakeLighting ? 0 : 1) << 10;
     material_flags |= (mesh->collisionOnly & 0x1) << 12;
-    material_flags |= (mesh->metallic != 0) << 13;
-    material_flags |= (mesh->metallic == 2 && mesh->alphaMode == 0) << 14;
+    /* An animated vertex has no room for its own shine (the byte is its
+     * bone), so the mesh takes the average of its vertices */
+    int shineStrength = mesh->shineStrength;
+    if (isAnimated && mesh->vertexCount) {
+      long sum = 0;
+      for (int v = 0; v < mesh->vertexCount; v++) sum += 255 - mesh->vertices[v].dull;
+      shineStrength = (int)(shineStrength * sum / (255L * mesh->vertexCount));
+    }
+    /* A textured part's reflection is a second pass as bright as its shine,
+     * so with none it would add nothing. Untextured metal shows the sky as
+     * its surface in the one pass, and a mirror and textured glass at their
+     * own strength, so those keep it */
+    int mirror = mesh->metallic == 2 && mesh->alphaMode == 0;
+    int glass = mesh->alphaMode == 2 && mesh->textureId >= 0;
+    int reflects = shineStrength || mirror || glass || mesh->textureId < 0;
+    material_flags |= (reflects && mesh->metallic != 0) << 13;
+    material_flags |= mirror << 14;
     material_flags |= (mesh->glow != 0) << 16;
+    material_flags |= (reflects && mesh->glossy != 0) << 18;
+    material_flags |= (uint32_t)(shineStrength ? mesh->shinePower & 0xf : 0) << 20;
+    material_flags |= (uint32_t)(shineStrength & 0xff) << 24;
 
     float alphaCutoff = mesh->alphaCutoff;
     fwrite(&material_flags, sizeof(uint32_t), 1, file);
@@ -3748,7 +3987,7 @@ void ExportTristrippedModel(const Model *model, const char *filename,
         sv.nx = srcV.nx;
         sv.ny = srcV.ny;
         sv.nz = srcV.nz;
-        sv.pad = 0;
+        sv.pad = 255 - srcV.dull;   // how much of the mesh's shine this vertex has
         sv.flags = flag;
         fwrite(&sv, sizeof(StaticVertex), 1, file);
       } else {

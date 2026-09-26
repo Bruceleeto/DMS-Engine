@@ -39,10 +39,18 @@ static struct {
     uint64_t part_start_ns[DC_PROF_COUNT];
     int      part_depth[DC_PROF_COUNT];
     uint64_t part_ns[DC_PROF_COUNT];
+    /* Profiling line: waiting for the PVR, finishing the scene, and the
+     * model draw split (DCModelStats) summed over the interval */
+    uint64_t wait_ns, finish_ns, lit_ns, plain_ns, clip_ns, reflect_ns;
+    uint64_t lit_v, plain_v, reflect_v;
+    uint64_t env_ns, env_v, stall_lit, stall_env, stall_reflect;
+    uint64_t lights_ns, lights_v, stall_lights;
+    uint64_t skin_ns, skin_v, skin_loads;
+    uint64_t cull_ns, hdr_ns, hdrs;
+    uint64_t sun_ns[3], sun_v[3], sun_pv;
+    bool     stall_on;
     uint64_t frame_ns;
     uint32_t sum_drawn, sum_culled, sum_xformed, sum_clipped, sum_tris;
-    bool     stats_log;         /* dc_debug_stats() was called: print the serial line */
-    uint64_t last_report_ms;
     uint32_t samples;
     DCFrameStats stats;
 } g_engine;
@@ -62,7 +70,7 @@ void dc_init(DCInitParams params) {
     if (params.fov == 0.0f)    params.fov = 60.0f;
     if (params.near_z == 0.0f) params.near_z = 0.1f;
     if (params.far_z == 0.0f)  params.far_z = 100.0f;
-    if (params.vram_size == 0) params.vram_size = (int)(1024 * 1024 * 1.5f);
+    if (params.vram_size == 0) params.vram_size = 2048 * 1024;
     g_engine.params = params;
 
     /* One extra list costs ~525KB of texture RAM (128 bytes x 300 tiles x the
@@ -109,6 +117,10 @@ void dc_clip_scene(bool on) {
 
 void dc_frame_begin(void) {
     g_engine.frame_start_ns = perf_cntr_timer_ns();
+    if (!g_engine.stall_on) {   /* PRFC0 is the ns timer; PRFC1 is free */
+        perf_cntr_start(PRFC1, PMCR_PIPELINE_FREEZE_BY_DCACHE_MISS_MODE, PMCR_COUNT_CPU_CYCLES);
+        g_engine.stall_on = true;
+    }
     dc_model_reset_stats();
 
     /* ---- Timing ---- */
@@ -130,7 +142,9 @@ void dc_frame_begin(void) {
     dc_input_poll();
 
     /* ---- PVR scene ---- */
+    uint64_t w0 = perf_cntr_timer_ns();
     pvr_scene_begin();
+    g_engine.wait_ns += perf_cntr_timer_ns() - w0;
     dc_model_frame_begin();   /* buffer is wound back, so the guard resets here */
     g_engine.current_list = -1;
     dc_clip_cmd = 0;
@@ -149,6 +163,20 @@ static void stats_frame_done(void) {
     g_engine.sum_xformed += ms->verts_xformed;
     g_engine.sum_clipped += ms->verts_clipped;
     g_engine.sum_tris    += ms->tris_drawn;
+    g_engine.lit_ns += ms->ns_lit;         g_engine.lit_v += ms->verts_lit;
+    g_engine.env_ns += ms->ns_env;         g_engine.env_v += ms->verts_env;
+    g_engine.stall_lit += ms->stall_lit;   g_engine.stall_env += ms->stall_env;
+    g_engine.stall_reflect += ms->stall_reflect;
+    g_engine.lights_ns += ms->ns_lights; g_engine.lights_v += ms->verts_lights;
+    g_engine.stall_lights += ms->stall_lights;
+    g_engine.skin_ns += ms->ns_skin; g_engine.skin_v += ms->verts_skin;
+    g_engine.skin_loads += ms->skin_bone_loads;
+    g_engine.cull_ns += ms->ns_cull; g_engine.hdr_ns += ms->ns_hdr; g_engine.hdrs += ms->hdrs_sent;
+    for (int i = 0; i < 3; i++) { g_engine.sun_ns[i] += ms->ns_sun[i]; g_engine.sun_v[i] += ms->verts_sun[i]; }
+    g_engine.sun_pv += ms->sun_power_v;
+    g_engine.plain_ns += ms->ns_plain;     g_engine.plain_v += ms->verts_plain;
+    g_engine.clip_ns += ms->ns_clip;
+    g_engine.reflect_ns += ms->ns_reflect; g_engine.reflect_v += ms->verts_reflect;
     g_engine.frame_ns += perf_cntr_timer_ns() - g_engine.frame_start_ns;
 
     if (++g_engine.samples < PROF_INTERVAL) return;
@@ -165,22 +193,17 @@ static void stats_frame_done(void) {
     st->verts_xformed = g_engine.sum_xformed / g_engine.samples;
     st->verts_clipped = g_engine.sum_clipped / g_engine.samples;
 
-    /* Wall-clock interval since the last report, so vsync waits are counted */
-    uint64_t now_ms = timer_ms_gettime64();
-    if (g_engine.stats_log && g_engine.last_report_ms) {
-        float secs = (float)(now_ms - g_engine.last_report_ms) / 1000.0f;
-        pvr_stats_t ps;
-        pvr_get_stats(&ps);
-        printf("FPS: %.1f  PPS: %.0f polys/sec (%lu tris/frame)  "
-               "vtxbuf %luKB (max %luKB)  render %.2fms\n",
-               n / secs, (float)g_engine.sum_tris / secs,
-               (unsigned long)(g_engine.sum_tris / g_engine.samples),
-               (unsigned long)(ps.vtx_buffer_used / 1024),
-               (unsigned long)(ps.vtx_buffer_used_max / 1024),
-               (float)ps.rnd_last_time / 1e6f);
-    }
-    g_engine.last_report_ms = now_ms;
-    g_engine.stats_log = false;
+    g_engine.wait_ns = g_engine.finish_ns = 0;
+    g_engine.lit_ns = g_engine.plain_ns = g_engine.clip_ns = g_engine.reflect_ns = 0;
+    g_engine.lit_v = g_engine.plain_v = g_engine.reflect_v = 0;
+    g_engine.env_ns = g_engine.env_v = 0;
+    g_engine.stall_lit = g_engine.stall_env = g_engine.stall_reflect = 0;
+    g_engine.lights_ns = g_engine.lights_v = g_engine.stall_lights = 0;
+    g_engine.skin_ns = g_engine.skin_v = g_engine.skin_loads = 0;
+    g_engine.cull_ns = g_engine.hdr_ns = g_engine.hdrs = 0;
+    memset(g_engine.sun_ns, 0, sizeof g_engine.sun_ns);
+    memset(g_engine.sun_v, 0, sizeof g_engine.sun_v);
+    g_engine.sun_pv = 0;
     g_engine.sum_tris = 0;
 
     memset(g_engine.part_ns, 0, sizeof(g_engine.part_ns));
@@ -200,10 +223,6 @@ void dc_prof_end(int part) {
         g_engine.part_ns[part] += perf_cntr_timer_ns() - g_engine.part_start_ns[part];
 }
 
-void dc_frame_stats_log(void) {
-    g_engine.stats_log = true;
-}
-
 const DCFrameStats* dc_frame_stats(void) {
     return &g_engine.stats;
 }
@@ -217,7 +236,9 @@ void dc_frame_end(void) {
     /* Close any open list */
     if (g_engine.current_list >= 0) list_close();
 
+    uint64_t f0 = perf_cntr_timer_ns();
     pvr_scene_finish();
+    g_engine.finish_ns += perf_cntr_timer_ns() - f0;
     g_engine.scene_active = false;
 
     /* Keep music streaming when the game linked dc_audio */

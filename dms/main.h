@@ -97,6 +97,18 @@ typedef struct __attribute__((aligned(32))) {
  * gives off light rather than only catching it. dc_set_bloom() makes those
  * meshes glow into the picture around them */
 #define DMS_MAT_GLOW           (1u << 16)
+/* material_flags bit 17: set at load when every vertex of the mesh has the
+ * same colour. Lit by one light, such a mesh sends the colour once and each
+ * vertex only how bright it is (see render_fast_intensity) */
+#define DMS_MAT_ONE_COLOUR     (1u << 17)
+/* material_flags bit 18: not metal but smooth (roughness near 0): glass,
+ * polished plastic. Reflects the environment image as metal does */
+#define DMS_MAT_GLOSSY         (1u << 18)
+/* material_flags bits 20-23 and 24-31: the highlight a light makes on it,
+ * from the glTF roughness and clear coat. Power 0 is none, 1 to 8 tighter as
+ * it goes up; strength 0 to 255 */
+#define DMS_MAT_SHINE_POWER(f)    (((f) >> 20) & 0xfu)
+#define DMS_MAT_SHINE_STRENGTH(f) (((f) >> 24) & 0xffu)
 
 typedef struct {
     uint32_t vertex_count;
@@ -111,12 +123,24 @@ typedef struct {
     uint32_t block;                 /* block this mesh belongs to */
     DMSVertex *vertices;            /* bind-pose / static verts */
     DMSVertex *animated_vertices;   /* skinned output (NULL if static) */
+    uint32_t  colour;               /* packed meshes: the one colour every vertex has */
+    uint8_t   packed;               /* 1: vertices are packed for the sun loops, see
+                                     * dms_strip_end() and dc_model.c's DMSPacked */
+    uint32_t  env_frame;            /* dc_frame_count() + 1 when its own pass last showed
+                                     * the environment image (env_single) */
     float    scroll_u, scroll_v;    /* dc_model_scroll(): texture widths a second */
     float    flip_w, flip_h;        /* dc_model_flipbook(): one frame, as a fraction of the sheet */
     uint16_t flip_across, flip_count;
     float    flip_fps;
     pvr_poly_hdr_t header __attribute__((aligned(32)));
 } DMSMesh;
+
+/* Whether vertex v ends its strip. A packed mesh (one colour, no skeleton)
+ * keeps it in bit 12 of the float nz, where the flags were. */
+static inline int dms_strip_end(const DMSMesh* mesh, uint32_t v) {
+    uint32_t f = mesh->vertices[v].flags;
+    return mesh->packed ? (f & 0x1000u) != 0 : f == 0xF0000000u;
+}
 
 /* A Blender Empty: a place marked in the scene, found by name with
  * dc_model_entity(). Where it is in the model's own space, the same space the
@@ -158,7 +182,8 @@ typedef struct DMSModel {
     float        anim_bound_radius;
     float        max_bind_radius;
     shz_vec3_t   bound_min, bound_max;  /* the box round every vertex, in its own units */
-    uint32_t     metallic_count;    /* meshes that reflect the environment */
+    uint32_t     metallic_count;    /* meshes that reflect the environment: metal, and
+                                     * glossy paint or plastic (dc_model_reflects) */
     uint32_t     mirror_count;      /* of those, mirrors */
     uint32_t     glow_count;        /* meshes that give off light (bloom) */
     char       (*material_names)[32]; /* glTF material name of each mesh, or NULL */

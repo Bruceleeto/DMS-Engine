@@ -31,6 +31,11 @@ void dc_set_camera(const DCCamera* cam);
  * last given) */
 const DCCamera* dc_get_camera(void);
 
+/* Engine use: the cameras the screen is drawn with this frame so far, each
+ * once, in the order first used (one a view in split screen). Returns how
+ * many went into out, at most max. */
+int dc_draw_screen_cameras(const DCCamera** out, int max);
+
 /* As it is: no turn, full size */
 void dc_draw(DMSModel* model, shz_vec3_t pos);
 

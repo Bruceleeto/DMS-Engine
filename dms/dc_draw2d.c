@@ -99,6 +99,17 @@ DCImage* dc_image_load(const char* filename) {
     return img;
 }
 
+DCImage* dc_image_load_buffer(const void* data, size_t size) {
+    DCImage* img = (DCImage*)calloc(1, sizeof(DCImage));
+    if (!img) return NULL;
+    if (!pvrtex_load_from_buffer(data, size, &img->tex)) {
+        printf("dc_image_load_buffer: not a .dt image\n");
+        free(img);
+        return NULL;
+    }
+    return img;
+}
+
 void dc_image_free(DCImage* img) {
     if (!img) return;
     pvrtex_unload(&img->tex);

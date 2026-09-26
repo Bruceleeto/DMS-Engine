@@ -16,7 +16,7 @@ typedef struct {
     int   height;         /* 480 default */
     float fov;            /* 60.0 default (degrees) */
     float near_z, far_z;  /* 0.1, 100.0 defaults */
-    int   vram_size;      /* PVR VRAM pool in bytes, default 1.5 MB */
+    int   vram_size;      /* PVR VRAM pool in bytes, default 2 MB */
     /* This app calls dc_model_volume(). The tile bins are sized in pvr_init(),
      * before any model exists, so it cannot be worked out. Costs ~525KB of
      * texture RAM. */
@@ -83,10 +83,6 @@ typedef struct {
 } DCFrameStats;
 
 const DCFrameStats* dc_frame_stats(void);
-
-/* Engine use (dc_debug_stats): print the FPS / polys per second line on the
- * serial log at the end of this averaging interval */
-void dc_frame_stats_log(void);
 
 /* ================================================================
  * Display

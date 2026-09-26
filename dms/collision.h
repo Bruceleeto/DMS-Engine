@@ -183,7 +183,7 @@ static int col_collect_tris(const ColWorld* w, DMSModel* mdl, ColTriRef* refs) {
                     n++;
                 }
             }
-            if (mesh->vertices[v].flags == 0xF0000000)
+            if (dms_strip_end(mesh, v))
                 strip_len = 0;
         }
     }

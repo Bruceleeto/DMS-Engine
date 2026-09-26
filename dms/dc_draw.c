@@ -93,6 +93,18 @@ void dc_set_camera(const DCCamera* cam) {
     current_cam = cam;
 }
 
+int dc_draw_screen_cameras(const DCCamera** out, int max) {
+    int n = 0;
+    for (int i = 0; i < queue_count && n < max; i++) {
+        const DCCamera* cam = queue[i].cam;
+        if (queue[i].target || !cam) continue;
+        int seen = 0;
+        for (int k = 0; k < n; k++) seen |= out[k] == cam;
+        if (!seen) out[n++] = cam;
+    }
+    return n;
+}
+
 /* Each draw keeps the environment current when it was queued, so a scene can
  * have gold things and silver things: set it, draw them, set the next */
 void dc_set_environment(const DCImage* img) {
@@ -105,7 +117,21 @@ const DCImage* dc_get_environment(void) {
 
 /* At the flush: the model layer's headers rebuilt only when the image changes
  * between one draw and the next */
-static void env_for(const DCImage* env) {
+/* The image shown when the game has not set one, so a metal or glossy model
+ * off the internet looks as it did in Blender or on Sketchfab without a line
+ * of code. Loaded with the first model that reflects (dc_model_load). */
+#include "env_default.h"
+static DCImage* g_env_default;
+static bool     g_env_default_tried;
+
+void dc_env_default_prepare(void) {
+    if (g_env_default_tried) return;
+    g_env_default_tried = true;
+    g_env_default = dc_image_load_buffer(env_default_dt, sizeof(env_default_dt));
+}
+
+static void env_for(const DCImage* env, const DMSModel* model) {
+    if (!env && model->metallic_count) env = g_env_default;
     if (env == applied_env) return;
     dc_model_set_environment((const dttex_info_t*)dc_image_tex(env));
     applied_env = env;
@@ -350,6 +376,7 @@ int dc_target_show_on(DCTarget* t, DMSModel* model, const char* material) {
     for (uint32_t m = 0; m < model->mesh_count; m++) {
         DMSMesh* mesh = &model->meshes[m];
         if (strncmp(model->material_names[m], material, 32) != 0) continue;
+        dc_model_mesh_unpack(mesh);
         flat_uvs(mesh);
         /* A screen gives off its own light: the picture as it is, not dimmed
          * by the room's baked lighting */
@@ -757,7 +784,7 @@ static void flush_scene(const DCTarget* target) {
                     dc_model_draw_shadow(e->model, e->pos, e->scale, e->yaw,
                                          e->has_rot ? e->rot : NULL, cam, e->shadow.light,
                                          e->shadow.sun, e->shadow.floor_y, e->shadow.dark);
-                env_for(e->env);
+                env_for(e->env, e->model);
                 if (e->add) dc_model_set_add(true);
                 if (e->tint) dc_model_set_tint(e->tint);
                 if (e->glow) dc_model_set_glow_only(true);
@@ -785,7 +812,12 @@ static void flush_scene(const DCTarget* target) {
     }
 }
 
+/* Linked only when the game uses coronas (dc_corona.c) */
+extern void dc_corona_flush(void) __attribute__((weak));
+
 void dc_draw_flush(void) {
+    if (dc_corona_flush) dc_corona_flush();
+
     /* Adds its own targets to the queue, so it goes before the loop below */
     bloom_queue();
 

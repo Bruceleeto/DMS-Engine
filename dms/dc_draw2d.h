@@ -43,6 +43,8 @@ typedef struct DCImage DCImage;
 /* Load a .dt image (make assets turns assets/<dir>/<name>.png into one).
  * Returns NULL if it cannot be loaded. */
 DCImage* dc_image_load(const char* filename);
+/* The same from a .dt already in memory (embedded in the program) */
+DCImage* dc_image_load_buffer(const void* data, size_t size);
 void dc_image_free(DCImage* img);
 
 /* The picture's size in pixels */
