@@ -4,6 +4,8 @@
 #include <kos.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdalign.h>
+#include <sh4zam/shz_sh4zam.h>
 
 /* ================================================================
  * Init / Shutdown
@@ -14,11 +16,19 @@ typedef struct {
     int   height;         /* 480 default */
     float fov;            /* 60.0 default (degrees) */
     float near_z, far_z;  /* 0.1, 100.0 defaults */
-    int   vram_size;      /* PVR VRAM pool in bytes, default 1.5 MB */
+    int   vram_size;      /* PVR VRAM pool in bytes, default 2 MB */
+    /* This app calls dc_model_volume(). The tile bins are sized in pvr_init(),
+     * before any model exists, so it cannot be worked out. Costs ~525KB of
+     * texture RAM. */
+    bool  volumes;
 } DCInitParams;
 
 /* Init PVR, timing, internal state. Zero-init params for defaults. */
 void dc_init(DCInitParams params);
+
+/* Engine use (dc_model_volume): whether dc_init() was given .volumes = true,
+ * and so whether the translucent modifier list has tile bins to write into. */
+bool dc_volumes_enabled(void);
 
 /* Free engine resources, pvr_shutdown(). */
 void dc_shutdown(void);
@@ -46,12 +56,55 @@ float dc_fps(void);
 /* Milliseconds since boot. */
 uint64_t dc_time_ms(void);
 
+/* Frames since dc_init(). Use it to do a thing once a frame when a call can
+ * happen more than once (drawing into a target as well as the screen). */
+uint32_t dc_frame_count(void);
+
+/* ================================================================
+ * Frame statistics (shown by dc_debug_stats)
+ * ================================================================ */
+
+/* Parts of a frame the engine times by itself */
+enum { DC_PROF_ANIM, DC_PROF_CAM, DC_PROF_DRAW, DC_PROF_COUNT };
+
+/* Engine use: time a part. Nested calls for the same part count once. */
+void dc_prof_begin(int part);
+void dc_prof_end(int part);
+
+/* Averages over the last 60 frames */
+typedef struct {
+    bool     valid;                 /* false until the first 60 frames are in */
+    float    frame_ms;              /* dc_frame_begin to the end of dc_frame_end */
+    float    anim_us;               /* dc_model_animate */
+    float    cam_us;                /* dc_player_update, dc_camera_update */
+    float    draw_us;               /* drawing the queue */
+    uint32_t meshes_drawn, meshes_culled;
+    uint32_t verts_xformed, verts_clipped;
+} DCFrameStats;
+
+const DCFrameStats* dc_frame_stats(void);
+
 /* ================================================================
  * Display
  * ================================================================ */
 
 /* Set PVR background clear color (0xAARRGGBB). */
 void dc_set_clear_color(uint32_t argb);
+
+/* Hardware fog on every model (0xRRGGBB, blend from none at near to full at
+ * far, both in world units along the view). Free: the PVR does it per
+ * pixel from the depth. dc_set_fog_off() clears it (the default). */
+void dc_set_fog(uint32_t rgb, float near, float far);
+void dc_set_fog_off(void);
+
+/* The same, arriving over so many seconds from the fog as it is now: the
+ * colour and the distances ease there. A dc_set_fog() in the middle jumps
+ * straight to it. With no fog on yet it is set at once. */
+void dc_set_fog_over(uint32_t rgb, float near, float far, float seconds);
+
+/* The clear colour eased there over so many seconds (the sky following the
+ * fog, a dusk). dc_set_clear_color() in the middle jumps. */
+void dc_set_clear_color_over(uint32_t argb, float seconds);
 
 /* ================================================================
  * PVR list helpers (used by rendering code)
@@ -63,6 +116,52 @@ pvr_dr_state_t* dc_list_begin(int pvr_list);
 
 /* Finish the currently open list (if any). */
 void dc_list_finish(void);
+
+/* Engine use: the part of what is being drawn into that the polygons from now
+ * on may land in, in pixels. The PVR keeps polygons out of the 32 pixel tiles
+ * outside it, so the edges are rounded out to tiles. Only a scene with a
+ * camera whose view is smaller than the screen (dc_clip_scene) sends any of
+ * this; every other scene, and every render target, goes to the TA with no
+ * clip objects, no dummies and no clip bits, as before there was a clip. */
+void dc_list_clip(float x, float y, float w, float h);
+
+/* Engine use (the draw queue): whether the scene being flushed clips. On, a
+ * list opens with the whole render size clipped and every header carries the
+ * clip bit; off, nothing is sent. */
+void dc_clip_scene(bool on);
+
+/* PVR_USERCLIP_INSIDE << 16 while the scene clips, else 0 */
+extern uint32_t dc_clip_cmd;
+
+/* Engine use: on a context compiled straight into the store queues, before
+ * pvr_poly_compile. Set here and not on the compiled header: the store
+ * queues cannot be read back on real hardware, so a read-modify-write of a
+ * header there sends garbage (and it did: the TA locked up). */
+static inline void dc_cxt_clip(pvr_poly_cxt_t* cxt) {
+    cxt->gen.clip_mode = dc_clip_cmd ? PVR_USERCLIP_INSIDE : PVR_USERCLIP_DISABLE;
+}
+
+/* Engine use: send a header compiled ahead of time (in RAM, with no clip
+ * bit) to the TA, adding the clip bit when the scene clips. Goes through
+ * XMTRX, like the copy it replaces; load the matrix after. */
+static inline void dc_send_hdr(pvr_dr_state_t* dr, const pvr_poly_hdr_t* hdr) {
+    (void)dr;
+    if (!dc_clip_cmd) {
+        shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), hdr);
+        return;
+    }
+    alignas(32) pvr_poly_hdr_t h = *hdr;
+    h.cmd |= dc_clip_cmd;
+    shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &h);
+}
+
+/* Engine use (the draw queue): draw a scene into a texture (RGB565, not
+ * twiddled, w by h) before the screen's scene. Returns false if it cannot. */
+bool dc_scene_begin_texture(pvr_ptr_t txr, int w, int h);
+void dc_scene_end_texture(void);
+
+/* Size in pixels of what is being drawn into: the screen, or a render target */
+void dc_render_size(float* w, float* h);
 
 /* Get current DR state (only valid between dc_list_begin and dc_list_finish). */
 pvr_dr_state_t* dc_dr_state(void);

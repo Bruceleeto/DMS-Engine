@@ -1,4 +1,5 @@
 #include "dc_player.h"
+#include "dc_engine.h"
 #include <math.h>
 
 #define DC_PITCH_LIMIT_DEFAULT (SHZ_F_PI * 0.45f)
@@ -13,14 +14,14 @@ void dc_player_init(DCPlayer* p) {
     p->height       = 1.8f;
     p->eye_height   = 1.6f;
     p->radius       = 0.3f;
-    p->gravity      = 0.15f;
+    p->gravity      = 0.01f;   /* per frame^2: ~36 units/s^2 at 60fps */
     p->ground_snap  = 0.5f;
     p->max_step     = 0.35f;
     p->move_speed   = 1.0f;
     p->sprint_speed = 0.3f;
     p->look_speed   = 2.0f;
     p->pitch_limit  = DC_PITCH_LIMIT_DEFAULT;
-    p->jump_force   = 0.25f;
+    p->jump_force   = 0.15f;   /* ~1.1 units high, ~0.5s in the air */
 
     p->cam_distance  = 5.0f;
     p->cam_height    = 2.0f;
@@ -78,13 +79,24 @@ static void player_physics(DCPlayer* p, float dx, float dz, ColWorld* col) {
         }
     }
 
-    /* Gravity / ground snap */
+    /* Gravity / ground snap. Moving up (a jump) is never snapped back down. */
     float max_ground = col ? (resolved.y - col->min_y + 1.0f) : 50.0f;
     ColGroundHit gh = col_ground(col, resolved, max_ground);
     float feet_y = resolved.y - p->eye_height;
-    if (!gh.hit || feet_y > gh.y + p->ground_snap) {
+    if (!gh.hit || p->vy > 0.0f || feet_y > gh.y + p->ground_snap) {
         p->vy -= p->gravity;
         resolved.y += p->vy;
+
+        /* Going up: a ceiling met by the top of the head ends the rise */
+        if (p->vy > 0.0f) {
+            float head = p->height - p->eye_height;
+            ColRayHit ch = col_raycast(col, shz_vec3_init(resolved.x, resolved.y - p->vy + head, resolved.z),
+                                       shz_vec3_init(0.0f, 1.0f, 0.0f), p->vy + 0.01f);
+            if (ch.hit && ch.pos.y - head < resolved.y) {
+                resolved.y = ch.pos.y - head;
+                p->vy = 0.0f;
+            }
+        }
 
         if (gh.hit) {
             float max_ground2 = col ? (resolved.y - col->min_y + 1.0f) : 50.0f;
@@ -128,7 +140,7 @@ SHZ_NO_FAST_MATH
 static void update_fps(DCPlayer* p, DCCamera* cam,
                        const DCInput* inp, ColWorld* col, float dt) {
     /* Look: left stick */
-    cam->yaw   += inp->stick_x * p->look_speed * dt;
+    cam->yaw   -= inp->stick_x * p->look_speed * dt;
     cam->pitch += inp->stick_y * p->look_speed * 0.75f * dt;
     if (cam->pitch >  p->pitch_limit) cam->pitch =  p->pitch_limit;
     if (cam->pitch < -p->pitch_limit) cam->pitch = -p->pitch_limit;
@@ -144,8 +156,8 @@ static void update_fps(DCPlayer* p, DCCamera* cam,
     shz_sincos_t sc = shz_sincosf(cam->yaw);
     float fwd_x   =  sc.sin;
     float fwd_z   =  sc.cos;
-    float right_x =  sc.cos;
-    float right_z = -sc.sin;
+    float right_x = -sc.cos;
+    float right_z =  sc.sin;
 
     /* Build desired XZ movement from DPAD */
     float dx = 0.0f, dz = 0.0f;
@@ -183,7 +195,7 @@ static void update_third(DCPlayer* p, DCCamera* cam,
      */
 
     /* ---- 1. Turn: stick X rotates the player ---- */
-    p->yaw += inp->stick_x * p->turn_speed * dt;
+    p->yaw -= inp->stick_x * p->turn_speed * dt;
     p->yaw = wrap_angle(p->yaw);
 
     /* ---- 2. Move: stick Y along player's forward ---- */
@@ -241,7 +253,7 @@ static void update_third(DCPlayer* p, DCCamera* cam,
 SHZ_NO_FAST_MATH
 static void update_noclip(DCPlayer* p, DCCamera* cam,
                           const DCInput* inp, float dt) {
-    cam->yaw   += inp->stick_x * p->look_speed * dt;
+    cam->yaw   -= inp->stick_x * p->look_speed * dt;
     cam->pitch += inp->stick_y * p->look_speed * 0.75f * dt;
     if (cam->pitch >  p->pitch_limit) cam->pitch =  p->pitch_limit;
     if (cam->pitch < -p->pitch_limit) cam->pitch = -p->pitch_limit;
@@ -249,10 +261,11 @@ static void update_noclip(DCPlayer* p, DCCamera* cam,
     shz_sincos_t sc = shz_sincosf(cam->yaw);
     float fwd_x   =  sc.sin;
     float fwd_z   =  sc.cos;
-    float right_x =  sc.cos;
-    float right_z = -sc.sin;
+    float right_x = -sc.cos;
+    float right_z =  sc.sin;
 
-    float speed = 20.0f;
+    float speed   = 60.0f;   /* d-pad, units/sec */
+    float v_speed = 120.0f;  /* triggers (up/down), units/sec */
     float mx = 0.0f, mz = 0.0f;
 
     if (inp->buttons & CONT_DPAD_UP)    { mx += fwd_x;   mz += fwd_z; }
@@ -263,7 +276,7 @@ static void update_noclip(DCPlayer* p, DCCamera* cam,
     float my = inp->rtrig - inp->ltrig;
 
     cam->pos.x += mx * speed * dt;
-    cam->pos.y += my * speed * dt;
+    cam->pos.y += my * v_speed * dt;
     cam->pos.z += mz * speed * dt;
 
     p->yaw = cam->yaw;
@@ -277,6 +290,7 @@ void dc_player_update(DCPlayer* p, DCCamera* cam,
                       const DCInput* inp, ColWorld* col, float dt) {
     if (!inp || !inp->connected) return;
 
+    dc_prof_begin(DC_PROF_CAM);
     switch (p->cam_mode) {
         case DC_CAM_FPS:
             update_fps(p, cam, inp, col, dt);
@@ -288,4 +302,5 @@ void dc_player_update(DCPlayer* p, DCCamera* cam,
             update_noclip(p, cam, inp, dt);
             break;
     }
+    dc_prof_end(DC_PROF_CAM);
 }

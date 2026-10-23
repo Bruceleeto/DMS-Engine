@@ -1,9 +1,20 @@
 *.o
 *.a
 *.dms
+*.dt
 *.elf
+*.cdi
 
 converter/strippy
 clipping_sh4zam/pc/
 clipping_sh4zam/test.elf
 Sonic/pc/dude/dude.dms
+Sonic_example/romdisk/
+romdisk.img
+Docs/
+botboy/pc/
+arcade/pc/
+fresnel/pc/
+teapot/pc/
+refraction/pc/
+bump/pc/

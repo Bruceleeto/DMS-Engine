@@ -11,17 +11,47 @@
 /* Load DMS model from file. Returns NULL on failure. */
 DMSModel* dc_model_load(const char* filename);
 
-/* Load external textures for v4 models. No-op for v5 (embedded). */
-void dc_model_load_textures(DMSModel* model, const char* base_path);
-
 /* Free model and VRAM textures. */
 void dc_model_free(DMSModel* model);
+
+/* Print every mesh: material name, vertex and triangle counts, texture, alpha
+ * mode, flags. Those names are what the calls below are asked for by. */
+void dc_model_materials(const DMSModel* model);
+
+/* Draw everything wearing this Blender material see-through, at this alpha
+ * (0 invisible, 255 solid). Animated models only; a static model's lists are
+ * fixed at load, so set the alpha mode in Blender instead. Returns how many
+ * meshes it changed. */
+int dc_model_see_through(DMSModel* model, const char* material, uint8_t alpha);
+
+/* The texture on everything wearing this Blender material slides along by
+ * itself: u and v are how many texture widths a second, u across and v down
+ * (negative goes the other way). Water, lava, a conveyor belt, a screen of
+ * scrolling text. Said once at load; drawing is dc_draw() as usual. The
+ * texture wraps, so the model's UVs can run past 1 as they like. Returns how
+ * many meshes it changed.
+ *
+ *     dc_model_scroll(belt, "Belt", 0.0f, -1.5f);
+ */
+int dc_model_scroll(DMSModel* model, const char* material, float u, float v);
+
+/* The texture on everything wearing this Blender material is a sheet of
+ * frames, `across` by `down`, read left to right then down, and the mesh
+ * shows the next one `fps` times a second, round and round. The model's UVs
+ * cover the first frame; the engine moves them along. count is how many of
+ * the sheet's frames are used, 0 for all of them. A television, a fire, a
+ * blinking sign. Said once at load. Returns how many meshes it changed.
+ *
+ *     dc_model_flipbook(cabinet, "screen", 8, 8, 64, 12.0f);
+ */
+int dc_model_flipbook(DMSModel* model, const char* material, int across, int down,
+                      int count, float fps);
 
 /* ================================================================
  * Drawing
  * ================================================================ */
 
-/* Draw all meshes of a model. Requires an active PVR list (dc_list_begin).
+/* Draw all meshes of a model (opens each PVR list it needs).
  * Handles frustum culling, near-plane clipping, and skinned rendering. */
 void dc_model_draw(DMSModel* model, shz_vec3_t pos, float scale,
                    const DCCamera* cam);
@@ -39,6 +69,154 @@ void dc_model_draw_list(DMSModel* model, shz_vec3_t pos, float scale,
 void dc_model_draw_list_rotated(DMSModel* model, shz_vec3_t pos, float scale,
                                 float yaw, const DCCamera* cam, int target_list);
 
+/* Draw list turned any way (static models only). rot is 3 columns: where the
+ * model's x, y and z axes point in the world. */
+/* A skinned model squashed or stretched: a factor per axis of the model on top
+ * of scale (0 means 1). For static models, dc_draw's .stretch does it. */
+void dc_model_draw_list_stretched(DMSModel* model, shz_vec3_t pos, float scale, float yaw,
+                                  shz_vec3_t stretch, const DCCamera* cam, int target_list);
+void dc_model_draw_list_oriented(DMSModel* model, shz_vec3_t pos, float scale,
+                                 const float rot[9], const DCCamera* cam, int target_list);
+
+/* Engine use (dc_draw_ex .shadow): the model's flat shadow on the floor at
+ * floor_y. light is where the light is, or with sun the way it shines. */
+void dc_model_draw_shadow(DMSModel* model, shz_vec3_t pos, float scale, float yaw,
+                          const float* rot, const DCCamera* cam,
+                          shz_vec3_t light, bool sun, float floor_y, float dark);
+
+/* Engine use (dc_draw): a packed mesh (one colour, no skeleton) back to
+ * plain DMSVertex for good, before its vertices are changed */
+void dc_model_mesh_unpack(DMSMesh* mesh);
+
+/* Engine use (dc_particles): squares of 4 world-space vertices, submitted
+ * with the matrix now in xmtrx. A square that reaches the near plane is
+ * dropped whole, not clipped. Stops if the vertex buffer is full. */
+void dc_model_submit_quads(const DMSVertex* verts, int quads, pvr_dr_state_t* dr);
+
+/* Translucent, because inside the shape the mesh has to stop covering what is
+ * behind it. The opaque list writes every pixel it keeps and ignores the
+ * blend, so there a volume can only swap one picture for another. */
+#define VOL_POLY_LIST    PVR_LIST_TR_POLY
+#define VOL_MOD_LIST     PVR_LIST_TR_MOD
+
+/* Wherever the mesh `shape` covers the mesh `on`, `on` goes see-through so
+ * that `shows` can be seen behind it -- an x-ray window that moves with the
+ * model. All three named by Blender material, all in the one model:
+ *
+ *     dc_model_volume(dino, "Scanner", "Dinosaur", "Bones");
+ *
+ * Said once at load; drawing is dc_draw() as usual. False if a material was
+ * not found. */
+bool dc_model_volume(DMSModel* model, const char* shape, const char* on,
+                     const char* shows);
+
+/* How much of `on` is left inside the shape, 0 (gone, pure x-ray) to 255
+ * (solid, no effect), and what colour it is tinted there -- 0xFFFFFF for
+ * none. The default is a light blue wash at a quarter strength. */
+void dc_model_volume_inside(DMSModel* model, uint8_t alpha, uint32_t rgb);
+
+/* Engine use: give the vertex buffer guard its budget back. The PVR winds the
+ * buffer back at the start of every scene, not every frame, so a frame drawing
+ * render targets calls this once per target as well as once for the screen. */
+void dc_model_frame_begin(void);
+
+/* Engine use (dc_draw flush): the mesh the volume works on, two-parameter,
+ * always in the TR list. */
+void dc_model_draw_modified(DMSModel* model, shz_vec3_t pos, float scale, float yaw,
+                            const DCCamera* cam);
+
+/* Engine use (dc_draw flush): the shape, as triangles, into PVR_LIST_TR_MOD */
+void dc_model_draw_volume(DMSModel* model, shz_vec3_t pos, float scale, float yaw,
+                          const DCCamera* cam);
+
+/* Engine use (dc_draw_ex .add): model draws that follow are additive, all in
+ * the transparent list, until set back to false */
+void dc_model_set_add(bool add);
+
+/* Engine use (dc_model_texture() in dc_draw2d.h): every mesh wearing the
+ * material draws with this texture, or its own again for NULL. material NULL
+ * means every mesh. Returns how many meshes it changed. */
+int dc_model_retexture(DMSModel* model, const char* material, const dttex_info_t* tex);
+
+/* Engine use: build a mesh's PVR header from its material flags and a texture
+ * (txr NULL for none) */
+void dc_model_compile_header(const DMSMesh* mesh, pvr_poly_hdr_t* out, int pvrformat,
+                             int width, int height, pvr_ptr_t txr);
+
+/* ================================================================
+ * Reflections
+ * ================================================================ */
+
+/* Engine use: whether the mesh shows the environment image -- metal, or a
+ * glossy enough non-metal (from the glTF roughness and clear coat) */
+bool dc_model_reflects(const DMSMesh* mesh);
+
+/* Engine use: puts the built-in reflection image into video memory (dc_draw.c) */
+void dc_env_default_prepare(void);
+
+/* Engine use (dc_set_environment): the image metallic meshes reflect, or NULL */
+void dc_model_set_environment(const dttex_info_t* tex);
+
+/* Engine use (dc_set_bloom): while on, model draws leave out every mesh but
+ * the ones that give off light (DMS_MAT_GLOW) */
+void dc_model_set_glow_only(bool on);
+
+/* ================================================================
+ * Light
+ * ================================================================ */
+
+/* A light that can move. See dc_set_light() in dc_draw.h. */
+typedef struct {
+    shz_vec3_t pos;      /* where the light is */
+    bool       sun;      /* pos is the way it shines instead (a far away light) */
+    float      r, g, b;  /* colour, 0 to 1. All zero means white */
+    float      range;    /* how far it reaches. 0 means 500. A sun has none */
+    float      ambient;  /* 0 to 1, how lit the side facing away is. 0 means 0.25 */
+    int        bands;    /* cel shading: the light in this many flat steps with
+                          * sharp edges between them. 0 means smooth */
+} DCLight;
+
+/* How many lights at once (dc_set_lights) */
+#define DC_MAX_LIGHTS 4
+
+/* Engine use (dc_set_light, dc_set_lights): the lights, or none */
+void dc_model_set_light(const DCLight* light);
+void dc_model_set_lights(const DCLight* lights, int count);
+
+/* Engine use: the light is cel shaded, so solid meshes of static models also
+ * draw a pass in the TR list */
+bool dc_model_cel_on(void);
+
+/* ================================================================
+ * Markers
+ * ================================================================ */
+
+/* Where a model marks places rather than showing something: the corners of
+ * every mesh whose material has that name, in the model's own space, each
+ * corner once and in the order the file holds them. Those meshes stop being
+ * drawn, since asking for them says they are markers.
+ *
+ * It is how an effect made in code is put where the model says it goes: a
+ * flame over a burner, a muzzle, a place a door swings from. Returns how many
+ * there were, which may be more than max. */
+int dc_model_points(DMSModel* model, const char* material,
+                    shz_vec3_t* out, int max);
+
+/* An Empty placed in Blender with this name, or NULL if there is none: a
+ * spawn point, where a camera starts, a pickup. Its copies count as the same
+ * name -- Blender calls them "pin.001", "pin.002" -- so this is the first.
+ *
+ *     const DMSEntity* start = dc_model_entity(level, "spawn");
+ *     if (start) player.pos = start->pos;
+ */
+const DMSEntity* dc_model_entity(const DMSModel* model, const char* name);
+
+/* Every Empty with this name and its copies, in the order the file holds
+ * them: the pins of a bowling lane, the coins in a level. Returns how many
+ * there were, which may be more than max. */
+int dc_model_entities(const DMSModel* model, const char* name,
+                      const DMSEntity** out, int max);
+
 /* ================================================================
  * Animation
  * ================================================================ */
@@ -53,6 +231,66 @@ void dc_model_set_anim(DMSModel* model, int anim_index);
 /* Get current animation index, or -1 if no skeleton. */
 int dc_model_get_anim(DMSModel* model);
 
+/* How long a clip is, in seconds (0 for no such clip), and how far into the
+ * current one it is */
+float dc_model_anim_length(const DMSModel* model, int anim_index);
+float dc_model_anim_time(const DMSModel* model);
+
+/* The current clip has played through at least once since it was set or
+ * restarted. Clips loop, so this stays true until the next set or restart:
+ * an attack, a landing, a shot, held on its last frames until the game
+ * moves on. */
+bool dc_model_anim_done(const DMSModel* model);
+
+/* The current clip from its start again (dc_model_set_anim() leaves a clip
+ * already playing alone, so a second shot of the same clip goes here) */
+void dc_model_anim_restart(DMSModel* model);
+
+/* The index of the clip with this name, as Blender named it, or -1 if there
+ * is none:
+ *
+ *     dc_model_set_anim(robot, dc_model_anim_index(robot, "walk"));
+ */
+int dc_model_anim_index(const DMSModel* model, const char* name);
+
+/* ================================================================
+ * Bounds
+ * ================================================================ */
+
+/* The box round a model's vertices, in its own units (the bind pose for a
+ * skinned one). material picks the meshes wearing that Blender material,
+ * NULL takes them all. A platform's top is .max.y, its half width
+ * (.max.x - .min.x) / 2, its middle (.max.x + .min.x) / 2: no numbers copied
+ * out of Blender. Nothing matched gives a box of nothing: min above max. */
+typedef struct {
+    shz_vec3_t min, max;
+} DCBounds;
+DCBounds dc_model_bounds(const DMSModel* model, const char* material);
+
+/* Sets the colour of every vertex of the meshes wearing a material, from a
+ * function given where each vertex is (the model's own units, the bind pose
+ * for a skinned one). Alpha is kept. Cheap enough every frame for a few
+ * thousand vertices: light worked out by hand, a pattern thrown on a floor.
+ * Returns how many vertices were set. */
+int dc_model_recolour(DMSModel* model, const char* material,
+                      uint32_t (*colour)(shz_vec3_t pos, void* user), void* user);
+
+/* The texture a material wears, shrunk to n by n (n a power of two), into
+ * out[n * n] as 0xAARRGGBB, row by row from v = 0 up. For reading what a
+ * texture looks like in code, e.g. the colours of a stained glass window.
+ * Twiddled 16 bit textures, compressed or not. Returns 1 if it was read. */
+int dc_model_texture_colours(const DMSModel* model, const char* material,
+                             uint32_t* out, int n);
+
+/* A white cube one unit across (-0.5 to 0.5), no texture, drawn like any
+ * model: a marker, a dot, a debug box, with DCDrawOpts.tint for its colour.
+ * Free it with dc_model_free(). */
+DMSModel* dc_model_cube(void);
+
+/* Engine use: dc_draw_ex() with a tint. 0xRRGGBB multiplied into every
+ * vertex colour of the draws that follow; 0 is off. */
+void dc_model_set_tint(uint32_t rgb);
+
 /* ================================================================
  * Render statistics
  * ================================================================ */
@@ -62,6 +300,21 @@ typedef struct {
     uint32_t meshes_culled;
     uint32_t verts_xformed;
     uint32_t verts_clipped;
+    uint32_t tris_drawn;
+    uint32_t meshes_vtxfull;   /* skipped: PVR vertex buffer nearly full */
+    /* Profiling: nanoseconds spent, and vertices sent, in each kind of draw */
+    uint64_t ns_lit, ns_plain, ns_clip, ns_reflect, ns_env;
+    uint32_t verts_lit, verts_plain, verts_reflect, verts_env;
+    uint64_t stall_lit, stall_env, stall_reflect;   /* cycles frozen on data cache misses */
+    uint64_t ns_lights, stall_lights;   /* several lights over a packed mesh: the loop alone */
+    uint32_t verts_lights;
+    uint64_t ns_skin;          /* skinned meshes: skin + submit */
+    uint32_t verts_skin, skin_bone_loads;   /* bone_loads: skin matrix changes */
+    uint64_t ns_cull, ns_hdr;  /* static meshes: sphere tests; header + matrix reload */
+    uint32_t hdrs_sent;
+    /* The sun loop over packed meshes: [0] no highlight, [1] highlight, [2] env image */
+    uint64_t ns_sun[3];
+    uint32_t verts_sun[3], sun_power_v;   /* power_v: highlight power x vertices */
 } DCModelStats;
 
 /* Reset counters to zero. */
@@ -69,5 +322,8 @@ void dc_model_reset_stats(void);
 
 /* Get accumulated stats since last reset. */
 const DCModelStats* dc_model_get_stats(void);
+/* Debug: times the sun loop's parts over a model's packed meshes into RAM,
+ * once, and prints ns a vertex for each */
+void dc_model_bench_sun(const DMSModel* model);
 
 #endif /* DC_MODEL_H */

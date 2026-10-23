@@ -1,4 +1,5 @@
 #include "dc_camera.h"
+#include "dc_engine.h"
 #include <math.h>
 
 #define DC_PITCH_LIMIT (SHZ_F_PI * 0.49f)  /* ~88 degrees */
@@ -12,6 +13,7 @@ void dc_camera_init(DCCamera* cam) {
     cam->yaw = 0.0f;
     cam->pitch = 0.0f;
     cam->fov = 60.0f;
+    cam->view = (DCViewport){ 0 };
 }
 
 /* ================================================================
@@ -86,20 +88,41 @@ static void build_frustum(DCCamera* cam, float fov_rad, float aspect) {
 }
 
 void dc_camera_update(DCCamera* cam) {
+    dc_prof_begin(DC_PROF_CAM);
     float fov_rad = SHZ_DEG_TO_RAD(cam->fov);
-    float aspect = SCR_W / SCR_H;
+    float vw = cam->view.w > 0.0f ? cam->view.w : SCR_W;
+    float vh = cam->view.h > 0.0f ? cam->view.h : SCR_H;
+    float aspect = vw / vh;
 
     /* Build projection_view matrix into XMTRX, then store */
-    shz_xmtrx_init_identity();
-    shz_xmtrx_apply_permutation_wxyz();
-    shz_xmtrx_apply_screen(SCR_W, SCR_H);
+    /* Not init_identity + apply_permutation_wxyz: sh4zam's SH4 apply version
+     * "zeroes" fr2 with fmul by 0, so leftover Inf/NaN in fr2 poisons the
+     * screen-y row with NaN and everything drawn vanishes. */
+    shz_xmtrx_init_permutation_wxyz();
+    shz_xmtrx_apply_screen(vw, vh);
     shz_xmtrx_apply_perspective(fov_rad, aspect, NEAR_Z);
     shz_xmtrx_apply_rotation_x(cam->pitch);
+    /* The vertex loop negates z to get from Blender's right-handed world
+     * into the PVR's. On its own that is a mirror: x came out the wrong way
+     * round, and every model drew as its own reflection. Reflecting x here
+     * too makes it a half turn instead, which is what looking along +z
+     * from a right-handed world is. */
+    shz_xmtrx_apply_scale(-1.0f, 1.0f, 1.0f);
     shz_xmtrx_apply_rotation_y(cam->yaw);
     shz_xmtrx_store_4x4(&cam->_pv_matrix);
+    /* Into a part of the screen: shifted by its corner. Screen x and y are
+     * rows 1 and 2 of the matrix, w is row 0, so x += corner.x * w */
+    if (cam->view.x != 0.0f || cam->view.y != 0.0f) {
+        for (int c = 0; c < 4; c++) {
+            cam->_pv_matrix.elem2D[c][1] += cam->view.x * cam->_pv_matrix.elem2D[c][0];
+            cam->_pv_matrix.elem2D[c][2] += cam->view.y * cam->_pv_matrix.elem2D[c][0];
+        }
+        shz_xmtrx_load_4x4(&cam->_pv_matrix);
+    }
 
     /* Build world-space frustum planes */
     build_frustum(cam, fov_rad, aspect);
+    dc_prof_end(DC_PROF_CAM);
 }
 
 /* ================================================================
@@ -110,8 +133,10 @@ void dc_camera_fps(DCCamera* cam, const DCInput* inp,
                    float move_speed, float look_speed, float dt) {
     if (!inp || !inp->connected) return;
 
-    /* Look — stick */
-    cam->yaw   += inp->stick_x * look_speed * dt;
+    /* Look — stick. Yaw grows towards +x, which is on the left when
+     * looking along +z in a right-handed world, so right on the stick
+     * takes yaw down. */
+    cam->yaw   -= inp->stick_x * look_speed * dt;
     cam->pitch += inp->stick_y * look_speed * 0.75f * dt;
 
     if (cam->pitch >  DC_PITCH_LIMIT) cam->pitch =  DC_PITCH_LIMIT;
@@ -121,8 +146,8 @@ void dc_camera_fps(DCCamera* cam, const DCInput* inp,
     shz_sincos_t sc = shz_sincosf(cam->yaw);
     float fwd_x   =  sc.sin;
     float fwd_z   =  sc.cos;
-    float right_x =  sc.cos;
-    float right_z = -sc.sin;
+    float right_x = -sc.cos;
+    float right_z =  sc.sin;
 
     float mx = 0.0f, mz = 0.0f;
 
@@ -148,7 +173,7 @@ void dc_camera_orbit(DCCamera* cam, shz_vec3_t target, float distance,
                      const DCInput* inp, float look_speed, float dt) {
     if (!inp || !inp->connected) return;
 
-    cam->yaw   += inp->stick_x * look_speed * dt;
+    cam->yaw   -= inp->stick_x * look_speed * dt;
     cam->pitch += inp->stick_y * look_speed * 0.75f * dt;
 
     if (cam->pitch >  DC_PITCH_LIMIT) cam->pitch =  DC_PITCH_LIMIT;
@@ -157,9 +182,11 @@ void dc_camera_orbit(DCCamera* cam, shz_vec3_t target, float distance,
     shz_sincos_t sc_y = shz_sincosf(cam->yaw);
     shz_sincos_t sc_p = shz_sincosf(cam->pitch);
 
-    cam->pos.x = target.x + distance * sc_p.cos * sc_y.sin;
+    /* Behind the target along the view direction, so the camera faces it
+     * (positive pitch looks down, so the camera goes up) */
+    cam->pos.x = target.x - distance * sc_p.cos * sc_y.sin;
     cam->pos.y = target.y + distance * sc_p.sin;
-    cam->pos.z = target.z + distance * sc_p.cos * sc_y.cos;
+    cam->pos.z = target.z - distance * sc_p.cos * sc_y.cos;
 }
 
 /* ================================================================
@@ -177,7 +204,7 @@ void dc_camera_look_at(DCCamera* cam, shz_vec3_t target) {
     float xz_dist = shz_sqrtf_fsrra(dx * dx + dz * dz);
 
     cam->yaw   = shz_atanf(dx / (dz + 0.0001f));
-    cam->pitch = shz_atanf(dy / (xz_dist + 0.0001f));
+    cam->pitch = -shz_atanf(dy / (xz_dist + 0.0001f));   /* positive pitch looks down */
 
     /* Fix quadrant for atan */
     if (dz < 0.0f) cam->yaw += SHZ_F_PI;

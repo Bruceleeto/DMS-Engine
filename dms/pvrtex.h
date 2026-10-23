@@ -6,6 +6,8 @@
 #include <pvrtex/file_dctex.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <malloc.h>
+#include <kos/fs.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -27,6 +29,8 @@ typedef struct {
   } flags;
   uint16_t width;
   uint16_t height;
+  uint16_t pixel_w;   /* the picture's own size; width/height are the PVR's (a power of two) */
+  uint16_t pixel_h;
   pvr_ptr_t ptr;
 } dttex_info_t;
 
@@ -37,48 +41,39 @@ typedef struct {
  * @param texinfo The texture texinfo struct
  * @return int 1 on success, 0 on failure
  */
-static inline int pvrtex_load(const char *filename, dttex_info_t *texinfo) {
-  int success = 1;
-  FILE *fp = NULL;
-  do {
-    fp = fopen(filename, "rb");
-    if (fp == NULL) {
-      printf("Error: fopen %s failed, %s\n", filename, strerror(errno));
-      success = 0;
-      break;
-    }
-    fread(&(texinfo->hdr), sizeof(dt_header_t), 1, fp);
-    size_t tdatasize =
-        texinfo->hdr.chunk_size - ((1 + texinfo->hdr.header_size) << 5);
-
-    texinfo->flags.compressed = fDtIsCompressed(&texinfo->hdr);
-    texinfo->flags.mipmapped = fDtIsMipmapped(&texinfo->hdr);
-    texinfo->flags.palettised = fDtIsPalettized(&texinfo->hdr);
-    texinfo->flags.strided = fDtIsStrided(&texinfo->hdr);
-    texinfo->flags.twiddled = fDtIsTwiddled(&texinfo->hdr);
-    texinfo->width = fDtGetPvrWidth(&texinfo->hdr);
-    texinfo->height = fDtGetPvrHeight(&texinfo->hdr);
-
-    texinfo->pvrformat = texinfo->hdr.pvr_type & 0xFFC00000;
-
-    void *buffer = malloc(tdatasize);
-    fread(buffer, tdatasize, 1, fp);
-
-    texinfo->ptr = pvr_mem_malloc(tdatasize);
-    if (texinfo->ptr == NULL) {
-      printf("Error: pvr_mem_malloc failed\n");
-      success = 0;
-      break;
-    }
-
-    pvr_txr_load(buffer, texinfo->ptr, tdatasize);
-    free(buffer);
-  } while (0);
-
-  if (fp != NULL) {
-    fclose(fp);
+static inline int pvrtex_load_from_buffer(const void *data, size_t size, dttex_info_t *texinfo);
+/* The whole of a file in one read, into a 32-byte aligned buffer, which is the
+ * one shape the ISO layer DMAs straight from the disc: anything else goes a
+ * sector at a time through its cache, and each call pays the drive's latency.
+ * Returns malloc'd memory the caller frees, NULL on failure. */
+static inline void *dc_file_read(const char *filename, size_t *size_out) {
+  file_t fd = fs_open(filename, O_RDONLY);
+  if (fd < 0) {
+    printf("Error: cannot open %s\n", filename);
+    return NULL;
   }
-  return success;
+  ssize_t size = fs_total(fd);
+  if (size <= 0) { fs_close(fd); return NULL; }
+  void *buf = memalign(32, ((size_t)size + 31) & ~(size_t)31);
+  if (!buf) { fs_close(fd); return NULL; }
+  ssize_t got = fs_read(fd, buf, size);
+  fs_close(fd);
+  if (got != size) {
+    printf("Error: %s: read %ld of %ld bytes\n", filename, (long)got, (long)size);
+    free(buf);
+    return NULL;
+  }
+  if (size_out) *size_out = (size_t)size;
+  return buf;
+}
+
+static inline int pvrtex_load(const char *filename, dttex_info_t *texinfo) {
+  size_t size;
+  void *buf = dc_file_read(filename, &size);
+  if (!buf) return 0;
+  int ok = pvrtex_load_from_buffer(buf, size, texinfo);
+  free(buf);
+  return ok;
 }
 
 /**
@@ -111,6 +106,8 @@ static inline int pvrtex_load_from_buffer(const void *data, size_t size, dttex_i
   texinfo->flags.twiddled = fDtIsTwiddled(&texinfo->hdr);
   texinfo->width = fDtGetPvrWidth(&texinfo->hdr);
   texinfo->height = fDtGetPvrHeight(&texinfo->hdr);
+  texinfo->pixel_w = fDtGetWidth(&texinfo->hdr);
+  texinfo->pixel_h = fDtGetHeight(&texinfo->hdr);
 
   texinfo->pvrformat = texinfo->hdr.pvr_type & 0xFFC00000;
 

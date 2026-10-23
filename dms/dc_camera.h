@@ -10,12 +10,24 @@
  * Camera struct
  * ================================================================ */
 
+/* The world is Blender's: x right, y up, z towards you, right-handed. A
+ * camera with yaw 0 looks along +z; yaw grows towards +x. */
+/* A part of the screen, in pixels */
+typedef struct { float x, y, w, h; } DCViewport;
+
 typedef struct {
     /* Public — user can read/write directly */
     shz_vec3_t pos;
     float      yaw;        /* radians */
     float      pitch;      /* radians, clamped ±89° */
     float      fov;        /* degrees (default 60) */
+    DCViewport view;       /* the part of the screen it draws into; all zero (the
+                            * default) is the whole screen. Split screen is one
+                            * camera per part, each dc_set_camera()ed before its
+                            * draws: what each draws is clipped to its part. The
+                            * PVR clips by 32 pixel tiles, so edges go on a
+                            * multiple of 32 (two views 640x224 with a 32 pixel
+                            * band between, not 640x240 each). */
 
     /* Internal — rebuilt by dc_camera_update() */
     shz_mat4x4_t  _pv_matrix   __attribute__((aligned(32)));

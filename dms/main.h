@@ -9,7 +9,7 @@
 #define SCR_W   640.0f
 #define SCR_H   480.0f
 #define NEAR_Z  0.1f
-#define FAR_Z   200.0f
+#define FAR_Z   1000.0f   /* cull distance only (no far clip); lower it to trade view distance for speed */
 
 /* ---- Player constants ---- */
 #define EYE_HEIGHT      1.6f
@@ -18,13 +18,11 @@
 #define GROUND_SNAP     0.5f
 #define MAX_STEP_HEIGHT 0.35f
 
-/* ---- Outcode flags ---- */
+/* ---- Outcode flag: vertex is behind the near plane ---- */
 #define OC_NEAR   0x01
-#define OC_FAR    0x02
-#define OC_LEFT   0x04
-#define OC_RIGHT  0x08
-#define OC_BOTTOM 0x10
-#define OC_TOP    0x20
+
+/* ---- .dms file magic ---- */
+#define DMS_MAGIC   0x54534D44u   /* "DMST" */
 
 /* ================================================================
  * Animation / Skeleton structures
@@ -42,6 +40,8 @@ typedef struct {
 typedef struct {
     char name[64];
     int  parent;
+    bool skinned;           /* owns vertices: a control or IK bone does not, and
+                             * it can sit anywhere, so it stays out of the bounds */
     DMSTransform bindPose;
     DMSTransform localPose;
     shz_mat4x4_t worldPose          __attribute__((aligned(32)));
@@ -64,6 +64,7 @@ typedef struct {
     int           animCount;
     int           currentAnim;
     float         currentTime;
+    int           loops;        /* times the clip has run through since it was set */
 } DMSSkeleton;
 
 /* ================================================================
@@ -78,31 +79,121 @@ typedef struct __attribute__((aligned(32))) {
     uint32_t flags;
 } DMSVertex;
 
+/* material_flags bit 2: the glTF material is double sided. Single-sided
+ * meshes have their back faces culled by the PVR */
+#define DMS_MAT_DOUBLE_SIDED   (1u << 2)
+/* material_flags bit 12: mesh is collided with but never drawn */
+#define DMS_MAT_COLLISION_ONLY (1u << 12)
+/* material_flags bit 13: glTF metallic of 0.5 or more. Reflects the environment
+ * image once dc_set_environment() has been called */
+#define DMS_MAT_METALLIC       (1u << 13)
+/* material_flags bit 14: a mirror (solid, metallic, roughness near 0). Shows
+ * the environment image in place of its own texture */
+#define DMS_MAT_MIRROR         (1u << 14)
+/* material_flags bit 15: set by dc_model_points(). The mesh marks a place
+ * rather than being something to look at, so it is not drawn */
+#define DMS_MAT_MARKER         (1u << 15)
+/* material_flags bit 16: the glTF material has an Emission colour, so the mesh
+ * gives off light rather than only catching it. dc_set_bloom() makes those
+ * meshes glow into the picture around them */
+#define DMS_MAT_GLOW           (1u << 16)
+/* material_flags bit 17: set at load when every vertex of the mesh has the
+ * same colour. Lit by one light, such a mesh sends the colour once and each
+ * vertex only how bright it is (see render_fast_intensity) */
+#define DMS_MAT_ONE_COLOUR     (1u << 17)
+/* material_flags bit 18: not metal but smooth (roughness near 0): glass,
+ * polished plastic. Reflects the environment image as metal does */
+#define DMS_MAT_GLOSSY         (1u << 18)
+/* material_flags bits 20-23 and 24-31: the highlight a light makes on it,
+ * from the glTF roughness and clear coat. Power 0 is none, 1 to 8 tighter as
+ * it goes up; strength 0 to 255 */
+#define DMS_MAT_SHINE_POWER(f)    (((f) >> 20) & 0xfu)
+#define DMS_MAT_SHINE_STRENGTH(f) (((f) >> 24) & 0xffu)
+
 typedef struct {
     uint32_t vertex_count;
     int32_t  texture_id;
-    uint32_t material_color;
+    uint32_t rim_color;             /* 0xRRGGBB the edges light up (Fresnel), 0 for none */
     float    bound_cx, bound_cy, bound_cz;
     float    bound_radius;
-    uint32_t material_flags;        /* v5: packed material bits */
-    float    alpha_cutoff;          /* v5: for CUTOUT alpha mode */
+    float    bound_min[3], bound_max[3];   /* the box round its vertices, computed at load */
+    uint32_t material_flags;        /* packed material bits */
+    float    alpha_cutoff;          /* for CUTOUT alpha mode */
+    uint32_t tri_count;             /* triangles across all strips (computed at load) */
+    uint32_t block;                 /* block this mesh belongs to */
     DMSVertex *vertices;            /* bind-pose / static verts */
     DMSVertex *animated_vertices;   /* skinned output (NULL if static) */
+    uint32_t  colour;               /* packed meshes: the one colour every vertex has */
+    uint8_t   packed;               /* 1: vertices are packed for the sun loops, see
+                                     * dms_strip_end() and dc_model.c's DMSPacked */
+    uint32_t  env_frame;            /* dc_frame_count() + 1 when its own pass last showed
+                                     * the environment image (env_single) */
+    float    scroll_u, scroll_v;    /* dc_model_scroll(): texture widths a second */
+    float    flip_w, flip_h;        /* dc_model_flipbook(): one frame, as a fraction of the sheet */
+    uint16_t flip_across, flip_count;
+    float    flip_fps;
     pvr_poly_hdr_t header __attribute__((aligned(32)));
 } DMSMesh;
 
+/* Whether vertex v ends its strip. A packed mesh (one colour, no skeleton)
+ * keeps it in bit 12 of the float nz, where the flags were. */
+static inline int dms_strip_end(const DMSMesh* mesh, uint32_t v) {
+    uint32_t f = mesh->vertices[v].flags;
+    return mesh->packed ? (f & 0x1000u) != 0 : f == 0xF0000000u;
+}
+
+/* A Blender Empty: a place marked in the scene, found by name with
+ * dc_model_entity(). Where it is in the model's own space, the same space the
+ * vertices are in. */
 typedef struct {
+    char       name[32];
+    shz_vec3_t pos;
+    float      rot[9];      /* where its x, y and z axes point: 3 columns, as
+                             * DCDrawOpts.rot takes them */
+    shz_vec3_t scale;
+} DMSEntity;
+
+/* static levels are cut into blocks by location; one sphere culls
+ * every mesh in the block */
+typedef struct {
+    float cx, cy, cz, radius;
+} DMSBlock;
+
+/* Meshes of one block inside one list sit together in the file; a run is
+ * that range, so a culled block is skipped without touching its meshes */
+typedef struct {
+    uint32_t block, first, count;
+} DMSBlockRun;
+
+typedef struct DMSModel {
     uint32_t    mesh_count;
-    uint32_t    opaque_count;       /* v5: meshes [0..opaque-1] → OP list */
-    uint32_t    cutout_count;       /* v5: meshes [opaque..+cutout-1] → PT list */
-    uint32_t    transparent_count;  /* v5: remaining → TR list */
+    uint32_t    opaque_count;       /* meshes [0..opaque-1] → OP list */
+    uint32_t    cutout_count;       /* meshes [opaque..+cutout-1] → PT list */
+    uint32_t    transparent_count;  /* remaining → TR list */
     DMSMesh    *meshes;
+    uint32_t    block_count;        /* 0 for animated models */
+    DMSBlock   *blocks;
+    DMSBlockRun *runs;              /* built at load, static models only */
+    uint32_t    list_runs[4];       /* runs of alpha mode l: [list_runs[l], list_runs[l+1]) */
     dttex_info_t *textures;
     int          texture_count;
     DMSSkeleton *skeleton;
     float        anim_bound_cx, anim_bound_cy, anim_bound_cz;
     float        anim_bound_radius;
     float        max_bind_radius;
+    shz_vec3_t   bound_min, bound_max;  /* the box round every vertex, in its own units */
+    uint32_t     metallic_count;    /* meshes that reflect the environment: metal, and
+                                     * glossy paint or plastic (dc_model_reflects) */
+    uint32_t     mirror_count;      /* of those, mirrors */
+    uint32_t     glow_count;        /* meshes that give off light (bloom) */
+    char       (*material_names)[32]; /* glTF material name of each mesh, or NULL */
+    DMSEntity   *entities;          /* the Empties in the .glb */
+    uint32_t     entity_count;
+    /* dc_model_volume(). Mesh or texture number plus one, so 0 is "not asked for" */
+    void        *mod_headers;       /* the two-parameter header, built on first use */
+    uint32_t     vol_shape;         /* the mesh that is the shape */
+    uint32_t     vol_on;            /* the mesh it shows through */
+    uint32_t     vol_inside;        /* the texture it shows there */
 } DMSModel;
 
 /* ================================================================

@@ -1,10 +1,17 @@
+#include <strings.h>
 #include "main.h"
 #define CGLTF_IMPLEMENTATION
 #include "include/cgltf.h"
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_PNG
+#define STBI_ONLY_JPEG
+#include "include/stb_image.h"
 #include <algorithm>
 #include <numeric>
 #include <random>
 #include <omp.h>
+#include <set>
+#include <functional>
 
 // Transform data
 typedef struct Transform {
@@ -46,7 +53,10 @@ typedef struct {
   uint8_t boneId;     // 1
   int8_t nx, ny, nz;  // 3
   float boneWeight;   // 4
-} Vertex;             // 32 bytes
+  uint8_t dull;       // how far below the mesh's shine strength this vertex
+                      // is, 0 (as strong) to 255 (none): read from the
+                      // metallic-roughness texture where it paints parts
+} Vertex;
 
 typedef struct {
   Vertex *vertices;         // Dynamic vertex array
@@ -57,6 +67,7 @@ typedef struct {
   unsigned int *stripLengths; // Array of strip lengths
   int stripCount;             // Number of strips
   int looseIndexCount;        // Number of indices in loose triangles
+  int prestripped;            // BuildBlocks already made the strips
   int vertexCount;
   int indexCount;
   int textureId;
@@ -67,6 +78,21 @@ typedef struct {
   float alphaCutoff;      // for CUTOUT mode (default 0.5)
   int doubleSided;        // 0=single-sided, 1=double-sided
   int wrapU, wrapV;       // raw glTF sampler values (10497=REPEAT, 33071=CLAMP, 33648=MIRROR)
+  int blockId;            // static levels: which block (by location) this mesh is in
+  int collisionOnly;      // named "collision": collided with, never drawn
+  char materialName[32];  // glTF material name, so code can find the mesh
+  int metallic;           // glTF metallicFactor of 0.5 or more: 1 = reflects the
+                          // environment, 2 = a mirror (roughness near 0)
+  int glossy;             // not metal, roughness GLOSS_ROUGHNESS or less (glass,
+                          // polished plastic): reflects the environment too
+  int glow;               // glTF emissiveFactor is not black: the material gives
+                          // off light, so dc_set_bloom() blooms it
+  uint32_t rim;           // Blender's Sheen colour, 0xRRGGBB: the edges facing
+                          // away from the camera light up this colour (Fresnel)
+  int shinePower;         // the highlight a light makes on it: 0 for none, else
+                          // 1 to 8, how tight it is (glossier is tighter)
+  int shineStrength;      // how bright that highlight is, 0 to 255
+  int vertexShine;        // the shine was read at each vertex (Vertex.dull)
 
 } Mesh;
 
@@ -74,6 +100,7 @@ typedef struct {
   Mesh *meshes;
   int meshCount;
   Skeleton *skeleton;
+  int blockCount;         // 0 = no blocks (animated models)
 } Model;
 
 typedef struct {
@@ -105,6 +132,22 @@ join_strips(const triangle_stripper::primitive_vector &originalStrips);
 std::vector<std::vector<uint32_t>> g_raw_strips;
 std::vector<uint32_t> g_loose_triangles;
 std::vector<std::array<float, 9>> g_rtTriangles; // v0, v1, v2 packed
+
+/* What the bake needs to know about materials. Meshes are merged by texture and
+ * material colour, so those two are the key. */
+static std::map<int, std::array<float, 3>> g_texAverage;   /* textureId -> average colour */
+static std::map<std::pair<int, uint32_t>, std::array<float, 3>> g_emissive;
+
+/* Blender empties: places marked in the scene rather than things drawn. The
+ * code finds them by name (dc_model_entity). rot is where the empty's x, y and
+ * z axes point, 3 columns, the same as DCDrawOpts.rot. */
+struct EntityRecord {
+  char name[32];
+  float pos[3];
+  float rot[9];
+  float scale[3];
+};
+static std::vector<EntityRecord> g_entities;
 
 bool LoadGLTF(const char *filename);
 void Cleanup(void);
@@ -207,6 +250,12 @@ struct StripInfo {
   std::vector<uint32_t> indices; // Indices making up this strip
   uint32_t stripId;              // ID of this strip
 };
+
+// Metallic materials smoother than this are mirrors
+#define MIRROR_ROUGHNESS 0.25f
+/* Smooth enough that anything shows a reflection, metal or not: glass is
+ * near 0, paint and plastic 0.4 and up */
+#define GLOSS_ROUGHNESS 0.15f
 
 struct MeshTriStrips {
   std::vector<Vertex> vertices;         // Optimized vertex buffer
@@ -495,42 +544,132 @@ static int RunPvrtex(const char *inPath, const char *outPath) {
     int w = 0, h = 0;
     bool square = GetImageDimensions(inPath, &w, &h) && (w == h);
 
+    /* -r near: a size the PVR cannot use (not a power of two) is resized to
+     * the nearest one. UVs are 0 to 1, so nothing else changes. */
     char cmd[1024];
     snprintf(cmd, sizeof(cmd),
-        "/opt/toolchains/dc/kos/utils/pvrtex/pvrtex -i \"%s\" -o \"%s\" -f auto -c%s",
+        "/opt/toolchains/dc/kos/utils/pvrtex/pvrtex -i \"%s\" -o \"%s\" -f auto -c -r near%s",
         inPath, outPath, square ? " -m" : "");
     printf("  Running: %s\n", cmd);
     return system(cmd);
 }
 
-/* Check if a cgltf image is a PNG with an alpha channel (RGBA or gray+alpha).
+/* Look at a cgltf image's alpha pixels, like pvrtex -f auto does:
+ * 0 = fully opaque, 1 = on/off alpha (cutout), 2 = soft alpha (blend).
+ * A few soft pixels on an otherwise on/off texture are just antialiased
+ * cutout edges (foliage, fences), so they still count as cutout.
  * Works for both embedded (buffer_view) and external images. */
-static bool CgltfImageHasAlpha(cgltf_image *img, const char *inputDir) {
-    uint8_t hdr[26];
+static int CgltfImageAlphaKind(cgltf_image *img, const char *inputDir) {
+    static std::map<cgltf_image *, int> cache;
+    auto it = cache.find(img);
+    if (it != cache.end()) return it->second;
+
+    int w, h, n;
+    unsigned char *px = NULL;
 
     if (img->buffer_view) {
-        const uint8_t *p = (const uint8_t *)img->buffer_view->buffer->data
+        const stbi_uc *p = (const stbi_uc *)img->buffer_view->buffer->data
                            + img->buffer_view->offset;
-        if (img->buffer_view->size < 26) return false;
-        memcpy(hdr, p, 26);
+        px = stbi_load_from_memory(p, (int)img->buffer_view->size, &w, &h, &n, 4);
     } else if (img->uri && strncmp(img->uri, "data:", 5) != 0) {
         char path[512];
         snprintf(path, sizeof(path), "%s/%s", inputDir, img->uri);
-        FILE *f = fopen(path, "rb");
-        if (!f) return false;
-        size_t n = fread(hdr, 1, 26, f);
-        fclose(f);
-        if (n < 26) return false;
-    } else {
-        return false;
+        px = stbi_load(path, &w, &h, &n, 4);
     }
 
-    /* PNG signature check, then color type at IHDR offset 25:
-     * 4 = grayscale+alpha, 6 = RGBA */
-    if (hdr[0] == 0x89 && hdr[1] == 'P' && hdr[2] == 'N' && hdr[3] == 'G')
-        return (hdr[25] == 4 || hdr[25] == 6);
+    int kind = 0;
+    if (px) {
+        size_t clear = 0, soft = 0;
+        for (size_t i = 0, count = (size_t)w * h; i < count; i++) {
+            unsigned char a = px[i * 4 + 3];
+            if (a == 0) clear++;
+            else if (a != 255) soft++;
+        }
+        stbi_image_free(px);
+        if (soft * 4 > clear + soft) kind = 2;   /* over 25% of see-through pixels are soft */
+        else if (clear + soft > 0) kind = 1;
+    }
+    cache[img] = kind;
+    return kind;
+}
 
-    return false; /* JPEG never has alpha */
+/* Average colour of an image, 0..1, see-through pixels left out. The bake uses
+ * it as the colour a textured surface bounces. */
+static bool CgltfImageAverage(cgltf_image *img, const char *inputDir, float *rgb) {
+    static std::map<cgltf_image *, std::array<float, 4>> cache;
+    auto it = cache.find(img);
+    if (it == cache.end()) {
+        int w, h, n;
+        unsigned char *px = NULL;
+        if (img->buffer_view) {
+            const stbi_uc *p = (const stbi_uc *)img->buffer_view->buffer->data
+                               + img->buffer_view->offset;
+            px = stbi_load_from_memory(p, (int)img->buffer_view->size, &w, &h, &n, 4);
+        } else if (img->uri && strncmp(img->uri, "data:", 5) != 0) {
+            char path[512];
+            snprintf(path, sizeof(path), "%s/%s", inputDir, img->uri);
+            px = stbi_load(path, &w, &h, &n, 4);
+        }
+        std::array<float, 4> avg = {1.0f, 1.0f, 1.0f, 0.0f};
+        if (px) {
+            double sum[3] = {0, 0, 0}, weight = 0;
+            for (size_t i = 0, count = (size_t)w * h; i < count; i++) {
+                double a = px[i * 4 + 3] / 255.0;
+                sum[0] += px[i * 4] * a; sum[1] += px[i * 4 + 1] * a; sum[2] += px[i * 4 + 2] * a;
+                weight += a;
+            }
+            stbi_image_free(px);
+            if (weight > 0)
+                avg = {(float)(sum[0] / weight / 255.0), (float)(sum[1] / weight / 255.0),
+                       (float)(sum[2] / weight / 255.0), 1.0f};
+        }
+        it = cache.insert({img, avg}).first;
+    }
+    rgb[0] = it->second[0]; rgb[1] = it->second[1]; rgb[2] = it->second[2];
+    return it->second[3] != 0.0f;
+}
+
+/* Pixels of an image as RGBA, or NULL. Kept for the whole run. */
+static const unsigned char *CgltfImagePixels(cgltf_image *img, const char *inputDir,
+                                             int *w, int *h) {
+    struct Px { unsigned char *px; int w, h; };
+    static std::map<cgltf_image *, Px> cache;
+    auto it = cache.find(img);
+    if (it == cache.end()) {
+        Px p = {NULL, 0, 0};
+        int n;
+        if (img->buffer_view) {
+            const stbi_uc *d = (const stbi_uc *)img->buffer_view->buffer->data
+                               + img->buffer_view->offset;
+            p.px = stbi_load_from_memory(d, (int)img->buffer_view->size, &p.w, &p.h, &n, 4);
+        } else if (img->uri && strncmp(img->uri, "data:", 5) != 0) {
+            char path[512];
+            snprintf(path, sizeof(path), "%s/%s", inputDir, img->uri);
+            p.px = stbi_load(path, &p.w, &p.h, &n, 4);
+        }
+        it = cache.insert({img, p}).first;
+    }
+    *w = it->second.w; *h = it->second.h;
+    return it->second.px;
+}
+
+/* How bright the highlight a light makes is, 0 to 1, and how glossy (so how
+ * tight). Smoother is tighter and brighter; paint and plastic are far dimmer
+ * than metal. A clear coat is a glossy layer over the paint (car bodies), so
+ * it shines on its own. */
+static float ShineOf(float metal, float rough, const cgltf_material *mat, float *glossOut) {
+    float gloss = 1.0f - (rough < 0.0f ? 0.0f : rough > 1.0f ? 1.0f : rough);
+    float strength = metal >= 0.5f ? gloss : gloss * gloss * 0.5f;
+    if (mat->has_clearcoat && mat->clearcoat.clearcoat_factor > 0.0f) {
+        float ccGloss = 1.0f - mat->clearcoat.clearcoat_roughness_factor;
+        float ccStrength = mat->clearcoat.clearcoat_factor * ccGloss;
+        if (ccStrength > strength) {
+            strength = ccStrength;
+            gloss = ccGloss;
+        }
+    }
+    *glossOut = gloss;
+    return strength >= 0.05f && gloss >= 0.2f ? strength : 0.0f;
 }
 
 void ExtractAndConvertTextures(cgltf_data *data, const char *inputFilename) {
@@ -547,8 +686,22 @@ void ExtractAndConvertTextures(cgltf_data *data, const char *inputFilename) {
     printf("\n=== Texture Extraction ===\n");
     printf("Found %zu images in GLB/GLTF\n", data->images_count);
 
+    /* Only base colour images are drawn. Normal, roughness and occlusion maps
+     * would only fill VRAM. */
+    std::vector<bool> used(data->images_count, false);
+    for (size_t m = 0; m < data->materials_count; m++) {
+        const cgltf_texture *t =
+            data->materials[m].pbr_metallic_roughness.base_color_texture.texture;
+        if (data->materials[m].has_pbr_metallic_roughness && t && t->image)
+            used[t->image - data->images] = true;
+    }
+
     for (size_t i = 0; i < data->images_count; i++) {
         cgltf_image *img = &data->images[i];
+        if (!used[i]) {
+            printf("  Texture %zu: not a base colour, skipped\n", i);
+            continue;
+        }
         const void *imageData = NULL;
         size_t imageSize = 0;
         char tmpPath[512], dtPath[512];
@@ -604,6 +757,658 @@ void ExtractAndConvertTextures(cgltf_data *data, const char *inputFilename) {
     printf("=== Texture Extraction Complete ===\n\n");
 }
 
+// A mesh placed in the scene by a node. The same cgltf_mesh can appear many
+// times (Blender linked duplicates); each placement becomes its own copy.
+struct MeshInstance {
+  cgltf_node *node;
+  cgltf_mesh *mesh;
+  float world[16]; // column-major, from cgltf_node_transform_world
+  bool bake;       // false for skinned nodes and identity transforms
+  int bone;        // rigid part: every vertex follows this bone (-1 = none)
+};
+
+// Game rips name their invisible collision geometry; it must never be drawn
+static bool NameHasCollision(const char *name) {
+  if (!name)
+    return false;
+  for (const char *p = name; *p; p++)
+    if (strncasecmp(p, "collision", 9) == 0)
+      return true;
+  return false;
+}
+
+static bool IsIdentity(const float *m) {
+  for (int i = 0; i < 16; i++) {
+    float expect = (i % 5 == 0) ? 1.0f : 0.0f;
+    if (fabsf(m[i] - expect) > 1e-6f)
+      return false;
+  }
+  return true;
+}
+
+static bool NodeInScene(const cgltf_node *node, const cgltf_scene *scene) {
+  if (!scene)
+    return true;
+  while (node->parent)
+    node = node->parent;
+  for (size_t i = 0; i < scene->nodes_count; i++) {
+    if (scene->nodes[i] == node)
+      return true;
+  }
+  return false;
+}
+
+/* Every node with no mesh and nothing under it is a place: an empty. The nodes
+ * that only group meshes have children and are left out, and so are bones. */
+static void CollectEntities(cgltf_data *data) {
+  g_entities.clear();
+  const cgltf_scene *scene = data->scene ? data->scene
+                           : data->scenes_count ? &data->scenes[0] : NULL;
+  std::set<const cgltf_node *> joints;
+  for (size_t s = 0; s < data->skins_count; s++)
+    for (size_t j = 0; j < data->skins[s].joints_count; j++)
+      joints.insert(data->skins[s].joints[j]);
+
+  for (size_t n = 0; n < data->nodes_count; n++) {
+    const cgltf_node *node = &data->nodes[n];
+    if (node->mesh || node->children_count || joints.count(node)) continue;
+    if (!NodeInScene(node, scene)) continue;
+
+    float w[16];
+    cgltf_node_transform_world(node, w);
+    EntityRecord e = {};
+    snprintf(e.name, sizeof(e.name), "%s", node->name ? node->name : "");
+    for (int i = 0; i < 3; i++) {
+      e.pos[i] = w[12 + i];
+      float len = sqrtf(w[i * 4] * w[i * 4] + w[i * 4 + 1] * w[i * 4 + 1] +
+                        w[i * 4 + 2] * w[i * 4 + 2]);
+      e.scale[i] = len;
+      for (int k = 0; k < 3; k++)
+        e.rot[i * 3 + k] = len > 0.0f ? w[i * 4 + k] / len : (i == k ? 1.0f : 0.0f);
+    }
+    g_entities.push_back(e);
+    printf("Entity '%s' at (%.2f, %.2f, %.2f)\n", e.name, e.pos[0], e.pos[1], e.pos[2]);
+  }
+}
+
+// Walk nodes in file order so exports that already have applied transforms
+// come out identical to the old mesh-list path.
+static std::vector<MeshInstance> CollectMeshInstances(cgltf_data *data) {
+  std::vector<MeshInstance> instances;
+  const cgltf_scene *scene = data->scene;
+  if (!scene && data->scenes_count > 0)
+    scene = &data->scenes[0];
+
+  for (size_t n = 0; n < data->nodes_count; n++) {
+    cgltf_node *node = &data->nodes[n];
+    if (!node->mesh || !NodeInScene(node, scene))
+      continue;
+
+    MeshInstance inst;
+    inst.node = node;
+    inst.mesh = node->mesh;
+    cgltf_node_transform_world(node, inst.world);
+    // glTF: a skinned mesh's own node transform is ignored, joints drive it
+    inst.bake = !node->skin && !IsIdentity(inst.world);
+    inst.bone = -1;
+    instances.push_back(inst);
+  }
+
+  // No nodes reference meshes: fall back to the raw mesh list
+  if (instances.empty()) {
+    for (size_t m = 0; m < data->meshes_count; m++) {
+      MeshInstance inst = {NULL, &data->meshes[m], {0}, false, -1};
+      instances.push_back(inst);
+    }
+  }
+  return instances;
+}
+
+/* ================================================================
+ * Rigid parts: props parented to bones, and objects animated without
+ * an armature. Both become bones the runtime already knows how to
+ * play: every vertex of the part follows one bone with full weight.
+ * ================================================================ */
+
+// Column-major 4x4 helpers (same layout as cgltf_node_transform_world)
+static void Mat4Identity(float *m) {
+  for (int i = 0; i < 16; i++)
+    m[i] = (i % 5 == 0) ? 1.0f : 0.0f;
+}
+
+static void Mat4Mul(const float *a, const float *b, float *out) {
+  float r[16];
+  for (int c = 0; c < 4; c++) {
+    for (int row = 0; row < 4; row++) {
+      float s = 0.0f;
+      for (int k = 0; k < 4; k++)
+        s += a[k * 4 + row] * b[c * 4 + k];
+      r[c * 4 + row] = s;
+    }
+  }
+  memcpy(out, r, sizeof(r));
+}
+
+static bool Mat4Invert(const float *m, float *out) {
+  float inv[16];
+  inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] +
+           m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+  inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] -
+           m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+  inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] +
+           m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+  inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] -
+            m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+  inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] -
+           m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+  inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] +
+           m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+  inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] -
+           m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+  inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] +
+            m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+  inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] +
+           m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+  inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] -
+           m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+  inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] +
+            m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+  inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] -
+            m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+  inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] -
+           m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+  inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] +
+           m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+  inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] -
+            m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+  inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] +
+            m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+
+  float det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+  if (fabsf(det) < 1e-12f) {
+    Mat4Identity(out);
+    return false;
+  }
+  for (int i = 0; i < 16; i++)
+    out[i] = inv[i] / det;
+  return true;
+}
+
+// T * R * S, the order the runtime builds bone matrices in
+static void Mat4FromTransform(const Transform &t, float *m) {
+  float x = t.rotation.x, y = t.rotation.y, z = t.rotation.z, w = t.rotation.w;
+  float r[9] = {1 - 2 * (y * y + z * z), 2 * (x * y + w * z),     2 * (x * z - w * y),
+                2 * (x * y - w * z),     1 - 2 * (x * x + z * z), 2 * (y * z + w * x),
+                2 * (x * z + w * y),     2 * (y * z - w * x),     1 - 2 * (x * x + y * y)};
+  float s[3] = {t.scale.x, t.scale.y, t.scale.z};
+  for (int c = 0; c < 3; c++) {
+    for (int row = 0; row < 3; row++)
+      m[c * 4 + row] = r[c * 3 + row] * s[c];
+    m[c * 4 + 3] = 0.0f;
+  }
+  m[12] = t.translation.x;
+  m[13] = t.translation.y;
+  m[14] = t.translation.z;
+  m[15] = 1.0f;
+}
+
+static Matrix MatrixFromMat4(const float *m) {
+  return (Matrix){m[0], m[4], m[8],  m[12], m[1], m[5], m[9],  m[13],
+                  m[2], m[6], m[10], m[14], m[3], m[7], m[11], m[15]};
+}
+
+// Scale from column lengths (raymath's MatrixDecompose uses rows)
+static Transform TransformFromMat4(const float *m) {
+  Transform t;
+  t.translation = (Vector3){m[12], m[13], m[14]};
+  float sx = sqrtf(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
+  float sy = sqrtf(m[4] * m[4] + m[5] * m[5] + m[6] * m[6]);
+  float sz = sqrtf(m[8] * m[8] + m[9] * m[9] + m[10] * m[10]);
+  float det = m[0] * (m[5] * m[10] - m[6] * m[9]) -
+              m[4] * (m[1] * m[10] - m[2] * m[9]) +
+              m[8] * (m[1] * m[6] - m[2] * m[5]);
+  if (det < 0.0f)
+    sx = -sx;
+  t.scale = (Vector3){sx, sy, sz};
+
+  if (fabsf(sx) < 1e-8f || sy < 1e-8f || sz < 1e-8f) {
+    t.rotation = QuaternionIdentity();
+    return t;
+  }
+  float r[16];
+  memcpy(r, m, sizeof(r));
+  for (int i = 0; i < 3; i++) {
+    r[i] /= sx;
+    r[4 + i] /= sy;
+    r[8 + i] /= sz;
+  }
+  r[12] = r[13] = r[14] = 0.0f;
+  t.rotation = QuaternionNormalize(QuaternionFromMatrix(MatrixFromMat4(r)));
+  return t;
+}
+
+static void ReadAnimKey(const cgltf_animation_sampler *s, size_t key,
+                        float *out, int n) {
+  // Cubic spline stores in-tangent, value, out-tangent per key
+  size_t idx = (s->interpolation == cgltf_interpolation_type_cubic_spline)
+                   ? key * 3 + 1
+                   : key;
+  cgltf_accessor_read_float(s->output, idx, out, n);
+}
+
+// Local TRS of a node at a given time: rest pose overridden by its channels
+static Transform SampleNodeLocal(const cgltf_animation *anim,
+                                 const cgltf_node *node, float time) {
+  Transform pose = GetNodeTransform(node);
+
+  for (size_t c = 0; c < anim->channels_count; c++) {
+    const cgltf_animation_channel *ch = &anim->channels[c];
+    if (ch->target_node != node)
+      continue;
+    const cgltf_animation_sampler *s = ch->sampler;
+    size_t n = s->input->count;
+    if (n == 0)
+      continue;
+
+    size_t k0 = 0, k1 = 0;
+    float alpha = 0.0f;
+    float tFirst, tLast;
+    cgltf_accessor_read_float(s->input, 0, &tFirst, 1);
+    cgltf_accessor_read_float(s->input, n - 1, &tLast, 1);
+    if (time >= tLast) {
+      k0 = k1 = n - 1;
+    } else if (time > tFirst) {
+      for (size_t k = 0; k + 1 < n; k++) {
+        float a, b;
+        cgltf_accessor_read_float(s->input, k, &a, 1);
+        cgltf_accessor_read_float(s->input, k + 1, &b, 1);
+        if (time >= a && time <= b) {
+          k0 = k;
+          k1 = k + 1;
+          alpha = (b > a) ? (time - a) / (b - a) : 0.0f;
+          break;
+        }
+      }
+    }
+    if (s->interpolation == cgltf_interpolation_type_step)
+      alpha = 0.0f;
+
+    switch (ch->target_path) {
+    case cgltf_animation_path_type_translation: {
+      Vector3 a, b;
+      ReadAnimKey(s, k0, &a.x, 3);
+      ReadAnimKey(s, k1, &b.x, 3);
+      pose.translation = Vector3Lerp(a, b, alpha);
+    } break;
+    case cgltf_animation_path_type_rotation: {
+      Quaternion a, b;
+      ReadAnimKey(s, k0, &a.x, 4);
+      ReadAnimKey(s, k1, &b.x, 4);
+      pose.rotation = QuaternionNormalize(QuaternionSlerp(a, b, alpha));
+    } break;
+    case cgltf_animation_path_type_scale: {
+      Vector3 a, b;
+      ReadAnimKey(s, k0, &a.x, 3);
+      ReadAnimKey(s, k1, &b.x, 3);
+      pose.scale = Vector3Lerp(a, b, alpha);
+    } break;
+    default:
+      break;
+    }
+  }
+  return pose;
+}
+
+static float AnimationDuration(const cgltf_animation *anim) {
+  float duration = 0.0f;
+  for (size_t c = 0; c < anim->channels_count; c++) {
+    const cgltf_accessor *input = anim->channels[c].sampler->input;
+    if (input->count == 0)
+      continue;
+    float last;
+    cgltf_accessor_read_float(input, input->count - 1, &last, 1);
+    if (last > duration)
+      duration = last;
+  }
+  return duration;
+}
+
+struct RigidBone {
+  cgltf_node *node; // NULL for the shared static bone
+  float offset[16]; // parent bone space -> this node's parent space
+};
+
+// Give every non-skinned mesh of an animated model a bone to follow:
+//  - parented (at any depth) to an armature joint -> that joint
+//  - under a node moved by the animation -> a new bone for that node
+//  - otherwise -> one shared bone that never moves
+// Vertices are moved into the space the chosen bone's inverse bind matrix
+// expects, so the runtime's bone * IBM * vertex lands them in place.
+static void SetupRigidParts(cgltf_data *data, cgltf_skin *skin,
+                            std::vector<MeshInstance> &instances) {
+  // Nodes moved directly by animation (armature joints are handled already)
+  std::set<const cgltf_node *> animated;
+  for (size_t a = 0; a < data->animations_count; a++) {
+    const cgltf_animation *anim = &data->animations[a];
+    for (size_t c = 0; c < anim->channels_count; c++) {
+      const cgltf_animation_channel *ch = &anim->channels[c];
+      if (!ch->target_node || ch->target_path == cgltf_animation_path_type_weights)
+        continue;
+      if (GetNodeBoneIndex(ch->target_node, skin) < 0)
+        animated.insert(ch->target_node);
+    }
+  }
+
+  // Nearest node at or above n that moves: a joint or an animated node
+  auto anchorOf = [&](cgltf_node *n) -> cgltf_node * {
+    for (; n; n = n->parent) {
+      if (GetNodeBoneIndex(n, skin) >= 0 || animated.count(n))
+        return n;
+    }
+    return NULL;
+  };
+
+  bool anyRigid = false, anyMoving = false;
+  for (const MeshInstance &inst : instances) {
+    if (!inst.node || inst.node->skin)
+      continue;
+    anyRigid = true;
+    if (anchorOf(inst.node))
+      anyMoving = true;
+  }
+  // Static files stay static; skinned-only files need nothing extra
+  if (!anyRigid || (!skin && !anyMoving))
+    return;
+
+  // Space the runtime skeleton lives in. The converter bakes only the
+  // armature's scale into root bones, so its rotation/translation are dropped:
+  // F = armatureScale * inverse(armatureWorld). Identity without an armature.
+  float F[16];
+  Mat4Identity(F);
+  if (skin) {
+    cgltf_node *armature = skin->skeleton;
+    if (!armature && skin->joints_count > 0 && skin->joints[0]->parent)
+      armature = skin->joints[0]->parent;
+    if (armature) {
+      float A[16], invA[16], S[16];
+      cgltf_node_transform_world(armature, A);
+      Mat4Invert(A, invA);
+      Mat4Identity(S);
+      S[0] = sqrtf(A[0] * A[0] + A[1] * A[1] + A[2] * A[2]);
+      S[5] = sqrtf(A[4] * A[4] + A[5] * A[5] + A[6] * A[6]);
+      S[10] = sqrtf(A[8] * A[8] + A[9] * A[9] + A[10] * A[10]);
+      Mat4Mul(S, invA, F);
+    }
+  }
+
+  int firstNew = skeleton.boneCount;
+  std::vector<Bone> newBones;
+  std::vector<RigidBone> rigid;
+  std::map<const cgltf_node *, int> boneOfNode;
+  int staticBone = -1;
+
+  std::function<int(cgltf_node *)> boneFor = [&](cgltf_node *a) -> int {
+    int joint = GetNodeBoneIndex(a, skin);
+    if (joint >= 0)
+      return joint;
+    auto it = boneOfNode.find(a);
+    if (it != boneOfNode.end())
+      return it->second;
+
+    // Parent bone first so it gets the lower index (runtime needs that)
+    cgltf_node *p = a->parent ? anchorOf(a->parent) : NULL;
+    int parentBone = p ? boneFor(p) : -1;
+
+    float parentWorld[16], world[16];
+    Mat4Identity(parentWorld);
+    if (a->parent)
+      cgltf_node_transform_world(a->parent, parentWorld);
+    cgltf_node_transform_world(a, world);
+
+    RigidBone rb;
+    rb.node = a;
+    if (p) {
+      float pw[16], invPw[16];
+      cgltf_node_transform_world(p, pw);
+      Mat4Invert(pw, invPw);
+      Mat4Mul(invPw, parentWorld, rb.offset);
+    } else {
+      Mat4Mul(F, parentWorld, rb.offset);
+    }
+
+    Bone b = {};
+    if (a->name)
+      strncpy(b.name, a->name, sizeof(b.name) - 1);
+    else
+      snprintf(b.name, sizeof(b.name), "node_%d", (int)(a - data->nodes));
+    b.parent = parentBone;
+    float local[16], m[16];
+    Mat4FromTransform(GetNodeTransform(a), local);
+    Mat4Mul(rb.offset, local, m);
+    b.bindPose = TransformFromMat4(m);
+    b.localPose = b.bindPose;
+    float bindWorld[16], ibm[16];
+    Mat4Mul(F, world, bindWorld);
+    Mat4Invert(bindWorld, ibm);
+    b.inverseBindMatrix = MatrixFromMat4(ibm);
+
+    int idx = firstNew + (int)newBones.size();
+    newBones.push_back(b);
+    rigid.push_back(rb);
+    boneOfNode[a] = idx;
+    return idx;
+  };
+
+  int attached = 0, moving = 0, fixed = 0;
+  for (MeshInstance &inst : instances) {
+    if (!inst.node || inst.node->skin)
+      continue;
+
+    float G[16], X[16];
+    cgltf_node_transform_world(inst.node, G);
+    cgltf_node *anchor = anchorOf(inst.node);
+    int joint = anchor ? GetNodeBoneIndex(anchor, skin) : -1;
+
+    if (joint >= 0) {
+      // Prop on a bone: undo that joint's bind so bone * IBM * p = F * G * v
+      float jw[16], invJw[16], ibm[16], invIbm[16], t[16];
+      cgltf_node_transform_world(anchor, jw);
+      Mat4Invert(jw, invJw);
+      Mat4Identity(ibm);
+      if (skin->inverse_bind_matrices)
+        cgltf_accessor_read_float(skin->inverse_bind_matrices, joint, ibm, 16);
+      Mat4Invert(ibm, invIbm);
+      Mat4Mul(invJw, G, t);
+      Mat4Mul(invIbm, t, X);
+      inst.bone = joint;
+      attached++;
+    } else {
+      if (anchor) {
+        inst.bone = boneFor(anchor);
+        moving++;
+      } else {
+        if (staticBone < 0) {
+          Bone b = {};
+          strncpy(b.name, "static", sizeof(b.name) - 1);
+          b.parent = -1;
+          b.bindPose = (Transform){{0, 0, 0}, QuaternionIdentity(), {1, 1, 1}};
+          b.localPose = b.bindPose;
+          b.inverseBindMatrix = MatrixIdentity();
+          staticBone = firstNew + (int)newBones.size();
+          newBones.push_back(b);
+          RigidBone rb;
+          rb.node = NULL;
+          Mat4Identity(rb.offset);
+          rigid.push_back(rb);
+        }
+        inst.bone = staticBone;
+        fixed++;
+      }
+      Mat4Mul(F, G, X);
+    }
+    memcpy(inst.world, X, sizeof(X));
+    inst.bake = !IsIdentity(X);
+  }
+
+  int total = firstNew + (int)newBones.size();
+  printf("Rigid parts: %d on bones, %d animated, %d static (%d new bones, %d total)\n",
+         attached, moving, fixed, (int)newBones.size(), total);
+  if (total > 256)
+    printf("WARNING: %d bones exceeds the 256 a vertex can address\n", total);
+  if (newBones.empty())
+    return;
+
+  skeleton.bones = (Bone *)realloc(skeleton.bones, total * sizeof(Bone));
+  memcpy(&skeleton.bones[firstNew], newBones.data(), newBones.size() * sizeof(Bone));
+
+  // No armature: build the animation list from the file
+  if (!skin && data->animations_count > 0) {
+    skeleton.animCount = (int)data->animations_count;
+    skeleton.animations = (Animation *)calloc(skeleton.animCount, sizeof(Animation));
+    for (int i = 0; i < skeleton.animCount; i++) {
+      Animation *dst = &skeleton.animations[i];
+      if (data->animations[i].name)
+        strncpy(dst->name, data->animations[i].name, sizeof(dst->name) - 1);
+      else
+        snprintf(dst->name, sizeof(dst->name), "anim_%d", i);
+      dst->duration = AnimationDuration(&data->animations[i]);
+      dst->frameCount = (int)(dst->duration * 30.0f) + 1;
+      dst->boneCount = 0;
+      dst->framePoses = NULL;
+    }
+  }
+
+  // Widen every animation's pose table with the new bones
+  for (int i = 0; i < skeleton.animCount; i++) {
+    Animation *anim = &skeleton.animations[i];
+    const cgltf_animation *src = &data->animations[i];
+    Transform *oldPoses = (Transform *)anim->framePoses;
+    Transform *poses =
+        (Transform *)calloc((size_t)anim->frameCount * total, sizeof(Transform));
+
+    for (int f = 0; f < anim->frameCount; f++) {
+      Transform *row = &poses[(size_t)f * total];
+      if (oldPoses)
+        memcpy(row, &oldPoses[(size_t)f * anim->boneCount],
+               anim->boneCount * sizeof(Transform));
+
+      float time = f * (1.0f / 30.0f);
+      for (size_t b = 0; b < rigid.size(); b++) {
+        if (!rigid[b].node) {
+          row[firstNew + b] = skeleton.bones[firstNew + b].bindPose;
+          continue;
+        }
+        float local[16], m[16];
+        Mat4FromTransform(SampleNodeLocal(src, rigid[b].node, time), local);
+        Mat4Mul(rigid[b].offset, local, m);
+        row[firstNew + b] = TransformFromMat4(m);
+      }
+    }
+    free(oldPoses);
+    anim->framePoses = (Transform **)poses;
+    anim->boneCount = total;
+  }
+
+  skeleton.boneCount = total;
+}
+
+// Move a primitive's vertices into world space so levels no longer need
+// "apply transforms" in Blender.
+static void BakeNodeTransform(Mesh *mesh, const float *m) {
+  // Normal matrix = cofactor of the 3x3 part (inverse-transpose up to scale)
+  float c[9] = {
+      m[5] * m[10] - m[6] * m[9], m[6] * m[8] - m[4] * m[10], m[4] * m[9] - m[5] * m[8],
+      m[2] * m[9] - m[1] * m[10], m[0] * m[10] - m[2] * m[8], m[1] * m[8] - m[0] * m[9],
+      m[1] * m[6] - m[2] * m[5],  m[2] * m[4] - m[0] * m[6],  m[0] * m[5] - m[1] * m[4]};
+  float det = m[0] * c[0] + m[1] * c[1] + m[2] * c[2];
+  float sign = det < 0.0f ? -1.0f : 1.0f;
+
+  for (int i = 0; i < mesh->vertexCount; i++) {
+    Vertex *v = &mesh->vertices[i];
+    float x = v->x, y = v->y, z = v->z;
+    v->x = m[0] * x + m[4] * y + m[8] * z + m[12];
+    v->y = m[1] * x + m[5] * y + m[9] * z + m[13];
+    v->z = m[2] * x + m[6] * y + m[10] * z + m[14];
+
+    float nx = v->nx / 127.0f, ny = v->ny / 127.0f, nz = v->nz / 127.0f;
+    float tx = (c[0] * nx + c[3] * ny + c[6] * nz) * sign;
+    float ty = (c[1] * nx + c[4] * ny + c[7] * nz) * sign;
+    float tz = (c[2] * nx + c[5] * ny + c[8] * nz) * sign;
+    float len = sqrtf(tx * tx + ty * ty + tz * tz);
+    if (len > 1e-8f) {
+      v->nx = (int8_t)(tx / len * 127.0f);
+      v->ny = (int8_t)(ty / len * 127.0f);
+      v->nz = (int8_t)(tz / len * 127.0f);
+    }
+
+    Vertex *o = &mesh->originalVertices[i];
+    o->x = v->x; o->y = v->y; o->z = v->z;
+    o->nx = v->nx; o->ny = v->ny; o->nz = v->nz;
+  }
+
+  // Mirrored (negative scale) transforms flip the winding
+  if (det < 0.0f) {
+    for (int i = 0; i + 2 < mesh->indexCount; i += 3)
+      std::swap(mesh->indices[i + 1], mesh->indices[i + 2]);
+  }
+}
+
+/* A mesh whose shine was read at each vertex (an atlas: chrome, rubber and
+ * plastic in one) is split in two: the triangles that shine, and the ones
+ * that do not. The second has no highlight and no reflection pass, so the
+ * whole of it is not sent again for a bumper along its edge. */
+static void SplitDullTriangles(Model *m) {
+  int count = m->meshCount;
+  for (int i = 0; i < count; i++) {
+    Mesh *src = &m->meshes[i];
+    if (!src->vertexShine || src->indexCount < 3) continue;
+    std::vector<unsigned int> lit, dull;
+    for (int t = 0; t + 2 < src->indexCount; t += 3) {
+      const unsigned int *tri = &src->indices[t];
+      bool any = false;
+      for (int k = 0; k < 3; k++) any |= src->vertices[tri[k]].dull < 255;
+      (any ? lit : dull).insert((any ? lit : dull).end(), tri, tri + 3);
+    }
+    if (lit.empty() || dull.empty()) continue;
+
+    // The dull part: its own vertices, gathered from the triangles
+    std::vector<int> remap(src->vertexCount, -1);
+    std::vector<Vertex> verts;
+    for (unsigned int &ix : dull) {
+      if (remap[ix] < 0) { remap[ix] = (int)verts.size(); verts.push_back(src->vertices[ix]); }
+      ix = remap[ix];
+    }
+    m->meshes = (Mesh *)realloc(m->meshes, (m->meshCount + 1) * sizeof(Mesh));
+    src = &m->meshes[i];
+    Mesh *d = &m->meshes[m->meshCount];
+    *d = *src;
+    d->vertexCount = (int)verts.size();
+    d->indexCount = (int)dull.size();
+    d->vertices = (Vertex *)calloc(d->vertexCount, sizeof(Vertex));
+    d->originalVertices = (Vertex *)calloc(d->vertexCount, sizeof(Vertex));
+    d->animatedVertices = (Vertex *)calloc(d->vertexCount, sizeof(Vertex));
+    memcpy(d->vertices, verts.data(), d->vertexCount * sizeof(Vertex));
+    memcpy(d->originalVertices, verts.data(), d->vertexCount * sizeof(Vertex));
+    d->indices = (unsigned int *)calloc(d->indexCount, sizeof(unsigned int));
+    memcpy(d->indices, dull.data(), d->indexCount * sizeof(unsigned int));
+    d->shinePower = 0;
+    d->shineStrength = 0;
+    d->vertexShine = 0;
+    d->metallic = 0;
+    d->glossy = 0;
+    d->looseIndexCount = d->indexCount;
+
+    // The shining part keeps the mesh, its unused vertices left for the
+    // strip builder to drop
+    src->indexCount = (int)lit.size();
+    src->looseIndexCount = src->indexCount;
+    memcpy(src->indices, lit.data(), lit.size() * sizeof(unsigned int));
+    printf("Mesh %d split: %zu triangles shine, %zu do not (now mesh %d)\n", i,
+           lit.size() / 3, dull.size() / 3, m->meshCount);
+    m->meshCount++;
+  }
+}
+
 bool LoadGLTF(const char *filename) {
   cgltf_options options = {};
   cgltf_data *data = NULL;
@@ -620,6 +1425,8 @@ bool LoadGLTF(const char *filename) {
     cgltf_free(data);
     return false;
   }
+
+  CollectEntities(data);
 
   // Load skeleton
   cgltf_skin *skin = NULL;
@@ -769,8 +1576,10 @@ bool LoadGLTF(const char *filename) {
             dstAnim->frameCount * skeleton.boneCount, sizeof(Transform));
         for (int frame = 0; frame < dstAnim->frameCount; frame++) {
           for (int bone = 0; bone < skeleton.boneCount; bone++) {
+            // Raw node pose: armature scale is baked into roots below, and
+            // bindPose already has it (would double it for unkeyed roots)
             poses[frame * skeleton.boneCount + bone] =
-                skeleton.bones[bone].bindPose;
+                GetNodeTransform(skin->joints[bone]);
           }
         }
 
@@ -858,11 +1667,6 @@ bool LoadGLTF(const char *filename) {
           }
         }
 
-        int reducedFrames =
-            reduceKeyframes(poses, dstAnim->frameCount, dstAnim->boneCount);
-        printf("Animation '%s': Reduced from %d to %d frames\n", dstAnim->name,
-               dstAnim->frameCount, reducedFrames);
-        dstAnim->frameCount = reducedFrames;
         dstAnim->framePoses = (Transform **)poses;
       }
     }
@@ -890,20 +1694,38 @@ bool LoadGLTF(const char *filename) {
   model.meshes = NULL;
   model.skeleton = &skeleton;
 
-  // Count total primitives across all meshes
-  if (data->meshes_count > 0) {
+  std::vector<MeshInstance> instances = CollectMeshInstances(data);
+  SetupRigidParts(data, skin, instances);
+
+  // Reduce once every bone (joints and rigid parts) has its poses
+  for (int i = 0; i < skeleton.animCount; i++) {
+    Animation *anim = &skeleton.animations[i];
+    int reducedFrames = reduceKeyframes((Transform *)anim->framePoses,
+                                        anim->frameCount, anim->boneCount);
+    printf("Animation '%s': Reduced from %d to %d frames\n", anim->name,
+           anim->frameCount, reducedFrames);
+    anim->frameCount = reducedFrames;
+  }
+
+  // Count total primitives across all placed meshes
+  if (!instances.empty()) {
     int totalPrimitives = 0;
-    for (size_t m = 0; m < data->meshes_count; m++) {
-      totalPrimitives += (int)data->meshes[m].primitives_count;
+    int bakedCount = 0;
+    for (const MeshInstance &inst : instances) {
+      totalPrimitives += (int)inst.mesh->primitives_count;
+      if (inst.bake)
+        bakedCount++;
     }
+    printf("Scene: %zu mesh instances (%d with node transforms baked)\n",
+           instances.size(), bakedCount);
 
     model.meshCount = totalPrimitives;
     model.meshes = (Mesh *)calloc(model.meshCount, sizeof(Mesh));
 
     int meshIndex = 0;
 
-    for (size_t m = 0; m < data->meshes_count; m++) {
-      cgltf_mesh *srcMesh = &data->meshes[m];
+    for (size_t m = 0; m < instances.size(); m++) {
+      cgltf_mesh *srcMesh = instances[m].mesh;
 
       // Each primitive becomes its own mesh
       for (size_t p = 0; p < srcMesh->primitives_count; p++) {
@@ -916,19 +1738,108 @@ bool LoadGLTF(const char *filename) {
         dstMesh->doubleSided = 0;
         dstMesh->wrapU = 10497;       // REPEAT
         dstMesh->wrapV = 10497;       // REPEAT
+        dstMesh->collisionOnly =
+            NameHasCollision(instances[m].node ? instances[m].node->name : NULL) ||
+            NameHasCollision(srcMesh->name) ||
+            NameHasCollision(primitive->material ? primitive->material->name : NULL);
+        if (dstMesh->collisionOnly)
+          printf("Mesh %d is collision-only (not drawn)\n", meshIndex);
+
+        // The metallic-roughness texture, when it is read at each vertex
+        const unsigned char *mrPx = NULL;
+        int mrW = 0, mrH = 0;
+        float mrMetal = 1.0f, mrRough = 1.0f;
+        const cgltf_material *mrMat = NULL;
 
         // Get material data for this primitive
         if (primitive->material) {
           cgltf_material *mat = primitive->material;
+
+          if (mat->name)
+            snprintf(dstMesh->materialName, sizeof(dstMesh->materialName), "%s",
+                     mat->name);
 
           // Alpha mode: cgltf_alpha_mode_opaque=0, mask=1, blend=2
           dstMesh->alphaMode = (int)mat->alpha_mode;
           dstMesh->alphaCutoff = mat->alpha_cutoff;
           dstMesh->doubleSided = mat->double_sided ? 1 : 0;
 
+          if (mat->has_sheen) {
+            const float *c = mat->sheen.sheen_color_factor;
+            uint8_t r = (uint8_t)(c[0] * 255.0f), g = (uint8_t)(c[1] * 255.0f), b = (uint8_t)(c[2] * 255.0f);
+            dstMesh->rim = (r << 16) | (g << 8) | b;
+            if (dstMesh->rim)
+              printf("Mesh %d material has a rim light (sheen) %02X%02X%02X\n", meshIndex, r, g, b);
+          }
+
           if (mat->has_pbr_metallic_roughness) {
             cgltf_pbr_metallic_roughness *pbr =
                 &mat->pbr_metallic_roughness;
+
+            /* The factors multiply the metallic-roughness texture (blue is
+             * metal, green roughness), and a factor left out counts as 1.0.
+             * Exporters often leave the factors at 1 and put the real values
+             * in the texture, so take its average too. A texture that cannot
+             * be read counts as not metal. */
+            float metal = pbr->metallic_factor, rough = pbr->roughness_factor;
+            if (pbr->metallic_roughness_texture.texture) {
+              char srcDir[256] = ".";
+              strncpy(srcDir, filename, sizeof(srcDir) - 1);
+              char *sl = strrchr(srcDir, '/');
+              if (!sl) sl = strrchr(srcDir, '\\');
+              if (sl) *sl = '\0'; else strcpy(srcDir, ".");
+              float mr[3];
+              if (pbr->metallic_roughness_texture.texture->image &&
+                  CgltfImageAverage(pbr->metallic_roughness_texture.texture->image,
+                                    srcDir, mr)) {
+                metal *= mr[2];
+                rough *= mr[1];
+              } else {
+                metal = 0.0f;
+              }
+            }
+            if (metal >= 0.5f)
+              dstMesh->metallic = rough < MIRROR_ROUGHNESS ? 2 : 1;
+            else if (rough <= GLOSS_ROUGHNESS)
+              dstMesh->glossy = 1;
+            if (dstMesh->glossy)
+              printf("Mesh %d material is glossy (roughness %.2f)\n", meshIndex, rough);
+            if (dstMesh->metallic)
+              printf("Mesh %d material is metallic (%.2f, roughness %.2f)%s\n",
+                     meshIndex, metal, rough,
+                     dstMesh->metallic == 2 ? ": a mirror" : "");
+
+            /* A texture that paints the parts of an atlas (chrome bumper,
+             * rubber tyre) is read at each vertex once they are loaded. One
+             * tiled small across the surface is detail (flakes in paint),
+             * which vertices far apart would only sample at random, so that
+             * keeps the average. */
+            const cgltf_texture_view *mrv = &pbr->metallic_roughness_texture;
+            if (mrv->texture && mrv->texture->image && !mrv->has_transform &&
+                mrv->texcoord == 0) {
+              char srcDir[256] = ".";
+              strncpy(srcDir, filename, sizeof(srcDir) - 1);
+              char *sl = strrchr(srcDir, '/');
+              if (!sl) sl = strrchr(srcDir, '\\');
+              if (sl) *sl = '\0'; else strcpy(srcDir, ".");
+              mrPx = CgltfImagePixels(mrv->texture->image, srcDir, &mrW, &mrH);
+              mrMetal = pbr->metallic_factor;
+              mrRough = pbr->roughness_factor;
+              mrMat = mat;
+            }
+
+            float gloss;
+            float strength = ShineOf(metal, rough, mat, &gloss);
+            if (strength > 0.0f) {
+              /* Lit at the vertices, so no tighter than 16 (four squarings):
+               * past that the highlight takes the shape of the triangles */
+              dstMesh->shinePower = 1 + (int)(gloss * 3.0f + 0.5f);
+              dstMesh->shineStrength = (int)(strength * 255.0f + 0.5f);
+              if (dstMesh->shineStrength > 255) dstMesh->shineStrength = 255;
+              if (!mrPx)
+                printf("Mesh %d material shines (power %d, strength %.2f)\n",
+                     meshIndex, dstMesh->shinePower, strength);
+            }
 
             float *bc = pbr->base_color_factor;
             uint8_t a = (uint8_t)(bc[3] * 255.0f);
@@ -970,8 +1881,9 @@ bool LoadGLTF(const char *filename) {
                 textureNames[dstMesh->textureId] = img->name;
               }
 
-              /* Auto-promote OPAQUE to CUTOUT if the texture actually
-                 has an alpha channel (common in game rips / bad exports). */
+              /* Auto-promote OPAQUE if the texture's pixels actually use
+                 alpha (common in game rips / bad exports): on/off alpha is
+                 a cutout, soft alpha needs blending. */
               if (dstMesh->alphaMode == 0) {
                 char srcDir[256] = ".";
                 strncpy(srcDir, filename, sizeof(srcDir) - 1);
@@ -979,12 +1891,75 @@ bool LoadGLTF(const char *filename) {
                 if (!sl) sl = strrchr(srcDir, '\\');
                 if (sl) *sl = '\0'; else strcpy(srcDir, ".");
 
-                if (CgltfImageHasAlpha(img, srcDir)) {
-                  printf("Mesh %d: texture has alpha channel, promoting OPAQUE -> CUTOUT\n",
+                int kind = CgltfImageAlphaKind(img, srcDir);
+                if (kind == 1) {
+                  printf("Mesh %d: texture has on/off alpha, promoting OPAQUE -> CUTOUT\n",
                          meshIndex);
                   dstMesh->alphaMode = 1;
+                } else if (kind == 2) {
+                  printf("Mesh %d: texture has soft alpha, promoting OPAQUE -> TRANSPARENT\n",
+                         meshIndex);
+                  dstMesh->alphaMode = 2;
                 }
               }
+
+              /* And the other way: BLEND with nothing see-through in it (a
+                 common export slip) would only cost a place in the
+                 transparent list and its sort. */
+              if (dstMesh->alphaMode == 2 && bc[3] >= 0.999f) {
+                char srcDir[256] = ".";
+                strncpy(srcDir, filename, sizeof(srcDir) - 1);
+                char *sl = strrchr(srcDir, '/');
+                if (!sl) sl = strrchr(srcDir, '\\');
+                if (sl) *sl = '\0'; else strcpy(srcDir, ".");
+                if (CgltfImageAlphaKind(img, srcDir) != 0) goto keep_blend;
+                printf("Mesh %d: BLEND but the texture and colour are opaque, demoting TRANSPARENT -> OPAQUE\n",
+                       meshIndex);
+                dstMesh->alphaMode = 0;
+              }
+              keep_blend:;
+            } else if (dstMesh->alphaMode == 2 && bc[3] >= 0.999f) {
+              printf("Mesh %d: BLEND but no texture and an opaque colour, demoting TRANSPARENT -> OPAQUE\n",
+                     meshIndex);
+              dstMesh->alphaMode = 0;
+            }
+          }
+
+          /* For the bake: the colour the surface bounces, and any glow */
+          {
+            char srcDir[256] = ".";
+            strncpy(srcDir, filename, sizeof(srcDir) - 1);
+            char *sl = strrchr(srcDir, '/');
+            if (!sl) sl = strrchr(srcDir, '\\');
+            if (sl) *sl = '\0'; else strcpy(srcDir, ".");
+
+            float avg[3];
+            if (dstMesh->textureId >= 0 &&
+                CgltfImageAverage(&data->images[dstMesh->textureId], srcDir, avg))
+            {
+              if (!g_texAverage.count(dstMesh->textureId))
+                printf("Texture %d average colour: %.2f %.2f %.2f\n", dstMesh->textureId,
+                       avg[0], avg[1], avg[2]);
+              g_texAverage[dstMesh->textureId] = {avg[0], avg[1], avg[2]};
+            }
+
+            float strength = mat->has_emissive_strength
+                                 ? mat->emissive_strength.emissive_strength : 1.0f;
+            float e[3] = {mat->emissive_factor[0] * strength,
+                          mat->emissive_factor[1] * strength,
+                          mat->emissive_factor[2] * strength};
+            if (mat->emissive_texture.texture && mat->emissive_texture.texture->image &&
+                CgltfImageAverage(mat->emissive_texture.texture->image, srcDir, avg)) {
+              e[0] *= avg[0]; e[1] *= avg[1]; e[2] *= avg[2];
+            }
+            if (e[0] + e[1] + e[2] > 0.01f) {
+              /* On the mesh, for the glow bit: this is the material being read,
+               * so it is the one place the answer is certain. The table below
+               * is the bake's, and is keyed by look rather than by material,
+               * so two materials that look alike share an entry. */
+              dstMesh->glow = 1;
+              g_emissive[{dstMesh->textureId, dstMesh->materialColor}] = {e[0], e[1], e[2]};
+              printf("Mesh %d material glows: %.2f %.2f %.2f\n", meshIndex, e[0], e[1], e[2]);
             }
           }
 
@@ -1093,6 +2068,7 @@ bool LoadGLTF(const char *filename) {
           } break;
 
           case cgltf_attribute_type_color: {
+            if (attr->index != 0) break;   // Only COLOR_0, as with TEXCOORD_0
             for (size_t v = 0; v < accessor->count; v++) {
               float color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
               cgltf_accessor_read_float(accessor, v, color, 4);
@@ -1113,6 +2089,42 @@ bool LoadGLTF(const char *filename) {
           }
         }
 
+        /* Shine read at each vertex: the mesh takes its strongest, and each
+         * vertex how far below that it is */
+        if (mrPx && !dstMesh->collisionOnly) {
+          std::vector<float> vs(totalVertices);
+          float best = 0.0f, bestGloss = 0.0f;
+          for (int v = 0; v < totalVertices; v++) {
+            float fu = dstMesh->vertices[v].u, fv = dstMesh->vertices[v].v;
+            int x = (int)floorf((fu - floorf(fu)) * mrW) % mrW;
+            int y = (int)floorf((fv - floorf(fv)) * mrH) % mrH;
+            const unsigned char *t = mrPx + ((size_t)y * mrW + x) * 4;
+            float gloss;
+            vs[v] = ShineOf(mrMetal * t[2] / 255.0f, mrRough * t[1] / 255.0f, mrMat, &gloss);
+            if (vs[v] > best) { best = vs[v]; bestGloss = gloss; }
+          }
+          dstMesh->shinePower = 0;
+          dstMesh->shineStrength = 0;
+          /* A few stray vertices on a sliver of the atlas are not a part
+           * that shines, and would cost the mesh a reflection pass */
+          int shining = 0;
+          for (int v = 0; v < totalVertices; v++) shining += vs[v] > 0.0f;
+          if (shining * 50 < totalVertices) best = 0.0f;
+          if (best > 0.0f) {
+            for (int v = 0; v < totalVertices; v++) {
+              int d = 255 - (int)(vs[v] / best * 255.0f + 0.5f);
+              dstMesh->vertices[v].dull = (uint8_t)(d < 0 ? 0 : d);
+              dstMesh->originalVertices[v].dull = dstMesh->vertices[v].dull;
+            }
+            dstMesh->shinePower = 1 + (int)(bestGloss * 3.0f + 0.5f);
+            dstMesh->shineStrength = (int)(best * 255.0f + 0.5f);
+            if (dstMesh->shineStrength > 255) dstMesh->shineStrength = 255;
+            dstMesh->vertexShine = 1;
+            printf("Mesh %d shines at %d of %d vertices, read from its texture (power %d, strength %.2f)\n",
+                   meshIndex, shining, totalVertices, dstMesh->shinePower, best);
+          }
+        }
+
         if (primitive->indices) {
           for (size_t i = 0; i < primitive->indices->count; i++) {
             dstMesh->indices[i] =
@@ -1123,6 +2135,19 @@ bool LoadGLTF(const char *filename) {
         dstMesh->vertexCount = totalVertices;
         dstMesh->indexCount = totalIndices;
 
+        if (instances[m].bake)
+          BakeNodeTransform(dstMesh, instances[m].world);
+
+        // Rigid part: the whole primitive follows one bone
+        if (instances[m].bone >= 0) {
+          for (int v = 0; v < totalVertices; v++) {
+            dstMesh->vertices[v].boneId = (uint8_t)instances[m].bone;
+            dstMesh->vertices[v].boneWeight = 1.0f;
+            dstMesh->originalVertices[v].boneId = (uint8_t)instances[m].bone;
+            dstMesh->originalVertices[v].boneWeight = 1.0f;
+          }
+        }
+
         printf("Loaded mesh %d with %d vertices and %d indices\n", meshIndex,
                dstMesh->vertexCount, dstMesh->indexCount);
 
@@ -1130,6 +2155,8 @@ bool LoadGLTF(const char *filename) {
       }
     }
   }
+
+  SplitDullTriangles(&model);
 
   ExtractAndConvertTextures(data, filename);
 
@@ -1145,12 +2172,15 @@ void WeldVertices(Mesh *mesh, float threshold = 0.001f) {
   std::vector<Vertex> weldedVerts;
   std::vector<int> remapTable(mesh->vertexCount);
 
-  // Build map with position AND UV as key
+  // Two vertices are one only if everything the PVR sees matches: place,
+  // UV, colour and normal. Welding on place and UV alone merged a black
+  // painted wall into the white wall it touched, and a hard edge into a
+  // soft one
   for (int i = 0; i < mesh->vertexCount; i++) {
-    char key[128];
-    snprintf(key, sizeof(key), "%.3f,%.3f,%.3f|%.4f,%.4f", mesh->vertices[i].x,
-             mesh->vertices[i].y, mesh->vertices[i].z, mesh->vertices[i].u,
-             mesh->vertices[i].v);
+    const Vertex &vv = mesh->vertices[i];
+    char key[160];
+    snprintf(key, sizeof(key), "%.3f,%.3f,%.3f|%.4f,%.4f|%02x%02x%02x%02x|%d,%d,%d",
+             vv.x, vv.y, vv.z, vv.u, vv.v, vv.r, vv.g, vv.b, vv.a, (int)vv.nx, (int)vv.ny, (int)vv.nz);
 
     auto it = vertexMap.find(key);
     if (it == vertexMap.end()) {
@@ -1185,6 +2215,327 @@ void WeldVertices(Mesh *mesh, float threshold = 0.001f) {
 
   printf("  Welded vertex count: %d (removed %d duplicates)\n",
          mesh->vertexCount, (int)remapTable.size() - mesh->vertexCount);
+}
+
+// Static levels are cut into blocks by location, the way SA2 lays out its
+// levels: how the scene was split into objects doesn't matter. Each block
+// holds one mesh per material, and the runtime culls a whole block with one
+// sphere test. Triangles are grouped by their centre, never cut, so the level
+// looks identical.
+#define BLOCK_MAX_SIZE 64.0f // world units; FAR_Z is 200
+// Each material inside a block is cut again into chunks this size, so the
+// runtime can cull chunks inside a visible block and only chunks that really
+// touch the near plane take the clip path (Docs/test/viz shows the effect)
+#define CHUNK_MAX_SIZE 16.0f
+// A material group or chunk with this many triangles or fewer is never
+// split further: clipping it costs little, and each extra mesh costs a
+// fixed amount per frame
+#ifndef CHUNK_MIN_TRIS
+#define CHUNK_MIN_TRIS 32
+#endif
+// Same idea one level up: a block with this many triangles or fewer is not
+// split by size. A sparse level cut purely by size ends up as hundreds of
+// blocks x materials holding a handful of triangles each, and a mesh costs
+// about as much as 10 vertices before it draws anything.
+#ifndef BLOCK_MIN_TRIS
+#define BLOCK_MIN_TRIS 256
+#endif
+// Triangle caps: a block / chunk already small enough in world
+// units is still split while it holds more than this. Models come at any
+// scale, and one modelled small would otherwise end up as a single block of
+// 600-triangle meshes that all cross the near plane.
+#ifndef BLOCK_MAX_TRIS
+#define BLOCK_MAX_TRIS 4096
+#endif
+#ifndef CHUNK_MAX_TRIS
+#define CHUNK_MAX_TRIS 256
+#endif
+
+#ifndef STRIP_MAX_TRIS
+#define STRIP_MAX_TRIS 32   // longer strips are cut so chunk spheres stay tight
+#endif
+
+struct BlockTri {
+  int mesh;
+  int tri;
+  Vector3 centre;
+  float size;             // longest side of the triangle's bounding box
+  int weight;             // triangles this entry stands for
+};
+
+static void SplitBlock(std::vector<BlockTri> &tris, size_t begin, size_t end,
+                       std::vector<std::pair<size_t, size_t>> &out, float maxSize,
+                       size_t minTris = 0, size_t maxTris = 0) {
+  size_t count = 0;
+  for (size_t i = begin; i < end; i++) count += tris[i].weight;
+  if (count <= minTris || end - begin < 2) {
+    out.push_back({begin, end});
+    return;
+  }
+  Vector3 lo = tris[begin].centre, hi = lo;
+  float biggestTri = 0.0f;
+  for (size_t i = begin; i < end; i++) {
+    lo = Vector3Min(lo, tris[i].centre);
+    hi = Vector3Max(hi, tris[i].centre);
+    biggestTri = std::max(biggestTri, tris[i].size);
+  }
+  Vector3 ext = Vector3Subtract(hi, lo);
+  int axis = (ext.x >= ext.y && ext.x >= ext.z) ? 0 : (ext.y >= ext.z ? 1 : 2);
+  float size = axis == 0 ? ext.x : axis == 1 ? ext.y : ext.z;
+  auto key = [axis](const BlockTri &t) {
+    return axis == 0 ? t.centre.x : axis == 1 ? t.centre.y : t.centre.z;
+  };
+  size_t m = begin;
+  // A block can't get smaller than its triangles, so past that point
+  // splitting by size only adds blocks
+  if (size > std::max(maxSize, biggestTri)) {
+    float mid = axis == 0 ? (lo.x + hi.x) * 0.5f
+              : axis == 1 ? (lo.y + hi.y) * 0.5f : (lo.z + hi.z) * 0.5f;
+    auto split = std::partition(tris.begin() + begin, tris.begin() + end,
+                                [&](const BlockTri &t) { return key(t) < mid; });
+    m = split - tris.begin();
+  }
+  // Small enough in units but still too many triangles (a level modelled at
+  // a tiny scale): cut at the median so both halves hold the same amount
+  if ((m == begin || m == end) && maxTris && count > maxTris && size > 0.0f) {
+    std::sort(tris.begin() + begin, tris.begin() + end,
+              [&](const BlockTri &x, const BlockTri &y) { return key(x) < key(y); });
+    size_t acc = 0;
+    for (m = begin; m < end - 1 && acc * 2 < count; m++) acc += tris[m].weight;
+    if (m == begin) m = begin + 1;
+  }
+  if (m == begin || m == end) {
+    out.push_back({begin, end});
+    return;
+  }
+  SplitBlock(tris, begin, m, out, maxSize, minTris, maxTris);
+  SplitBlock(tris, m, end, out, maxSize, minTris, maxTris);
+}
+
+
+static void UnitBounds(const std::vector<Vertex> &v, const std::vector<uint32_t> &s,
+                       Vector3 *lo, Vector3 *hi, float *biggestTri) {
+  *lo = {v[s[0]].x, v[s[0]].y, v[s[0]].z};
+  *hi = *lo;
+  *biggestTri = 0.0f;
+  for (size_t i = 0; i < s.size(); i++) {
+    Vector3 p = {v[s[i]].x, v[s[i]].y, v[s[i]].z};
+    *lo = Vector3Min(*lo, p);
+    *hi = Vector3Max(*hi, p);
+    if (i >= 2) {
+      Vector3 a = {v[s[i - 1]].x, v[s[i - 1]].y, v[s[i - 1]].z};
+      Vector3 c = {v[s[i - 2]].x, v[s[i - 2]].y, v[s[i - 2]].z};
+      Vector3 e = Vector3Subtract(Vector3Max(Vector3Max(p, a), c), Vector3Min(Vector3Min(p, a), c));
+      *biggestTri = std::max(*biggestTri, std::max(e.x, std::max(e.y, e.z)));
+    }
+  }
+}
+
+// A strip too long for one chunk is cut in the middle (2 extra verts a cut);
+// cuts land on an even triangle so the winding carries over
+static void CutStrip(const std::vector<Vertex> &v, const std::vector<uint32_t> &s,
+                     std::vector<std::vector<uint32_t>> &out) {
+  size_t n = s.size() - 2;
+  Vector3 lo, hi;
+  float biggest;
+  UnitBounds(v, s, &lo, &hi, &biggest);
+  Vector3 ext = Vector3Subtract(hi, lo);
+  float size = std::max(ext.x, std::max(ext.y, ext.z));
+  if (n < 4 || (n <= STRIP_MAX_TRIS && size <= std::max(CHUNK_MAX_SIZE, 2.0f * biggest))) {
+    out.push_back(s);
+    return;
+  }
+  size_t k = (n / 2) & ~(size_t)1;
+  if (k < 2) k = 2;
+  CutStrip(v, std::vector<uint32_t>(s.begin(), s.begin() + k + 2), out);
+  CutStrip(v, std::vector<uint32_t>(s.begin() + k, s.end()), out);
+}
+
+// Meshes with the same material are merged inside a block
+// Same look and same name. Two materials that look alike but are named apart
+// are kept apart: the name is how code finds a mesh, and merging them makes
+// that lookup answer with both (the flame and its reflection in fire.glb
+// share a texture, so they used to come back as one mesh).
+static bool SameMaterial(const Mesh &a, const Mesh &b) {
+  if (strcmp(a.materialName, b.materialName) != 0)
+    return false;
+  return a.textureId == b.textureId && a.materialColor == b.materialColor &&
+         a.alphaMode == b.alphaMode && a.alphaCutoff == b.alphaCutoff &&
+         a.doubleSided == b.doubleSided && a.wrapU == b.wrapU &&
+         a.wrapV == b.wrapV && a.collisionOnly == b.collisionOnly &&
+         a.metallic == b.metallic && a.glossy == b.glossy && a.glow == b.glow && a.rim == b.rim &&
+         a.shinePower == b.shinePower && a.shineStrength == b.shineStrength;
+}
+
+void BuildBlocks(Model *m) {
+  // Material of each source mesh = first earlier mesh with the same material
+  std::vector<int> material(m->meshCount);
+  int materialCount = 0;
+  for (int i = 0; i < m->meshCount; i++) {
+    material[i] = i;
+    for (int j = 0; j < i; j++) {
+      if (material[j] == j && SameMaterial(m->meshes[i], m->meshes[j])) {
+        material[i] = j;
+        break;
+      }
+    }
+    if (material[i] == i) materialCount++;
+  }
+
+  std::vector<BlockTri> tris;
+  for (int i = 0; i < m->meshCount; i++) {
+    const Mesh *mesh = &m->meshes[i];
+    for (int t = 0; t < mesh->indexCount / 3; t++) {
+      const Vertex &a = mesh->vertices[mesh->indices[t * 3]];
+      const Vertex &b = mesh->vertices[mesh->indices[t * 3 + 1]];
+      const Vertex &c = mesh->vertices[mesh->indices[t * 3 + 2]];
+      Vector3 lo = Vector3Min(Vector3Min({a.x, a.y, a.z}, {b.x, b.y, b.z}), {c.x, c.y, c.z});
+      Vector3 hi = Vector3Max(Vector3Max({a.x, a.y, a.z}, {b.x, b.y, b.z}), {c.x, c.y, c.z});
+      Vector3 ext = Vector3Subtract(hi, lo);
+      tris.push_back({i, t,
+                      {(a.x + b.x + c.x) / 3.0f, (a.y + b.y + c.y) / 3.0f,
+                       (a.z + b.z + c.z) / 3.0f},
+                      std::max(ext.x, std::max(ext.y, ext.z)), 1});
+    }
+  }
+  if (tris.empty()) return;
+
+  std::vector<std::pair<size_t, size_t>> blocks;
+  SplitBlock(tris, 0, tris.size(), blocks, BLOCK_MAX_SIZE, BLOCK_MIN_TRIS, BLOCK_MAX_TRIS);
+
+  std::vector<Mesh> result;
+  for (size_t b = 0; b < blocks.size(); b++) {
+    // Triangles of this block, grouped by material
+    std::map<int, std::vector<BlockTri>> byMaterial;
+    for (size_t i = blocks[b].first; i < blocks[b].second; i++)
+      byMaterial[material[tris[i].mesh]].push_back(tris[i]);
+
+    for (auto &group : byMaterial) {
+      std::vector<BlockTri> &gt = group.second;
+      // Strip the whole group first, then sort finished strips into chunks
+      Mesh g = m->meshes[group.first];
+      {
+        std::map<std::pair<int, unsigned int>, int> remap;
+        std::vector<Vertex> verts;
+        g.indexCount = (int)gt.size() * 3;
+        g.indices = (unsigned int *)calloc(g.indexCount, sizeof(unsigned int));
+        for (size_t t = 0; t < gt.size(); t++) {
+          const Mesh *src = &m->meshes[gt[t].mesh];
+          for (int k = 0; k < 3; k++) {
+            unsigned int old = src->indices[gt[t].tri * 3 + k];
+            auto key = std::make_pair(gt[t].mesh, old);
+            auto it = remap.find(key);
+            if (it == remap.end()) {
+              it = remap.emplace(key, (int)verts.size()).first;
+              verts.push_back(src->vertices[old]);
+            }
+            g.indices[t * 3 + k] = it->second;
+          }
+        }
+        g.vertexCount = (int)verts.size();
+        g.vertices = (Vertex *)calloc(g.vertexCount, sizeof(Vertex));
+        memcpy(g.vertices, verts.data(), sizeof(Vertex) * g.vertexCount);
+      }
+      MeshTriStrips ts = ExtractTriStrips(&g);
+      free(g.vertices);
+      free(g.indices);
+
+      std::vector<std::vector<uint32_t>> units;
+      size_t stripUnits = 0;
+      for (auto &st : ts.strips) CutStrip(ts.vertices, st.indices, units);
+      stripUnits = units.size();
+      for (size_t i = 0; i + 2 < ts.looseTriangles.size(); i += 3)
+        units.push_back({ts.looseTriangles[i], ts.looseTriangles[i + 1], ts.looseTriangles[i + 2]});
+
+      std::vector<BlockTri> ut;
+      size_t groupTris = 0;
+      for (size_t u = 0; u < units.size(); u++) {
+        Vector3 lo, hi;
+        float biggest;
+        UnitBounds(ts.vertices, units[u], &lo, &hi, &biggest);
+        Vector3 ext = Vector3Subtract(hi, lo);
+        int w = (int)units[u].size() - 2;
+        ut.push_back({(int)u, (int)(u < stripUnits), Vector3Scale(Vector3Add(lo, hi), 0.5f),
+                      std::max(ext.x, std::max(ext.y, ext.z)), w});
+        groupTris += w;
+      }
+      std::sort(ut.begin(), ut.end(),
+                [](const BlockTri &x, const BlockTri &y) { return x.size < y.size; });
+      std::vector<std::pair<size_t, size_t>> chunks;
+      size_t first = 0;
+      if (groupTris <= CHUNK_MIN_TRIS) {
+        chunks.push_back({0, ut.size()});
+        first = ut.size();
+      }
+      for (float tier = CHUNK_MAX_SIZE; first < ut.size(); tier *= 2.0f) {
+        size_t end = first;
+        while (end < ut.size() && ut[end].size <= tier) end++;
+        if (end > first) SplitBlock(ut, first, end, chunks, tier, CHUNK_MIN_TRIS, CHUNK_MAX_TRIS);
+        first = end;
+      }
+      for (auto &chunk : chunks) {
+        Mesh c = m->meshes[group.first];
+        std::map<uint32_t, int> remap;
+        std::vector<Vertex> verts;
+        std::vector<unsigned int> idx, lens;
+        auto add = [&](uint32_t old) {
+          auto it = remap.find(old);
+          if (it == remap.end()) {
+            it = remap.emplace(old, (int)verts.size()).first;
+            verts.push_back(ts.vertices[old]);
+          }
+          idx.push_back(it->second);
+        };
+        for (int pass = 1; pass >= 0; pass--)   // strips first, loose after
+          for (size_t i = chunk.first; i < chunk.second; i++) {
+            if (ut[i].tri != pass) continue;
+            if (pass) lens.push_back((unsigned int)units[ut[i].mesh].size());
+            for (uint32_t v : units[ut[i].mesh]) add(v);
+          }
+        size_t stripIdx = 0;
+        for (unsigned int l : lens) stripIdx += l;
+        c.vertexCount = (int)verts.size();
+        c.vertices = (Vertex *)calloc(c.vertexCount, sizeof(Vertex));
+        c.originalVertices = (Vertex *)calloc(c.vertexCount, sizeof(Vertex));
+        c.animatedVertices = (Vertex *)calloc(c.vertexCount, sizeof(Vertex));
+        memcpy(c.vertices, verts.data(), sizeof(Vertex) * c.vertexCount);
+        memcpy(c.originalVertices, verts.data(), sizeof(Vertex) * c.vertexCount);
+        c.indexCount = (int)idx.size();
+        c.indices = (unsigned int *)calloc(c.indexCount, sizeof(unsigned int));
+        memcpy(c.indices, idx.data(), sizeof(unsigned int) * idx.size());
+        c.stripCount = (int)lens.size();
+        c.stripLengths = (unsigned int *)calloc(lens.size() + 1, sizeof(unsigned int));
+        memcpy(c.stripLengths, lens.data(), sizeof(unsigned int) * lens.size());
+        c.looseIndexCount = (int)(idx.size() - stripIdx);
+        c.prestripped = 1;
+        c.blockId = (int)b;
+        result.push_back(c);
+      }
+    }
+  }
+
+  int inTris = (int)tris.size(), outTris = 0;
+  for (const Mesh &mesh : result) {
+    outTris += mesh.looseIndexCount / 3;
+    for (int i = 0; i < mesh.stripCount; i++) outTris += mesh.stripLengths[i] - 2;
+  }
+
+  printf("Blocks: %d meshes (%d materials) -> %zu blocks, %zu meshes, %d tris in, %d tris out%s\n",
+         m->meshCount, materialCount, blocks.size(), result.size(), inTris, outTris,
+         outTris == inTris ? "" : "  ERROR: TRIANGLE COUNT CHANGED");
+
+  for (int i = 0; i < m->meshCount; i++) {
+    free(m->meshes[i].vertices);
+    free(m->meshes[i].originalVertices);
+    free(m->meshes[i].animatedVertices);
+    free(m->meshes[i].indices);
+    free(m->meshes[i].stripLengths);
+  }
+  free(m->meshes);
+  m->meshCount = (int)result.size();
+  m->meshes = (Mesh *)calloc(m->meshCount, sizeof(Mesh));
+  memcpy(m->meshes, result.data(), sizeof(Mesh) * m->meshCount);
+  m->blockCount = (int)blocks.size();
 }
 
 void SortVerticesByBoneId(MeshTriStrips &tristrips) {
@@ -1234,6 +2585,7 @@ void CreateTristrippedModel(const Model *sourceModel, Model *destModel) {
   // Copy skeleton pointer and allocate new mesh array
   destModel->skeleton = sourceModel->skeleton;
   destModel->meshCount = sourceModel->meshCount;
+  destModel->blockCount = sourceModel->blockCount;
   destModel->meshes = (Mesh *)calloc(destModel->meshCount, sizeof(Mesh));
 
   // Process each mesh from the source model
@@ -1247,6 +2599,31 @@ void CreateTristrippedModel(const Model *sourceModel, Model *destModel) {
     dstMesh->doubleSided = srcMesh->doubleSided;
     dstMesh->wrapU = srcMesh->wrapU;
     dstMesh->wrapV = srcMesh->wrapV;
+    dstMesh->blockId = srcMesh->blockId;
+    dstMesh->collisionOnly = srcMesh->collisionOnly;
+    dstMesh->metallic = srcMesh->metallic;
+    dstMesh->glossy = srcMesh->glossy;
+    dstMesh->glow = srcMesh->glow;
+    dstMesh->rim = srcMesh->rim;
+    dstMesh->shinePower = srcMesh->shinePower;
+    dstMesh->shineStrength = srcMesh->shineStrength;
+    memcpy(dstMesh->materialName, srcMesh->materialName,
+           sizeof(dstMesh->materialName));
+
+    if (srcMesh->prestripped) {
+      dstMesh->vertexCount = srcMesh->vertexCount;
+      dstMesh->vertices = (Vertex *)calloc(dstMesh->vertexCount, sizeof(Vertex));
+      dstMesh->animatedVertices = (Vertex *)calloc(dstMesh->vertexCount, sizeof(Vertex));
+      memcpy(dstMesh->vertices, srcMesh->vertices, dstMesh->vertexCount * sizeof(Vertex));
+      dstMesh->indexCount = srcMesh->indexCount;
+      dstMesh->indices = (unsigned int *)calloc(dstMesh->indexCount, sizeof(unsigned int));
+      memcpy(dstMesh->indices, srcMesh->indices, dstMesh->indexCount * sizeof(unsigned int));
+      dstMesh->stripCount = srcMesh->stripCount;
+      dstMesh->stripLengths = (unsigned int *)calloc(dstMesh->stripCount + 1, sizeof(unsigned int));
+      memcpy(dstMesh->stripLengths, srcMesh->stripLengths, dstMesh->stripCount * sizeof(unsigned int));
+      dstMesh->looseIndexCount = srcMesh->looseIndexCount;
+      continue;
+    }
 
     printf("Processing mesh %d of %d...\n", m + 1, sourceModel->meshCount);
     printf("Source mesh has %d vertices and %d indices\n", srcMesh->vertexCount,
@@ -1371,6 +2748,10 @@ int main(int argc, char *argv[]) {
     WeldVertices(&model.meshes[i]);
   }
   printf("=== Vertex Welding Complete ===\n\n");
+
+  // Animated models are culled as a whole, so only static ones get blocks
+  if (skeleton.boneCount == 0)
+    BuildBlocks(&model);
 
   CreateTristrippedModel(&model, &tristrippedModel);
 
@@ -1722,91 +3103,168 @@ static void BuildBVH() {
     printf("BVH built: %zu nodes, %zu tri refs\n", g_bvh.size(), g_bvhTriIdx.size());
 }
 
+/* Calls fn(i0, i1, i2) for every triangle of a mesh. The index list holds the
+ * strips first (stripLengths), then loose triangles, three indices each. */
+template <class F> static void ForEachMeshTriangle(const Mesh *mesh, F fn) {
+  if (!mesh->indices || mesh->indexCount < 3)
+    return;
+  const uint32_t vc = (uint32_t)mesh->vertexCount;
+  auto tri = [&](uint32_t i0, uint32_t i1, uint32_t i2) {
+    /* Strips repeat vertices to turn corners: skip those empty triangles */
+    if (i0 < vc && i1 < vc && i2 < vc && i0 != i1 && i1 != i2 && i0 != i2)
+      fn(i0, i1, i2);
+  };
+
+  int pos = 0;
+  for (int s = 0; s < mesh->stripCount && mesh->stripLengths; s++) {
+    int len = (int)mesh->stripLengths[s];
+    if (pos + len > mesh->indexCount)
+      break;
+    for (int k = 0; k + 2 < len; k++) {
+      uint32_t i0 = mesh->indices[pos + k];
+      uint32_t i1 = mesh->indices[pos + k + 1];
+      uint32_t i2 = mesh->indices[pos + k + 2];
+      if (k & 1)
+        std::swap(i0, i1);      /* every other triangle of a strip is wound backwards */
+      tri(i0, i1, i2);
+    }
+    pos += len;
+  }
+  for (; pos + 2 < mesh->indexCount; pos += 3)
+    tri(mesh->indices[pos], mesh->indices[pos + 1], mesh->indices[pos + 2]);
+}
+
+/* AO radius: this part of the model's size, but at most this many average edges */
+#define BAKE_AO_SIZE_PART   0.04f
+#define BAKE_AO_EDGE_PART   6.0f
+
+/* One triangle of the ray scene, as the bake sees it */
+struct BakeTri {
+  int mesh;
+  uint32_t i[3];       /* vertices in that mesh */
+  float n[3];          /* face normal, on the side the vertex normals point */
+  float area;
+  float edge;          /* average edge length */
+  float albedo[3];     /* colour it bounces: material x average texture x vertex colour */
+  float emit[3];       /* light it gives off */
+};
+static std::vector<BakeTri> g_bakeTris;                   /* same order as g_rtTriangles */
+static std::vector<std::array<float, 3>> g_bakeTriLight;  /* light leaving each triangle */
+static float g_bakeAORadius = 2.0f;
+
 void BuildRTScene(const Model *model) {
   g_rtTriangles.clear();
+  g_bakeTris.clear();
+  float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+  double edgeSum = 0, areaSum = 0;
+
   for (int m = 0; m < model->meshCount; m++) {
     const Mesh *mesh = &model->meshes[m];
-    if (!mesh->indices || mesh->indexCount < 3)
-      continue;
+    if (mesh->collisionOnly)
+      continue;                 /* never drawn, so it casts no shadow either */
 
-    int i = 0;
-    while (i < mesh->indexCount) {
-      uint32_t rawIndex = mesh->indices[i];
-      bool isStrip = (rawIndex & 0x80000000) != 0;
+    float base[3] = {((mesh->materialColor >> 16) & 0xFF) / 255.0f,
+                     ((mesh->materialColor >> 8) & 0xFF) / 255.0f,
+                     (mesh->materialColor & 0xFF) / 255.0f};
+    auto tex = g_texAverage.find(mesh->textureId);
+    if (tex != g_texAverage.end())
+      for (int c = 0; c < 3; c++) base[c] *= tex->second[c];
+    float emit[3] = {0, 0, 0};
+    auto glow = g_emissive.find({mesh->textureId, mesh->materialColor});
+    if (glow != g_emissive.end())
+      for (int c = 0; c < 3; c++) emit[c] = glow->second[c];
 
-      if (isStrip) {
-        uint32_t sId = (rawIndex >> 24) & 0x7F;
-        int stripStart = i;
+    ForEachMeshTriangle(mesh, [&](uint32_t i0, uint32_t i1, uint32_t i2) {
+      const Vertex *v[3] = {&mesh->vertices[i0], &mesh->vertices[i1], &mesh->vertices[i2]};
+      float e1[3] = {v[1]->x - v[0]->x, v[1]->y - v[0]->y, v[1]->z - v[0]->z};
+      float e2[3] = {v[2]->x - v[0]->x, v[2]->y - v[0]->y, v[2]->z - v[0]->z};
+      float e3[3] = {v[2]->x - v[1]->x, v[2]->y - v[1]->y, v[2]->z - v[1]->z};
+      float n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2],
+                    e1[0] * e2[1] - e1[1] * e2[0]};
+      float len = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+      if (len < 1e-12f)
+        return;
 
-        while (i < mesh->indexCount && (mesh->indices[i] & 0x80000000) &&
-               ((mesh->indices[i] >> 24) & 0x7F) == sId) {
-          i++;
-        }
-        int stripLen = i - stripStart;
-
-        for (int j = 0; j < stripLen - 2; j++) {
-          uint32_t i0 = mesh->indices[stripStart + j] & 0x00FFFFFF;
-          uint32_t i1 = mesh->indices[stripStart + j + 1] & 0x00FFFFFF;
-          uint32_t i2 = mesh->indices[stripStart + j + 2] & 0x00FFFFFF;
-
-          if (j & 1)
-            std::swap(i0, i1);
-
-          if (i0 < (uint32_t)mesh->vertexCount &&
-              i1 < (uint32_t)mesh->vertexCount &&
-              i2 < (uint32_t)mesh->vertexCount) {
-            const Vertex &v0 = mesh->vertices[i0];
-            const Vertex &v1 = mesh->vertices[i1];
-            const Vertex &v2 = mesh->vertices[i2];
-            g_rtTriangles.push_back(
-                {v0.x, v0.y, v0.z, v1.x, v1.y, v1.z, v2.x, v2.y, v2.z});
-          }
-        }
-      } else {
-        if (i + 2 < mesh->indexCount) {
-          uint32_t i0 = mesh->indices[i] & 0x00FFFFFF;
-          uint32_t i1 = mesh->indices[i + 1] & 0x00FFFFFF;
-          uint32_t i2 = mesh->indices[i + 2] & 0x00FFFFFF;
-
-          if (i0 < (uint32_t)mesh->vertexCount &&
-              i1 < (uint32_t)mesh->vertexCount &&
-              i2 < (uint32_t)mesh->vertexCount) {
-            const Vertex &v0 = mesh->vertices[i0];
-            const Vertex &v1 = mesh->vertices[i1];
-            const Vertex &v2 = mesh->vertices[i2];
-            g_rtTriangles.push_back(
-                {v0.x, v0.y, v0.z, v1.x, v1.y, v1.z, v2.x, v2.y, v2.z});
-          }
-        }
-        i += 3;
+      BakeTri t;
+      t.mesh = m;
+      t.i[0] = i0; t.i[1] = i1; t.i[2] = i2;
+      t.area = len * 0.5f;
+      t.edge = (sqrtf(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2]) +
+                sqrtf(e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2]) +
+                sqrtf(e3[0] * e3[0] + e3[1] * e3[1] + e3[2] * e3[2])) / 3.0f;
+      /* Mirrored models wind backwards: trust the vertex normals for the side */
+      float side = 0;
+      for (int k = 0; k < 3; k++)
+        side += n[0] * v[k]->nx + n[1] * v[k]->ny + n[2] * v[k]->nz;
+      float flip = side < 0 ? -1.0f : 1.0f;
+      for (int c = 0; c < 3; c++) t.n[c] = n[c] / len * flip;
+      float vc[3] = {(v[0]->r + v[1]->r + v[2]->r) / 765.0f,
+                     (v[0]->g + v[1]->g + v[2]->g) / 765.0f,
+                     (v[0]->b + v[1]->b + v[2]->b) / 765.0f};
+      for (int c = 0; c < 3; c++) {
+        t.albedo[c] = base[c] * vc[c];
+        t.emit[c] = emit[c];
       }
-    }
+      g_bakeTris.push_back(t);
+      g_rtTriangles.push_back({v[0]->x, v[0]->y, v[0]->z, v[1]->x, v[1]->y, v[1]->z,
+                               v[2]->x, v[2]->y, v[2]->z});
+      for (int k = 0; k < 3; k++) {
+        float p[3] = {v[k]->x, v[k]->y, v[k]->z};
+        for (int c = 0; c < 3; c++) {
+          lo[c] = fminf(lo[c], p[c]);
+          hi[c] = fmaxf(hi[c], p[c]);
+        }
+      }
+      edgeSum += (double)t.edge * t.area;
+      areaSum += t.area;
+    });
   }
   printf("Built RT scene: %zu triangles\n", g_rtTriangles.size());
+
+  /* How far ambient occlusion looks. A fixed distance is wrong for anything not
+   * built at the scale it was tuned on, so take it from the model: a slice of
+   * its size, but no more than a few polygons across on a big open level. */
+  if (areaSum > 0) {
+    float diag = sqrtf((hi[0] - lo[0]) * (hi[0] - lo[0]) + (hi[1] - lo[1]) * (hi[1] - lo[1]) +
+                       (hi[2] - lo[2]) * (hi[2] - lo[2]));
+    float meanEdge = (float)(edgeSum / areaSum);
+    g_bakeAORadius = fminf(diag * BAKE_AO_SIZE_PART, meanEdge * BAKE_AO_EDGE_PART);
+    printf("AO radius %.3f (model size %.2f, average edge %.3f)\n", g_bakeAORadius, diag,
+           meanEdge);
+  }
   BuildBVH();
 }
 
-static inline bool RayTriHit(const std::array<float,9>& tri,
-                              float ox, float oy, float oz,
-                              float dx, float dy, float dz, float maxDist) {
+/* Returns the distance along the ray, or a negative number for a miss */
+static inline float RayTriDist(const std::array<float,9>& tri,
+                               float ox, float oy, float oz,
+                               float dx, float dy, float dz) {
     float e1x = tri[3]-tri[0], e1y = tri[4]-tri[1], e1z = tri[5]-tri[2];
     float e2x = tri[6]-tri[0], e2y = tri[7]-tri[1], e2z = tri[8]-tri[2];
     float hx = dy*e2z - dz*e2y, hy = dz*e2x - dx*e2z, hz = dx*e2y - dy*e2x;
     float a = e1x*hx + e1y*hy + e1z*hz;
-    if (fabsf(a) < 1e-7f) return false;
+    if (fabsf(a) < 1e-7f) return -1.0f;
     float f = 1.0f / a;
     float sx = ox-tri[0], sy = oy-tri[1], sz = oz-tri[2];
     float u = f * (sx*hx + sy*hy + sz*hz);
-    if (u < 0.0f || u > 1.0f) return false;
+    if (u < 0.0f || u > 1.0f) return -1.0f;
     float qx = sy*e1z - sz*e1y, qy = sz*e1x - sx*e1z, qz = sx*e1y - sy*e1x;
     float v = f * (dx*qx + dy*qy + dz*qz);
-    if (v < 0.0f || u+v > 1.0f) return false;
-    float t = f * (e2x*qx + e2y*qy + e2z*qz);
-    return (t > 1e-4f && t < maxDist);
+    if (v < 0.0f || u+v > 1.0f) return -1.0f;
+    return f * (e2x*qx + e2y*qy + e2z*qz);
 }
 
+static inline bool RayTriHit(const std::array<float,9>& tri,
+                              float ox, float oy, float oz,
+                              float dx, float dy, float dz, float maxDist,
+                              float minDist) {
+    float t = RayTriDist(tri, ox, oy, oz, dx, dy, dz);
+    return (t > minDist && t < maxDist);
+}
+
+/* Hits nearer than minDist are ignored */
 bool RayHit(float ox, float oy, float oz, float dx, float dy, float dz,
-            float maxDist) {
+            float maxDist, float minDist = 1e-4f) {
   if (!g_bvhBuilt) return false;
 
   float idx = 1.0f / (fabsf(dx) > 1e-8f ? dx : (dx >= 0 ? 1e-8f : -1e-8f));
@@ -1825,7 +3283,7 @@ bool RayHit(float ox, float oy, float oz, float dx, float dy, float dz,
       /* Leaf */
       for (int i = 0; i < node.triCount; i++) {
         if (RayTriHit(g_rtTriangles[g_bvhTriIdx[node.triStart + i]],
-                      ox, oy, oz, dx, dy, dz, maxDist))
+                      ox, oy, oz, dx, dy, dz, maxDist, minDist))
           return true;
       }
     } else {
@@ -1836,47 +3294,189 @@ bool RayHit(float ox, float oy, float oz, float dx, float dy, float dz,
   return false;
 }
 
-float ComputeAO(float px, float py, float pz, float nx, float ny, float nz,
-                int samples) {
-  thread_local std::mt19937 rng(12345 + omp_get_thread_num());
-  thread_local std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+/* The nearest triangle along a ray, or -1. Hits nearer than minDist are ignored. */
+static int RayNearest(float ox, float oy, float oz, float dx, float dy, float dz,
+                      float minDist, float *dist) {
+  if (!g_bvhBuilt) return -1;
 
-  float ao = 0.0f;
-  float bias = 0.001f;
-  float maxDist = 2.0f; // AO radius
+  float idx = 1.0f / (fabsf(dx) > 1e-8f ? dx : (dx >= 0 ? 1e-8f : -1e-8f));
+  float idy = 1.0f / (fabsf(dy) > 1e-8f ? dy : (dy >= 0 ? 1e-8f : -1e-8f));
+  float idz = 1.0f / (fabsf(dz) > 1e-8f ? dz : (dz >= 0 ? 1e-8f : -1e-8f));
 
-  for (int i = 0; i < samples; i++) {
-    float u1 = dist(rng), u2 = dist(rng);
-    float r = sqrtf(u1), theta = 6.283185f * u2;
-    float lx = r * cosf(theta), ly = r * sinf(theta), lz = sqrtf(1.0f - u1);
+  int stack[64];
+  int sp = 0;
+  stack[sp++] = 0;
+  int best = -1;
+  float bestT = 1e30f;
 
-    // Build tangent frame
-    float upX = (fabsf(nx) < 0.9f) ? 1.0f : 0.0f,
-          upY = (fabsf(nx) < 0.9f) ? 0.0f : 1.0f;
-    float tx = upY * nz, ty = -upX * nz, tz = upX * ny - upY * nx;
-    float tlen = sqrtf(tx * tx + ty * ty + tz * tz);
-    tx /= tlen;
-    ty /= tlen;
-    tz /= tlen;
-    float bx = ny * tz - nz * ty, by = nz * tx - nx * tz,
-          bz = nx * ty - ny * tx;
-
-    float dx = lx * tx + ly * bx + lz * nx;
-    float dy = lx * ty + ly * by + lz * ny;
-    float dz = lx * tz + ly * bz + lz * nz;
-
-    if (!RayHit(px + nx * bias, py + ny * bias, pz + nz * bias, dx, dy, dz,
-                maxDist))
-      ao += 1.0f;
+  while (sp > 0) {
+    const BVHNode& node = g_bvh[stack[--sp]];
+    if (!RayAABB(node.box, ox, oy, oz, idx, idy, idz, bestT))
+      continue;
+    if (node.left == -1) {
+      for (int i = 0; i < node.triCount; i++) {
+        int tri = g_bvhTriIdx[node.triStart + i];
+        float t = RayTriDist(g_rtTriangles[tri], ox, oy, oz, dx, dy, dz);
+        if (t > minDist && t < bestT) {
+          bestT = t;
+          best = tri;
+        }
+      }
+    } else {
+      stack[sp++] = node.left;
+      stack[sp++] = node.right;
+    }
   }
-  return ao / samples;
+  *dist = bestT;
+  return best;
 }
 
-LitColor CalculateVertexLighting(float px, float py, float pz, float nx,
-                                 float ny, float nz, uint8_t baseR,
-                                 uint8_t baseG, uint8_t baseB, uint8_t vertR,
-                                 uint8_t vertG, uint8_t vertB) {
-  float ao = ComputeAO(px, py, pz, nx, ny, nz, 64);
+/* Bake settings. Offline only, so the sample counts can be generous. None of
+ * these are for the user: they are relative to the model, not to a scale. */
+#define BAKE_GATHER_SAMPLES 256     /* rays per vertex for AO, sky and bounced light */
+#define BAKE_SHADOW_SAMPLES 64
+#define BAKE_TRI_GATHER     48      /* the same, per triangle, for the bounce passes */
+#define BAKE_TRI_SHADOW     16
+#define BAKE_BOUNCES        2
+#define BAKE_BOUNCE_GAIN    0.8f
+#define BAKE_VERTEX_FACES   8       /* a vertex is lit from at most this many of its faces */
+#define BAKE_SUN_SPREAD     0.10f   /* tan of the key light's half angle: soft edges */
+
+/* A repeatable 0..1 value from a position. Sample patterns are turned by it, so
+ * two vertices at the same place (a seam between meshes) bake exactly alike. */
+static float BakeHash(float x, float y, float z) {
+  uint32_t h = 2166136261u;
+  float f[3] = {x, y, z};
+  for (int i = 0; i < 3; i++) {
+    uint32_t bits;
+    memcpy(&bits, &f[i], 4);
+    if (bits == 0x80000000u) bits = 0;   /* -0 and +0 are the same place */
+    h = (h ^ bits) * 16777619u;
+    h ^= h >> 15;
+  }
+  return (float)(h & 0xFFFFFF) / (float)0x1000000;
+}
+
+/* Two unit vectors at right angles to n */
+static void BakeFrame(float nx, float ny, float nz, float *t, float *b) {
+  float upX = (fabsf(nx) < 0.9f) ? 1.0f : 0.0f,
+        upY = (fabsf(nx) < 0.9f) ? 0.0f : 1.0f;
+  t[0] = upY * nz; t[1] = -upX * nz; t[2] = upX * ny - upY * nx;
+  float tlen = sqrtf(t[0] * t[0] + t[1] * t[1] + t[2] * t[2]);
+  t[0] /= tlen; t[1] /= tlen; t[2] /= tlen;
+  b[0] = ny * t[2] - nz * t[1];
+  b[1] = nz * t[0] - nx * t[2];
+  b[2] = nx * t[1] - ny * t[0];
+}
+
+/* Ambient colour from a direction: warm from below, blue from above */
+static inline void BakeSky(float dy, float *rgb) {
+  float hemi = dy * 0.5f + 0.5f;
+  rgb[0] = 0.3f + 0.2f * hemi;
+  rgb[1] = 0.25f + 0.35f * hemi;
+  rgb[2] = 0.2f + 0.6f * hemi;
+}
+
+/* One set of rays over the hemisphere gives three things:
+ *   ao      how open the point is to its near surroundings, 0..1
+ *   sky     ambient light from the rays that reach the sky
+ *   bounce  light coming off the surfaces the other rays hit
+ * selfDist: hits nearer than this are the point's own neighbouring faces */
+static void BakeGather(const float *p, const float *n, const float *faceN, int samples,
+                       float bias, float selfDist, bool useBounce, float *ao, float *sky,
+                       float *bounce) {
+  float t[3], b[3];
+  BakeFrame(n[0], n[1], n[2], t, b);
+  float turn = 6.283185f * BakeHash(p[0], p[1], p[2]);
+  float ox = p[0] + faceN[0] * bias, oy = p[1] + faceN[1] * bias, oz = p[2] + faceN[2] * bias;
+  float open = 0.0f;
+  int used = 0;
+  sky[0] = sky[1] = sky[2] = 0.0f;
+  bounce[0] = bounce[1] = bounce[2] = 0.0f;
+
+  /* Cosine weighted hemisphere, evenly spread (golden angle spiral) */
+  for (int i = 0; i < samples; i++) {
+    float u1 = (i + 0.5f) / samples;
+    float r = sqrtf(u1), theta = turn + 2.399963f * i;
+    float lx = r * cosf(theta), ly = r * sinf(theta), lz = sqrtf(1.0f - u1);
+    float dx = lx * t[0] + ly * b[0] + lz * n[0];
+    float dy = lx * t[1] + ly * b[1] + lz * n[1];
+    float dz = lx * t[2] + ly * b[2] + lz * n[2];
+
+    /* A smoothed normal leans past the edge of its own flat face. Rays that
+     * would go down through that face see the inside of the model: drop them. */
+    if (dx * faceN[0] + dy * faceN[1] + dz * faceN[2] <= 0.0f)
+      continue;
+    used++;
+
+    float dist;
+    int tri = RayNearest(ox, oy, oz, dx, dy, dz, selfDist, &dist);
+    if (tri < 0) {
+      float c[3];
+      BakeSky(dy, c);
+      sky[0] += c[0]; sky[1] += c[1]; sky[2] += c[2];
+      open += 1.0f;
+      continue;
+    }
+    /* Occlusion fades out with distance instead of stopping at a hard edge */
+    open += fminf(1.0f, dist / g_bakeAORadius);
+    if (useBounce) {
+      const std::array<float, 3> &l = g_bakeTriLight[tri];
+      bounce[0] += l[0]; bounce[1] += l[1]; bounce[2] += l[2];
+    }
+  }
+  if (!used) used = 1;
+  *ao = open / used;
+  for (int c = 0; c < 3; c++) {
+    sky[c] /= used;
+    bounce[c] /= used;
+  }
+}
+
+/* How much of the key light reaches a point, 0..1. The light is a small disc,
+ * not a point, so shadow edges are soft and do not flip from vertex to vertex. */
+static float ComputeKeyShadow(float px, float py, float pz, float nx, float ny,
+                              float nz, float lx, float ly, float lz,
+                              int samples, float bias, float selfDist) {
+  float t[3], b[3];
+  BakeFrame(lx, ly, lz, t, b);
+  float turn = 6.283185f * BakeHash(pz, px, py);
+  float ox = px + nx * bias, oy = py + ny * bias, oz = pz + nz * bias;
+
+  int lit = 0, used = 0;
+  for (int i = 0; i < samples; i++) {
+    float r = BAKE_SUN_SPREAD * sqrtf((i + 0.5f) / samples);
+    float theta = turn + 2.399963f * i;
+    float dx = lx + (t[0] * cosf(theta) + b[0] * sinf(theta)) * r;
+    float dy = ly + (t[1] * cosf(theta) + b[1] * sinf(theta)) * r;
+    float dz = lz + (t[2] * cosf(theta) + b[2] * sinf(theta)) * r;
+    float len = sqrtf(dx * dx + dy * dy + dz * dz);
+    dx /= len; dy /= len; dz /= len;
+
+    /* Part of the disc below the surface's own horizon: not a shadow */
+    if (dx * nx + dy * ny + dz * nz <= 0.0f)
+      continue;
+    used++;
+    if (!RayHit(ox, oy, oz, dx, dy, dz, 1e30f, selfDist))
+      lit++;
+  }
+  return used ? (float)lit / used : 0.0f;
+}
+
+/* All the light arriving at a point, as a colour to multiply the surface by.
+ * edgeLen: size of the polygons here. */
+static void BakeLightAt(const float *p, const float *n, const float *faceN, float edgeLen,
+                        int gatherSamples,
+                        int shadowSamples, bool useBounce, float *light) {
+  /* Rays start just clear of the face and ignore only the very nearest hits.
+   * Nothing more is needed against self shadowing: BakeGather drops the rays
+   * that would pass down through the point's own face. Both sizes follow the
+   * mesh's own detail, so a wall right next to a corner vertex still counts. */
+  float bias = fmaxf(1e-4f, edgeLen * 0.02f);
+  float selfDist = fmaxf(1e-4f, edgeLen * 0.05f);
+
+  float ao, sky[3], bounce[3];
+  BakeGather(p, n, faceN, gatherSamples, bias, selfDist, useBounce, &ao, sky, bounce);
 
   // Key light
   float keyX = 0.4f, keyY = 0.8f, keyZ = 0.4f;
@@ -1884,15 +3484,19 @@ LitColor CalculateVertexLighting(float px, float py, float pz, float nx,
   keyX /= klen;
   keyY /= klen;
   keyZ /= klen;
-  float keyNdotL = fmaxf(0.0f, nx * keyX + ny * keyY + nz * keyZ);
+  float keyDot = n[0] * keyX + n[1] * keyY + n[2] * keyZ;
+  float keyNdotL = fmaxf(0.0f, keyDot);
   float keyWrap = (keyNdotL + 0.5f) / 1.5f;
   keyWrap *= keyWrap;
 
-  // Key light shadow
-  float shadow = RayHit(px + nx * 0.001f, py + ny * 0.001f, pz + nz * 0.001f,
-                        keyX, keyY, keyZ, 100.0f)
-                     ? 0.3f
-                     : 1.0f;
+  // Key light shadow. Surfaces turned away from the light are in their own
+  // shadow; fade into that across the terminator so there is no hard line.
+  float facing = fminf(1.0f, fmaxf(0.0f, keyDot / 0.25f));
+  facing = facing * facing * (3.0f - 2.0f * facing);
+  float reach = facing > 0.0f ? ComputeKeyShadow(p[0], p[1], p[2], faceN[0], faceN[1], faceN[2], keyX,
+                                                 keyY, keyZ, shadowSamples, bias, selfDist)
+                              : 0.0f;
+  float shadow = 0.3f + 0.7f * reach * facing;
 
   // Fill light
   float fillX = -0.5f, fillY = 0.3f, fillZ = -0.3f;
@@ -1900,49 +3504,200 @@ LitColor CalculateVertexLighting(float px, float py, float pz, float nx,
   fillX /= flen;
   fillY /= flen;
   fillZ /= flen;
-  float fillDiffuse = (nx * fillX + ny * fillY + nz * fillZ) * 0.5f + 0.5f;
+  float fillDiffuse = (n[0] * fillX + n[1] * fillY + n[2] * fillZ) * 0.5f + 0.5f;
   fillDiffuse *= fillDiffuse;
 
-  // Hemisphere ambient
-  float hemi = ny * 0.5f + 0.5f;
-  float ambR = 0.3f + 0.2f * hemi;
-  float ambG = 0.25f + 0.35f * hemi;
-  float ambB = 0.2f + 0.6f * hemi;
+  // Ambient. Half is the sky the point can really see, so an overhang is
+  // darker underneath and bluer on top. The other half only looks at near
+  // surroundings, so an indoor level with no sky at all still gets some light.
+  float amb[3];
+  BakeSky(n[1], amb);
+
+  const float keyCol[3] = {0.7f, 0.65f, 0.55f};
+  const float fillCol[3] = {0.25f, 0.3f, 0.35f};
+  for (int c = 0; c < 3; c++)
+    light[c] = 0.35f * (0.5f * amb[c] * ao + 0.5f * sky[c]) +
+               keyWrap * keyCol[c] * shadow + fillDiffuse * fillCol[c] +
+               bounce[c] * BAKE_BOUNCE_GAIN;
+}
+
+/* Light leaving every triangle: what it gives off, plus what it reflects. Each
+ * pass reads the one before, so pass 1 is direct light and pass 2 onwards add a
+ * bounce each. */
+static void BakeTriangleLight() {
+  int count = (int)g_bakeTris.size();
+  g_bakeTriLight.assign(count, {0.0f, 0.0f, 0.0f});
+  std::vector<std::array<float, 3>> next(count);
+
+  for (int pass = 0; pass < BAKE_BOUNCES; pass++) {
+    #pragma omp parallel for schedule(dynamic, 256)
+    for (int i = 0; i < count; i++) {
+      const BakeTri &t = g_bakeTris[i];
+      const std::array<float, 9> &v = g_rtTriangles[i];
+      float p[3] = {(v[0] + v[3] + v[6]) / 3.0f, (v[1] + v[4] + v[7]) / 3.0f,
+                    (v[2] + v[5] + v[8]) / 3.0f};
+      float light[3];
+      BakeLightAt(p, t.n, t.n, t.edge, BAKE_TRI_GATHER, BAKE_TRI_SHADOW, pass > 0, light);
+      for (int c = 0; c < 3; c++)
+        next[i][c] = t.emit[c] + t.albedo[c] * light[c];
+    }
+    g_bakeTriLight.swap(next);
+  }
+}
+
+/* Vertices at the same place with the same normal, whichever mesh they are in */
+struct BakeVertKey {
+  uint32_t pos[3];
+  int8_t n[3];
+  bool operator<(const BakeVertKey &o) const {
+    if (int d = memcmp(pos, o.pos, sizeof(pos))) return d < 0;
+    return memcmp(n, o.n, sizeof(n)) < 0;
+  }
+};
+
+static BakeVertKey BakeKeyOf(const Vertex *v) {
+  BakeVertKey k;
+  float f[3] = {v->x, v->y, v->z};
+  memcpy(k.pos, f, sizeof(f));
+  for (int i = 0; i < 3; i++)
+    if (k.pos[i] == 0x80000000u) k.pos[i] = 0;
+  k.n[0] = v->nx; k.n[1] = v->ny; k.n[2] = v->nz;
+  return k;
+}
+
+/* Bakes light into the vertex colours of every drawn mesh. Free at runtime: the
+ * result is only the colours the vertices already carry. */
+static void BakeModelLighting(const Model *model) {
+  BuildRTScene(model);
+  if (g_rtTriangles.empty())
+    return;
+  printf("Baking lighting (%d threads): %d bounces...", omp_get_max_threads(),
+         BAKE_BOUNCES);
+  fflush(stdout);
+  BakeTriangleLight();
+
+  /* A vertex colour stands for the faces around the vertex, not the single
+   * point it sits at, which is often the darkest spot of a crease. So light is
+   * sampled a little way into each face that uses the vertex and averaged by
+   * area. Vertices split between meshes share one answer, so seams match. */
+  struct Corner { int tri, corner; };
+  std::map<BakeVertKey, int> slotOf;
+  std::vector<std::vector<Corner>> corners;
+  for (int i = 0; i < (int)g_bakeTris.size(); i++) {
+    const BakeTri &t = g_bakeTris[i];
+    for (int k = 0; k < 3; k++) {
+      BakeVertKey key = BakeKeyOf(&model->meshes[t.mesh].vertices[t.i[k]]);
+      auto it = slotOf.find(key);
+      if (it == slotOf.end()) {
+        it = slotOf.insert({key, (int)corners.size()}).first;
+        corners.push_back({});
+      }
+      corners[it->second].push_back({i, k});
+    }
+  }
+  printf(" %zu vertex sites...", corners.size());
+  fflush(stdout);
+
+  std::vector<std::array<float, 3>> siteLight(corners.size());
+  #pragma omp parallel for schedule(dynamic, 64)
+  for (int s = 0; s < (int)corners.size(); s++) {
+    std::vector<Corner> &list = corners[s];
+    if ((int)list.size() > BAKE_VERTEX_FACES) {
+      std::stable_sort(list.begin(), list.end(), [](const Corner &a, const Corner &b) {
+        return g_bakeTris[a.tri].area > g_bakeTris[b.tri].area;
+      });
+      list.resize(BAKE_VERTEX_FACES);
+    }
+    int faces = (int)list.size();
+    int gather = std::max(32, BAKE_GATHER_SAMPLES / faces);
+    int shadowRays = std::max(8, BAKE_SHADOW_SAMPLES / faces);
+
+    float sum[3] = {0, 0, 0}, weight = 0;
+    for (const Corner &c : list) {
+      const BakeTri &t = g_bakeTris[c.tri];
+      const Mesh *mesh = &model->meshes[t.mesh];
+      const Vertex *v0 = &mesh->vertices[t.i[c.corner]];
+      const Vertex *v1 = &mesh->vertices[t.i[(c.corner + 1) % 3]];
+      const Vertex *v2 = &mesh->vertices[t.i[(c.corner + 2) % 3]];
+      float p[3] = {0.6f * v0->x + 0.2f * (v1->x + v2->x),
+                    0.6f * v0->y + 0.2f * (v1->y + v2->y),
+                    0.6f * v0->z + 0.2f * (v1->z + v2->z)};
+      /* The vertex's own normal: blending in the neighbours' normals tilts the
+       * shading towards the bigger faces and shows up as stripes. */
+      float n[3] = {(float)v0->nx, (float)v0->ny, (float)v0->nz};
+      float len = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+      if (len > 1e-6f) {
+        n[0] /= len; n[1] /= len; n[2] /= len;
+      } else {
+        n[0] = t.n[0]; n[1] = t.n[1]; n[2] = t.n[2];
+      }
+      float light[3];
+      BakeLightAt(p, n, t.n, t.edge, gather, shadowRays, true, light);
+      for (int k = 0; k < 3; k++) sum[k] += light[k] * t.area;
+      weight += t.area;
+    }
+    for (int k = 0; k < 3; k++) siteLight[s][k] = sum[k] / weight;
+  }
 
   // Rim
   float rimX = -0.3f, rimY = 0.2f, rimZ = -0.9f;
   float rlen = sqrtf(rimX * rimX + rimY * rimY + rimZ * rimZ);
-  float rim =
-      fmaxf(0.0f, -(nx * rimX / rlen + ny * rimY / rlen + nz * rimZ / rlen));
-  rim = powf(rim, 2.0f) * 0.2f;
 
-  // Combine (multiply source vertex color with baked lighting)
-  float srcR = vertR / 255.0f;
-  float srcG = vertG / 255.0f;
-  float srcB = vertB / 255.0f;
+  for (int m = 0; m < model->meshCount; m++) {
+    const Mesh *mesh = &model->meshes[m];
+    if (mesh->collisionOnly)
+      continue;
+    float base[3] = {((mesh->materialColor >> 16) & 0xFF) / 255.0f,
+                     ((mesh->materialColor >> 8) & 0xFF) / 255.0f,
+                     (mesh->materialColor & 0xFF) / 255.0f};
+    float emit[3] = {0, 0, 0};
+    auto glow = g_emissive.find({mesh->textureId, mesh->materialColor});
+    if (glow != g_emissive.end())
+      for (int c = 0; c < 3; c++) emit[c] = glow->second[c];
 
-  float r =
-      srcR * (baseR / 255.0f) *
-          (ambR * 0.35f * ao + keyWrap * 0.7f * shadow + fillDiffuse * 0.25f) +
-      rim;
-  float g =
-      srcG * (baseG / 255.0f) *
-          (ambG * 0.35f * ao + keyWrap * 0.65f * shadow + fillDiffuse * 0.3f) +
-      rim;
-  float b =
-      srcB * (baseB / 255.0f) *
-          (ambB * 0.35f * ao + keyWrap * 0.55f * shadow + fillDiffuse * 0.35f) +
-      rim;
+    for (int i = 0; i < mesh->vertexCount; i++) {
+      Vertex *v = &mesh->vertices[i];
+      auto it = slotOf.find(BakeKeyOf(v));
+      if (it == slotOf.end())
+        continue;               /* not used by any triangle */
+      const std::array<float, 3> &light = siteLight[it->second];
 
-  // Saturation boost
-  float gray = (r + g + b) / 3.0f;
-  r = gray + (r - gray) * 1.15f;
-  g = gray + (g - gray) * 1.15f;
-  b = gray + (b - gray) * 1.15f;
+      float nx = v->nx / 127.0f, ny = v->ny / 127.0f, nz = v->nz / 127.0f;
+      float rim = fmaxf(0.0f, -(nx * rimX + ny * rimY + nz * rimZ) / rlen);
+      rim = rim * rim * 0.2f;
 
-  return {(uint8_t)(fminf(1.0f, fmaxf(0.0f, r)) * 255.0f),
-          (uint8_t)(fminf(1.0f, fmaxf(0.0f, g)) * 255.0f),
-          (uint8_t)(fminf(1.0f, fmaxf(0.0f, b)) * 255.0f)};
+      // Multiply the source vertex colour by the baked light. A glowing
+      // surface shows at least its own light.
+      float src[3] = {v->r / 255.0f, v->g / 255.0f, v->b / 255.0f};
+      float out[3];
+      for (int c = 0; c < 3; c++)
+        out[c] = src[c] * base[c] * (light[c] + emit[c]) + rim;
+
+      // Saturation boost
+      float gray = (out[0] + out[1] + out[2]) / 3.0f;
+      for (int c = 0; c < 3; c++) {
+        out[c] = gray + (out[c] - gray) * 1.15f;
+        out[c] = fminf(1.0f, fmaxf(0.0f, out[c])) * 255.0f;
+      }
+      v->r = (uint8_t)out[0];
+      v->g = (uint8_t)out[1];
+      v->b = (uint8_t)out[2];
+    }
+  }
+  printf(" done.\n");
+}
+
+/* glTF defines baseColorFactor in linear light; the PVR multiplies it straight
+ * against an sRGB texel, so raw it comes out dark (Sketchfab writes 0.21223
+ * into everything: mid grey, 127/255, arriving as 54/255). sRGB is a power law
+ * and power laws are multiplicative -- encode(f*t) == encode(f)*encode(t) -- so
+ * encoding here lands where glTF's linear multiply would. Alpha is not gamma
+ * encoded and is left alone. */
+static uint8_t LinearToSrgb8(uint8_t linear) {
+  float x = linear / 255.0f;
+  float s = x <= 0.0031308f ? 12.92f * x
+                            : 1.055f * powf(x, 1.0f / 2.4f) - 0.055f;
+  return (uint8_t)(s * 255.0f + 0.5f);
 }
 
 void ExportTristrippedModel(const Model *model, const char *filename,
@@ -1955,16 +3710,20 @@ void ExportTristrippedModel(const Model *model, const char *filename,
 
   // Header
   uint32_t magic = 0x54534D44;
-  uint32_t version = 5; // Version 5: material flags per mesh
   uint32_t meshCount = model->meshCount;
   uint32_t boneCount = model->skeleton ? model->skeleton->boneCount : 0;
   bool isAnimated = (boneCount > 0);
+  uint32_t blockCount = isAnimated ? 0 : model->blockCount;
 
-  // Build sort order: OPAQUE first, then CUTOUT, then TRANSPARENT
+  // Build sort order: OPAQUE first, then CUTOUT, then TRANSPARENT. Inside a
+  // list, meshes of one block sit together so the runtime culls them in one go.
   std::vector<int> meshOrder(meshCount);
   std::iota(meshOrder.begin(), meshOrder.end(), 0);
   std::stable_sort(meshOrder.begin(), meshOrder.end(), [&](int a, int b) {
-    return model->meshes[a].alphaMode < model->meshes[b].alphaMode;
+    const Mesh &ma = model->meshes[a], &mb = model->meshes[b];
+    if (ma.alphaMode != mb.alphaMode) return ma.alphaMode < mb.alphaMode;
+    if (blockCount && ma.blockId != mb.blockId) return ma.blockId < mb.blockId;
+    return blockCount && ma.textureId < mb.textureId;
   });
 
   uint32_t opaque_count = 0, cutout_count = 0, transparent_count = 0;
@@ -1979,7 +3738,6 @@ void ExportTristrippedModel(const Model *model, const char *filename,
          opaque_count, cutout_count, transparent_count);
 
   fwrite(&magic, sizeof(uint32_t), 1, file);
-  fwrite(&version, sizeof(uint32_t), 1, file);
   fwrite(&meshCount, sizeof(uint32_t), 1, file);
   fwrite(&boneCount, sizeof(uint32_t), 1, file);
   fwrite(&opaque_count, sizeof(uint32_t), 1, file);
@@ -2027,13 +3785,45 @@ void ExportTristrippedModel(const Model *model, const char *filename,
     fwrite(&animCount, sizeof(uint32_t), 1, file);
   }
 
+  // Block table, one bounding sphere per block (empty for skinned models)
+  fwrite(&blockCount, sizeof(uint32_t), 1, file);
+  if (blockCount) {
+    std::vector<Vector3> lo(blockCount, {1e30f, 1e30f, 1e30f});
+    std::vector<Vector3> hi(blockCount, {-1e30f, -1e30f, -1e30f});
+    for (uint32_t m = 0; m < meshCount; m++) {
+      const Mesh *mesh = &model->meshes[m];
+      for (int i = 0; i < mesh->vertexCount; i++) {
+        Vector3 p = {mesh->vertices[i].x, mesh->vertices[i].y, mesh->vertices[i].z};
+        lo[mesh->blockId] = Vector3Min(lo[mesh->blockId], p);
+        hi[mesh->blockId] = Vector3Max(hi[mesh->blockId], p);
+      }
+    }
+    std::vector<float> radius(blockCount, 0.0f);
+    std::vector<Vector3> centre(blockCount);
+    for (uint32_t b = 0; b < blockCount; b++)
+      centre[b] = Vector3Scale(Vector3Add(lo[b], hi[b]), 0.5f);
+    for (uint32_t m = 0; m < meshCount; m++) {
+      const Mesh *mesh = &model->meshes[m];
+      for (int i = 0; i < mesh->vertexCount; i++) {
+        Vector3 p = {mesh->vertices[i].x, mesh->vertices[i].y, mesh->vertices[i].z};
+        radius[mesh->blockId] = std::max(radius[mesh->blockId],
+                                         Vector3Distance(p, centre[mesh->blockId]));
+      }
+    }
+    float maxRadius = 0.0f;
+    for (uint32_t b = 0; b < blockCount; b++) {
+      fwrite(&centre[b], sizeof(float), 3, file);
+      fwrite(&radius[b], sizeof(float), 1, file);
+      maxRadius = std::max(maxRadius, radius[b]);
+    }
+    printf("Writing %u blocks, largest radius %.1f\n", blockCount, maxRadius);
+  }
+
   // Write mesh data
   printf("Writing %d meshes at %ld\n", meshCount, ftell(file));
 
-  if (bakeLighting) {
-    BuildRTScene(model);
-    printf("Baking lighting (AO/Shadows)...\n");
-  }
+  if (bakeLighting)
+    BakeModelLighting(model);
 
   for (uint32_t m = 0; m < meshCount; m++) {
     const Mesh *mesh = &model->meshes[meshOrder[m]];
@@ -2042,29 +3832,17 @@ void ExportTristrippedModel(const Model *model, const char *filename,
            meshOrder[m], mesh->vertexCount, mesh->indexCount);
 
     // Bake lighting or apply material color
+    /* Encoded here, not where materialColor is read: BakeModelLighting wants
+     * the linear value, as a reflectance rather than a screen multiplier. */
     uint8_t baseA = (mesh->materialColor >> 24) & 0xFF;
-    uint8_t baseR = (mesh->materialColor >> 16) & 0xFF;
-    uint8_t baseG = (mesh->materialColor >> 8) & 0xFF;
-    uint8_t baseB = (mesh->materialColor) & 0xFF;
+    uint8_t baseR = LinearToSrgb8((mesh->materialColor >> 16) & 0xFF);
+    uint8_t baseG = LinearToSrgb8((mesh->materialColor >> 8) & 0xFF);
+    uint8_t baseB = LinearToSrgb8((mesh->materialColor) & 0xFF);
 
     if (bakeLighting) {
-      printf("    Computing lighting (%d threads)...", omp_get_max_threads());
-      fflush(stdout);
-      #pragma omp parallel for schedule(dynamic, 64)
-      for (int i = 0; i < mesh->vertexCount; i++) {
-        Vertex *v = &mesh->vertices[i];
-        float vnx = v->nx / 127.0f;
-        float vny = v->ny / 127.0f;
-        float vnz = v->nz / 127.0f;
-        LitColor lit =
-            CalculateVertexLighting(v->x, v->y, v->z, vnx, vny, vnz, baseR, baseG,
-                                    baseB, v->r, v->g, v->b);
-        v->r = lit.r;
-        v->g = lit.g;
-        v->b = lit.b;
-        v->a = (uint8_t)((v->a * baseA) / 255);
-      }
-      printf(" done.\n");
+      /* BakeModelLighting has set the colours already */
+      for (int i = 0; i < mesh->vertexCount; i++)
+        mesh->vertices[i].a = (uint8_t)((mesh->vertices[i].a * baseA) / 255);
     } else {
       for (int i = 0; i < mesh->vertexCount; i++) {
         Vertex *v = &mesh->vertices[i];
@@ -2087,7 +3865,7 @@ void ExportTristrippedModel(const Model *model, const char *filename,
     // Write mesh header
     fwrite(&totalVerts, sizeof(uint32_t), 1, file);
     fwrite(&mesh->textureId, sizeof(int), 1, file);
-    fwrite(&mesh->materialColor, sizeof(uint32_t), 1, file);
+    fwrite(&mesh->rim, sizeof(uint32_t), 1, file);   /* the base colour is baked in; this slot is the rim */
 
     // Write bounding sphere
     fwrite(&bsCx, sizeof(float), 1, file);
@@ -2095,7 +3873,7 @@ void ExportTristrippedModel(const Model *model, const char *filename,
     fwrite(&bsCz, sizeof(float), 1, file);
     fwrite(&bsRadius, sizeof(float), 1, file);
 
-    // Pack material flags (v5)
+    // Pack material flags
     // bits 0-1:  alpha_mode (0=OPAQUE, 1=CUTOUT, 2=TRANSPARENT)
     // bit  2:    double_sided
     // bits 3-4:  blend_mode (0=src_alpha, 1=additive) — default 0
@@ -2103,6 +3881,18 @@ void ExportTristrippedModel(const Model *model, const char *filename,
     // bits 7-8:  wrap_v (same)
     // bit  9:    tex_filter (0=bilinear, 1=nearest)
     // bits 10-11: lighting_mode (0=BAKED, 1=DYNAMIC, 2=UNLIT)
+    // bit  12:   collision_only (collided with, never drawn)
+    // bit  13:   metallic (reflects the environment image)
+    // bit  14:   mirror (solid, metallic, roughness near 0: shows only the
+    //            environment image, tinted by its vertex colours)
+    // bit  15:   marker (set at runtime by dc_model_points, never written here)
+    // bit  16:   glow (the material has an Emission colour: it gives off light
+    //            rather than only catching it, and blooms)
+    // bit  17:   one colour (set at load when every vertex shares a colour)
+    // bit  18:   glossy (not metal, roughness near 0: glass, polished
+    //            plastic; reflects the environment image as metal does)
+    // bits 20-23: shine power (0 = no highlight, 1-8 tighter as it goes up)
+    // bits 24-31: shine strength (0-255)
     uint32_t material_flags = 0;
     material_flags |= (mesh->alphaMode & 0x3);
     material_flags |= (mesh->doubleSided & 0x1) << 2;
@@ -2114,10 +3904,34 @@ void ExportTristrippedModel(const Model *model, const char *filename,
     // tex_filter: default bilinear (0)
     // lighting_mode: baked=0, dynamic=1
     material_flags |= (bakeLighting ? 0 : 1) << 10;
+    material_flags |= (mesh->collisionOnly & 0x1) << 12;
+    /* An animated vertex has no room for its own shine (the byte is its
+     * bone), so the mesh takes the average of its vertices */
+    int shineStrength = mesh->shineStrength;
+    if (isAnimated && mesh->vertexCount) {
+      long sum = 0;
+      for (int v = 0; v < mesh->vertexCount; v++) sum += 255 - mesh->vertices[v].dull;
+      shineStrength = (int)(shineStrength * sum / (255L * mesh->vertexCount));
+    }
+    /* A textured part's reflection is a second pass as bright as its shine,
+     * so with none it would add nothing. Untextured metal shows the sky as
+     * its surface in the one pass, and a mirror and textured glass at their
+     * own strength, so those keep it */
+    int mirror = mesh->metallic == 2 && mesh->alphaMode == 0;
+    int glass = mesh->alphaMode == 2 && mesh->textureId >= 0;
+    int reflects = shineStrength || mirror || glass || mesh->textureId < 0;
+    material_flags |= (reflects && mesh->metallic != 0) << 13;
+    material_flags |= mirror << 14;
+    material_flags |= (mesh->glow != 0) << 16;
+    material_flags |= (reflects && mesh->glossy != 0) << 18;
+    material_flags |= (uint32_t)(shineStrength ? mesh->shinePower & 0xf : 0) << 20;
+    material_flags |= (uint32_t)(shineStrength & 0xff) << 24;
 
     float alphaCutoff = mesh->alphaCutoff;
     fwrite(&material_flags, sizeof(uint32_t), 1, file);
     fwrite(&alphaCutoff, sizeof(float), 1, file);
+    uint32_t block = blockCount ? mesh->blockId : 0;
+    fwrite(&block, sizeof(uint32_t), 1, file);
 
     const char *alphaNames[] = {"OPAQUE", "CUTOUT", "TRANSPARENT"};
     printf("    Material: alpha=%s flags=0x%08X cutoff=%.2f\n",
@@ -2173,7 +3987,7 @@ void ExportTristrippedModel(const Model *model, const char *filename,
         sv.nx = srcV.nx;
         sv.ny = srcV.ny;
         sv.nz = srcV.nz;
-        sv.pad = 0;
+        sv.pad = 255 - srcV.dull;   // how much of the mesh's shine this vertex has
         sv.flags = flag;
         fwrite(&sv, sizeof(StaticVertex), 1, file);
       } else {
@@ -2194,7 +4008,7 @@ void ExportTristrippedModel(const Model *model, const char *filename,
     }
   }
 
-  // ---- Embed textures (v5) ----
+  // ---- Embed textures ----
   // Derive output directory from filename
   char outputDir[256] = ".";
   strncpy(outputDir, filename, sizeof(outputDir) - 1);
@@ -2269,6 +4083,17 @@ void ExportTristrippedModel(const Model *model, const char *filename,
   fseek(file, endPos, SEEK_SET);
 
   printf("=== Texture embedding complete ===\n");
+
+  // Material names, after everything else: "MATN", then 32 chars per mesh
+  fwrite("MATN", 1, 4, file);
+  for (uint32_t m = 0; m < meshCount; m++)
+    fwrite(model->meshes[meshOrder[m]].materialName, 1, 32, file);
+
+  // Entities (Blender empties): "ENTS", count, then one EntityRecord each
+  uint32_t entCount = (uint32_t)g_entities.size();
+  fwrite("ENTS", 1, 4, file);
+  fwrite(&entCount, sizeof(uint32_t), 1, file);
+  fwrite(g_entities.data(), sizeof(EntityRecord), entCount, file);
 
   long finalPos = ftell(file);
   fclose(file);
