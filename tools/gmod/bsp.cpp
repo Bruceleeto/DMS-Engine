@@ -267,9 +267,10 @@ bool bsp_load(Vfs& vfs, const std::string& path, Bsp& out, std::string* why) {
         float tv[2][4], lv[2][4];
         for (int k = 0; k < 8; k++) { tv[k / 4][k % 4] = rf(f, to + 4 * k); lv[k / 4][k % 4] = rf(f, to + 32 + 4 * k); }
 
-        int plane = rd<uint16_t>(f, fo), side = f[fo + 2];
+        /* The plane it is on faces the way it does: a face on the back of a
+         * node's plane has the plane's flipped twin (odd numbered) already */
+        int plane = rd<uint16_t>(f, fo);
         V3 pn = rv(f, R.at(L_PLANES) + (size_t)plane * 20);
-        if (side) pn = pn * -1;
         int first = ri(f, fo + 4), nedges = rd<int16_t>(f, fo + 8), disp = rd<int16_t>(f, fo + 12);
         int lightofs = ri(f, fo + 20);
         int mins[2] = { ri(f, fo + 28), ri(f, fo + 32) }, size[2] = { ri(f, fo + 36), ri(f, fo + 40) };
