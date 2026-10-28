@@ -13,10 +13,16 @@ struct VfsEntry {
     uint16_t archive;       /* vpk: which _NNN.vpk, 0x7fff the _dir itself */
     uint64_t offset, size;
     std::vector<uint8_t> preload;   /* vpk: bytes kept in the directory */
+    uint16_t method = 0;            /* zip: 8 deflate, 14 LZMA (packed as csize bytes) */
+    uint64_t csize = 0;
 };
 
+/* Valve's LZMA (a map's lumps): "LZMA", u32 size, u32 packed size, 5 bytes
+ * of properties, the stream. False if it isn't that */
+bool valve_unlzma(const uint8_t* d, size_t n, std::vector<uint8_t>& out);
+
 struct VfsSource {
-    enum Kind { DIR, VPK, GMA } kind;
+    enum Kind { DIR, VPK, GMA, ZIP } kind;
     std::string path;       /* the folder, the _dir.vpk, or the .gma (.bin) */
     std::string label;      /* where it came from, for lists */
     mutable std::vector<uint8_t> blob;  /* a .bin addon, unpacked when first read */
@@ -37,6 +43,9 @@ public:
     bool add_dir(const std::string& dir, const std::string& label);
     bool add_vpk(const std::string& dir_vpk, const std::string& label);
     bool add_gma(const std::string& path, const std::string& label);
+    /* A .zip in memory (a map's pakfile: its stored files); its files hide
+     * the same paths already mounted, as a map's own do in the game */
+    bool add_zip(std::vector<uint8_t> zip, const std::string& label);
 
     bool exists(const std::string& path) const;
     bool read(const std::string& path, std::vector<uint8_t>& out) const;

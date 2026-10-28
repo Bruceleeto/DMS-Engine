@@ -69,7 +69,7 @@ static std::string base_name(const std::string& p) {
  * What gmod2glb says
  * ================================================================ */
 
-struct Entry { std::string path, from; bool workshop; };
+struct Entry { std::string path, from; bool workshop, map; };
 struct Node { std::map<std::string, Node> dirs; std::vector<int> files; };
 
 enum { ALPHATEST = 1, TRANSLUCENT = 2, TWO_SIDED = 4, ADDITIVE = 8 };
@@ -85,15 +85,19 @@ struct Mat {
 
 struct PMesh { int mat; std::vector<uint32_t> idx; };
 
-/* One model as gmod2glb --info reads it */
+/* One model (or map) as gmod2glb --info reads it */
 struct Loaded {
     std::string path, from, error;
+    bool map = false;
+    int unsimplified = 0;                               /* a map's triangles before simplifying */
+    std::vector<std::pair<std::string, int>> props;     /* a map's: each model, how many */
     int bones = 0, verts = 0, tris = 0, skins = 1;
     std::vector<std::pair<std::string, std::vector<std::string>>> body;
     std::vector<Mat> mats;
     std::vector<std::string> anims;
     std::set<std::string> anim_files;
     std::vector<float> pos, nrm, uv;
+    std::vector<uint8_t> rgba;              /* a map's light at each vertex */
     std::vector<PMesh> meshes;
     float centre[3] = { 0, 0, 0 }, radius = 1;
 };
@@ -109,7 +113,7 @@ static bool read_preview(const std::string& file, Loaded& L) {
     size_t p = 0;
     auto need = [&](size_t k) { return p + k <= d.size(); };
     auto u32 = [&]() { uint32_t v = 0; if (need(4)) memcpy(&v, &d[p], 4); p += 4; return v; };
-    if (!need(8) || memcmp(d.data(), "GMPV", 4)) return false;
+    if (!need(8) || memcmp(d.data(), "GMPV", 4) || d[4] != 2) return false;
     p = 8;
     uint32_t nm = u32();
     for (uint32_t i = 0; i < nm && need(5); i++) {
@@ -130,7 +134,8 @@ static bool read_preview(const std::string& file, Loaded& L) {
         p += bytes;
     }
     uint32_t nv = u32();
-    if (!need((size_t)nv * 32)) return false;
+    if (!need((size_t)nv * 36)) return false;
+    L.rgba.resize(nv * 4);
     L.pos.resize(nv * 3);
     L.nrm.resize(nv * 3);
     L.uv.resize(nv * 2);
@@ -138,7 +143,8 @@ static bool read_preview(const std::string& file, Loaded& L) {
     for (uint32_t i = 0; i < nv; i++) {
         float v[8];
         memcpy(v, &d[p], 32);
-        p += 32;
+        memcpy(&L.rgba[i * 4], &d[p + 32], 4);
+        p += 36;
         for (int k = 0; k < 3; k++) {
             L.pos[i * 3 + k] = v[k];
             L.nrm[i * 3 + k] = v[3 + k];
@@ -171,10 +177,13 @@ static bool read_preview(const std::string& file, Loaded& L) {
     return true;
 }
 
-static void load(const std::string& path, int skin, const std::vector<int>& body, Loaded& L) {
+static void load(const std::string& path, int skin, const std::vector<int>& body, float simplify, Loaded& L) {
     std::string dir = ed.root + "build/editor/gmod/";
-    std::string cmd = q(tool()) + " --info " + q(path) + " --preview " + q(dir + "preview.bin") + " --tex 512";
+    L.map = path.size() > 4 && !path.compare(path.size() - 4, 4, ".bsp");
+    /* A map has a couple of hundred textures */
+    std::string cmd = q(tool()) + " --info " + q(path) + " --preview " + q(dir + "preview.bin") + (L.map ? " --tex 128" : " --tex 512");
     if (skin) cmd += " --skin " + std::to_string(skin);
+    if (L.map && simplify > 0) cmd += " --simplify " + std::to_string(simplify);
     if (!body.empty()) {
         std::string b;
         for (size_t i = 0; i < body.size(); i++) b += (i ? "," : "") + std::to_string(body[i]);
@@ -190,7 +199,9 @@ static void load(const std::string& path, int skin, const std::vector<int>& body
         std::vector<std::string> f = fields(out.substr(at, nl - at));
         at = nl + 1;
         const std::string& k = f[0];
-        if (k == "model" && f.size() > 2) L.from = f[2];
+        if ((k == "model" || k == "map") && f.size() > 2) L.from = f[2];
+        else if (k == "simplified" && f.size() > 1) L.unsimplified = atoi(f[1].c_str());
+        else if (k == "prop" && f.size() > 2) L.props.push_back({ f[1], atoi(f[2].c_str()) });
         else if (k == "counts" && f.size() > 4) {
             L.bones = atoi(f[1].c_str());
             L.verts = atoi(f[2].c_str());
@@ -231,6 +242,8 @@ static struct {
     std::vector<Entry> entries;
     std::string list_error;
     int show = 0;                           /* 0 everything, 1 the game's, 2 workshop addons */
+    int kind = 0, kind_was = -1;            /* 0 models, 1 maps */
+    int simplify = 2;                       /* a map's: SIMPLIFY[] */
     char filter[128] = "";
     std::string filter_was = "\x01";
     int show_was = -1;
@@ -261,10 +274,14 @@ static struct {
     int tex = 2;
     std::atomic<int> bring_state{ 0 };      /* 0 idle, 1 working, 2 done, 3 failed */
     std::thread bring_worker;
-    std::string bring_log, bring_rel;
+    std::string bring_log, bring_rel, bring_scene;
+    bool bring_map = false, props = true;
 } g;
 
 static const int TEX_SIZES[] = { 64, 128, 256, 512, 1024 };
+/* How far a map's shape (metres) and light (0..1) may move when simplified */
+static const float SIMPLIFY[] = { 0, 0.02f, 0.05f, 0.1f, 0.2f, 0.4f };
+static const char* const SIMPLIFY_NAMES[] = { "Off", "Light", "Medium", "Strong", "Stronger", "Most" };
 
 static void list_start() {
     g.list_state = 1;
@@ -289,7 +306,8 @@ static void list_start() {
             at = nl + 1;
             if (f[0].empty()) continue;
             std::string from = f.size() > 1 ? f[1] : "";
-            g.entries.push_back({ f[0], from, !from.compare(0, 9, "workshop/") || !from.compare(0, 7, "addons/") });
+            bool map = f[0].size() > 4 && !f[0].compare(f[0].size() - 4, 4, ".bsp");
+            g.entries.push_back({ f[0], from, !from.compare(0, 9, "workshop/") || !from.compare(0, 7, "addons/"), map });
         }
         g.list_state = 2;
     });
@@ -308,10 +326,11 @@ static void request() {
     g.state = 1;
     std::string path = g.selected;
     int skin = g.skin;
+    float simplify = SIMPLIFY[g.simplify];
     std::vector<int> body = g.body;
-    g.worker = std::thread([path, skin, body] {
+    g.worker = std::thread([path, skin, body, simplify] {
         g.next = Loaded();
-        load(path, skin, body, g.next);
+        load(path, skin, body, simplify, g.next);
         g.state = 2;
     });
 }
@@ -324,6 +343,10 @@ static void select(const std::string& path) {
     g.anims.clear();
     snprintf(g.name, sizeof(g.name), "%s", base_name(path).c_str());
     g.dist = 0;
+    bool map = path.size() > 4 && !path.compare(path.size() - 4, 4, ".bsp");
+    /* A map from above, its textures small (it has a couple of hundred) */
+    g.pitch = map ? 0.7f : 0.15f;
+    g.tex = map ? 1 : 2;
     request();
 }
 
@@ -381,7 +404,7 @@ static void render_preview(int w, int h) {
     SDL_RenderClear(r);
     size_t nv = L.pos.size() / 3;
     if (nv) {
-        if (g.dist <= 0) g.dist = L.radius * 2.6f;
+        if (g.dist <= 0) g.dist = L.radius * (L.map ? 1.5f : 2.6f);
         float cp = cosf(g.pitch), sp = sinf(g.pitch), cy = cosf(g.yaw), sy = sinf(g.yaw);
         float eye[3] = { L.centre[0] + g.dist * cp * sy, L.centre[1] + g.dist * sp, L.centre[2] + g.dist * cp * cy };
         float fw[3] = { -cp * sy, -sp, -cp * cy };
@@ -406,6 +429,7 @@ static void render_preview(int w, int h) {
             float iz = z > 1e-4f ? 1.0f / z : 0;
             sx[i] = w * 0.5f + x * iz * focal;
             syv[i] = h * 0.5f - y * iz * focal;
+            if (L.map) continue;            /* lit by its own lightmap */
             const float* n = &L.nrm[i * 3];
             float l = n[0] * lt[0] + n[1] * lt[1] + n[2] * lt[2];
             shade[i] = 0.42f + 0.58f * (l > 0 ? l : 0);
@@ -445,10 +469,11 @@ static void render_preview(int w, int h) {
                 bool textured = m.mat >= 0 && m.mat < (int)L.mats.size() && L.mats[m.mat].tex;
                 for (int k = 0; k < 3; k++) {
                     uint32_t i = m.idx[tri.at + k];
-                    float s = shade[i] * (textured ? 1.0f : 0.7f);
+                    float s = (L.map ? 1.0f : shade[i]) * (textured ? 1.0f : 0.7f);
+                    const uint8_t* c = &L.rgba[i * 4];
                     SDL_Vertex v;
                     v.position = { sx[i], syv[i] };
-                    v.color = { s, s, s, 1.0f };
+                    v.color = { s * c[0] / 255.0f, s * c[1] / 255.0f, s * c[2] / 255.0f, 1.0f };
                     v.tex_coord = { L.uv[i * 2], L.uv[i * 2 + 1] };
                     batch.push_back(v);
                 }
@@ -463,12 +488,35 @@ static void render_preview(int w, int h) {
  * Bringing it in: gmod2glb into assets/gmod/<name>/, then the Model tab
  * ================================================================ */
 
-static std::string bring_rel() { return std::string("gmod/") + g.name + "/" + g.name + ".glb"; }
+static std::string bring_rel() {
+    return std::string(g.cur.map ? "gmod/maps/" : "gmod/") + g.name + "/" + g.name + ".glb";
+}
 
 static void bring_in() {
     if (g.bring_state == 1 || !g.have || g.name[0] == 0) return;
     if (g.bring_worker.joinable()) g.bring_worker.join();
     std::string rel = bring_rel(), glb = ed.project + "assets/" + rel;
+    g.bring_map = g.cur.map;
+    if (g.cur.map) {
+        /* Its world, its props (each once, under assets/gmod/), a scene of them */
+        std::string cmd = q(tool()) + " " + q(g.cur.path) + " --assets " + q(ed.project + "assets") + " --name " + q(g.name) +
+                          " --tex " + std::to_string(TEX_SIZES[g.tex]);
+        if (!g.props) cmd += " --no-props";
+        if (SIMPLIFY[g.simplify] > 0) cmd += " --simplify " + std::to_string(SIMPLIFY[g.simplify]);
+        /* The open scene's Player (the project's character) goes where the map starts one */
+        if (DCSceneObject* p = ed.scene ? dc_scene_find(ed.scene, "Player") : nullptr)
+            if (p->model[0]) cmd += std::string(" --player ") + q(p->model) + " --player-scale " + std::to_string(p->scale.x);
+        g.bring_rel = rel;
+        g.bring_scene = std::string("scenes/") + g.name + ".json";
+        g.bring_state = 1;
+        g.bring_worker = std::thread([cmd] {
+            std::string out, err;
+            bool ok = run(cmd, &out, &err);
+            g.bring_log = out + err;
+            g.bring_state = ok ? 2 : 3;
+        });
+        return;
+    }
     std::string cmd = "mkdir -p " + q(glb.substr(0, glb.find_last_of('/'))) + " && " + q(tool()) + " " + q(g.cur.path) +
                       " -o " + q(glb) + " --tex " + std::to_string(TEX_SIZES[g.tex]);
     if (g.skin) cmd += " --skin " + std::to_string(g.skin);
@@ -504,6 +552,17 @@ static void bring_poll() {
         ed_log("%s", log.c_str());
         return;
     }
+    if (g.bring_map) {
+        ed_log("Garry's Mod: %s", log.c_str());
+        ed_scan_assets();
+        /* Made into .dms, then its scene opened */
+        std::string scene = g.bring_scene;
+        ed_run("assets", [scene](bool ok) {
+            ed_scan_assets();
+            if (ok) ed_switch_scene(scene);
+        });
+        return;
+    }
     ed_log("Garry's Mod: brought in assets/%s", g.bring_rel.c_str());
     ed_scan_assets();
     model_open(g.bring_rel);
@@ -518,7 +577,7 @@ static void build_tree() {
     g.tree = Node();
     for (int i = 0; i < (int)g.entries.size(); i++) {
         const Entry& e = g.entries[i];
-        if ((g.show == 1 && e.workshop) || (g.show == 2 && !e.workshop)) continue;
+        if ((g.show == 1 && e.workshop) || (g.show == 2 && !e.workshop) || e.map != (g.kind == 1)) continue;
         Node* n = &g.tree;
         size_t at = 0;
         for (;;) {
@@ -564,13 +623,22 @@ static void browser() {
     }
     if (g.list_worker.joinable()) g.list_worker.join();
 
+    const char* kinds[] = { "Models", "Maps" };
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5.5f);
+    ImGui::Combo("##kind", &g.kind, kinds, 2);
+    ImGui::SameLine();
     ImGui::SetNextItemWidth(-ImGui::GetFontSize() * 7.5f);
     ImGui::InputTextWithHint("##gf", ICON_SEARCH "  Search", g.filter, sizeof(g.filter));
     ImGui::SameLine();
     ImGui::SetNextItemWidth(-1);
     const char* shows[] = { "Everything", "The game's", "Addons" };
     ImGui::Combo("##show", &g.show, shows, 3);
-    if (g.show != g.show_was) { build_tree(); g.filter_was = "\x01"; g.show_was = g.show; }
+    if (g.show != g.show_was || g.kind != g.kind_was) {
+        build_tree();
+        g.filter_was = "\x01";
+        g.show_was = g.show;
+        g.kind_was = g.kind;
+    }
     if (g.filter_was != g.filter) {
         g.filter_was = g.filter;
         g.matches.clear();
@@ -579,7 +647,7 @@ static void browser() {
         if (!f.empty())
             for (int i = 0; i < (int)g.entries.size(); i++) {
                 const Entry& e = g.entries[i];
-                if ((g.show == 1 && e.workshop) || (g.show == 2 && !e.workshop)) continue;
+                if ((g.show == 1 && e.workshop) || (g.show == 2 && !e.workshop) || e.map != (g.kind == 1)) continue;
                 if (e.path.find(f) != std::string::npos) g.matches.push_back(i);
             }
     }
@@ -589,7 +657,7 @@ static void browser() {
         clip.Begin((int)g.matches.size());
         while (clip.Step())
             for (int k = clip.DisplayStart; k < clip.DisplayEnd; k++) entry_row(g.matches[k], true);
-        if (g.matches.empty()) ImGui::TextDisabled("No model matches");
+        if (g.matches.empty()) ImGui::TextDisabled(g.kind ? "No map matches" : "No model matches");
     } else {
         tree_node(g.tree);
     }
@@ -631,7 +699,33 @@ static void details() {
     ImGui::TextDisabled("%s", L.path.c_str());
     ImGui::TextDisabled("from %s", L.from.c_str());
     if (!L.error.empty()) { ImGui::TextColored(ImColor(ui::ERROR), "%s", L.error.c_str()); }
-    ImGui::Text("%d triangles, %d vertices, %d bones", L.tris, L.verts, L.bones);
+    if (L.map) {
+        ImGui::Text("%d triangles, %d vertices, %zu materials", L.tris, L.verts, L.mats.size());
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 10);
+        if (ImGui::SliderInt("Simplify", &g.simplify, 0, 5, SIMPLIFY_NAMES[g.simplify])) request();
+        ui::tooltip("Joins the pieces the map was cut into where it doesn't show: flat, evenly lit surfaces\n"
+                    "become a few big triangles; shadows and edges keep theirs. The preview shows the result");
+        if (L.unsimplified) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("%d%% of %d", (int)(100.0f * L.tris / L.unsimplified + 0.5f), L.unsimplified);
+        }
+        int placed = 0;
+        for (auto& p : L.props) placed += p.second;
+        if (ui::component(ICON_BOXES, "Props")) {
+            ImGui::Checkbox("Bring the props in too", &g.props);
+            ui::tooltip("Each model once, under assets/gmod/, then placed in the scene where the map has it");
+            ImGui::TextDisabled("%d placed, %zu kinds", placed, L.props.size());
+            ImGui::BeginChild("props", ImVec2(0, ImGui::GetFontSize() * 8), ImGuiChildFlags_Borders);
+            for (auto& p : L.props) {
+                ImGui::Text("%3d  %s", p.second, p.first.c_str());
+                if (ImGui::IsItemClicked()) gmod_open(p.first);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Click to look at it");
+            }
+            ImGui::EndChild();
+        }
+    } else {
+        ImGui::Text("%d triangles, %d vertices, %d bones", L.tris, L.verts, L.bones);
+    }
 
     /* Its looks */
     bool changed = false;
@@ -653,7 +747,7 @@ static void details() {
     }
     if (changed) request();
 
-    if (ui::component(ICON_IMAGE, "Textures")) {
+    if (ui::component(ICON_IMAGE, "Textures", !L.map)) {
         if (ImGui::BeginTable("tex", 3, ImGuiTableFlags_SizingStretchProp)) {
             for (const Mat& m : L.mats) {
                 ImGui::TableNextRow();
@@ -728,6 +822,7 @@ static void details() {
     ImGui::EndDisabled();
     ImGui::SameLine();
     ImGui::TextDisabled("to assets/%s", bring_rel().c_str());
+    if (L.map) ImGui::TextDisabled("and a scene, scenes/%s.json, that it opens", g.name);
 }
 
 void gmod_window(void* sdl_renderer) {
@@ -760,6 +855,7 @@ void gmod_window(void* sdl_renderer) {
 bool gmod_busy() { return g.list_state == 1 || g.state == 1 || g.want || g.bring_state == 1; }
 
 void gmod_open(const std::string& mdl) {
+    g.kind = mdl.size() > 4 && !mdl.compare(mdl.size() - 4, 4, ".bsp");
     select(mdl);
     if (ImGuiWindow* w = ImGui::FindWindowByName(WIN_GMOD)) ImGui::FocusWindow(w);
 }

@@ -5,6 +5,7 @@
 #include <cstring>
 #include <dirent.h>
 #include <lzma.h>
+#include <zlib.h>
 #include <sys/stat.h>
 
 static bool read_file(const std::string& path, std::vector<uint8_t>& out) {
@@ -192,6 +193,36 @@ static bool unlzma(const std::vector<uint8_t>& in, std::vector<uint8_t>& out) {
     return r == LZMA_STREAM_END;
 }
 
+/* A raw LZMA stream with its properties and size, as an LZMA-alone stream */
+static bool unlzma_raw(const uint8_t* props, const uint8_t* d, size_t n, uint64_t size, std::vector<uint8_t>& out) {
+    std::vector<uint8_t> alone(props, props + 5);
+    for (int i = 0; i < 8; i++) alone.push_back((uint8_t)(size >> (8 * i)));
+    alone.insert(alone.end(), d, d + n);
+    return unlzma(alone, out) || out.size() == size;
+}
+
+bool valve_unlzma(const uint8_t* d, size_t n, std::vector<uint8_t>& out) {
+    if (n < 17 || memcmp(d, "LZMA", 4)) return false;
+    uint32_t size, packed;
+    memcpy(&size, d + 4, 4);
+    memcpy(&packed, d + 8, 4);
+    if (17 + (size_t)packed > n) return false;
+    return unlzma_raw(d + 12, d + 17, packed, size, out) && out.size() >= size && (out.resize(size), true);
+}
+
+static bool inflate_raw(const uint8_t* d, size_t n, uint64_t size, std::vector<uint8_t>& out) {
+    out.resize(size);
+    z_stream z{};
+    if (inflateInit2(&z, -15) != Z_OK) return false;
+    z.next_in = (Bytef*)d;
+    z.avail_in = (uInt)n;
+    z.next_out = out.data();
+    z.avail_out = (uInt)size;
+    int r = inflate(&z, Z_FINISH);
+    inflateEnd(&z);
+    return r == Z_STREAM_END;
+}
+
 struct GmaFile { std::string name; uint64_t offset, size; };
 
 /* A .gma's name and files (their offsets into it) */
@@ -326,6 +357,40 @@ bool Vfs::add_gma(const std::string& path, const std::string& label) {
     return true;
 }
 
+bool Vfs::add_zip(std::vector<uint8_t> z, const std::string& label) {
+    auto u16 = [&](size_t o) { return o + 2 <= z.size() ? (uint32_t)(z[o] | z[o + 1] << 8) : 0u; };
+    auto u32 = [&](size_t o) { return o + 4 <= z.size() ? (uint32_t)(u16(o) | u16(o + 2) << 16) : 0u; };
+    /* The end of the central directory, the last thing in it */
+    if (z.size() < 22) return false;
+    size_t end = z.size() - 22;
+    while (end > 0 && u32(end) != 0x06054b50) end--;
+    if (u32(end) != 0x06054b50) return false;
+    int count = (int)u16(end + 10);
+    size_t at = u32(end + 16);
+    sources.push_back({ VfsSource::ZIP, "", label, {} });
+    int src = (int)sources.size() - 1;
+    int skipped = 0;
+    for (int i = 0; i < count && u32(at) == 0x02014b50; i++) {
+        uint32_t method = u16(at + 10), csize = u32(at + 20), size = u32(at + 24);
+        uint32_t nlen = u16(at + 28), xlen = u16(at + 30), clen = u16(at + 32), local = u32(at + 42);
+        std::string name(z.begin() + at + 46, z.begin() + std::min(z.size(), (size_t)(at + 46 + nlen)));
+        at += 46 + nlen + xlen + clen;
+        if (method != 0 && method != 8 && method != 14) { skipped++; continue; }
+        size_t data = local + 30 + u16(local + 26) + u16(local + 28);
+        if (data + csize > z.size()) continue;
+        VfsEntry e{};
+        e.source = src;
+        e.offset = data;
+        e.size = size;
+        e.method = (uint16_t)method;
+        e.csize = csize;
+        files[norm(name)] = e;
+    }
+    if (skipped) fprintf(stderr, "%s: %d files packed in a way not read, left out\n", label.c_str(), skipped);
+    sources[src].blob.swap(z);
+    return true;
+}
+
 const VfsEntry* Vfs::find(const std::string& path) const {
     auto it = files.find(norm(path));
     return it == files.end() ? nullptr : &it->second;
@@ -343,7 +408,16 @@ bool Vfs::read(const std::string& path, std::vector<uint8_t>& out) const {
         std::vector<uint8_t> d;
         if (!read_file(s.path, d) || !unlzma(d, s.blob)) return false;
     }
-    if (s.packed) {
+    if (s.kind == VfsSource::ZIP && e->method) {
+        if (e->offset + e->csize > s.blob.size()) return false;
+        const uint8_t* d = s.blob.data() + e->offset;
+        /* Zip's LZMA: u16 version, u16 properties' size, the properties, the stream */
+        if (e->method == 14)
+            return e->csize > 9 && unlzma_raw(d + 4, d + 9, e->csize - 9, e->size, out) && out.size() >= e->size &&
+                   (out.resize(e->size), true);
+        return inflate_raw(d, e->csize, e->size, out);
+    }
+    if (s.packed || s.kind == VfsSource::ZIP) {
         if (e->offset + e->size > s.blob.size()) return false;
         out.insert(out.end(), s.blob.begin() + e->offset, s.blob.begin() + e->offset + e->size);
         return true;

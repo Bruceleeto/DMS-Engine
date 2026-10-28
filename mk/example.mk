@@ -99,13 +99,14 @@ STRIPPY_FLAGS = $(if $(filter 1,$(BAKE)),-bake,)
 MUSIC_FLAGS = -f PCM16 --long --loop
 
 # GENERATED_GLBS: models a project's own rule creates under assets/.
-GLBS  = $(sort $(wildcard assets/*/*.glb) $(GENERATED_GLBS))
+# Models may be folders down (a brought-in map's props: assets/gmod/props_c17/)
+GLBS  = $(sort $(shell find assets -name '*.glb' 2>/dev/null) $(GENERATED_GLBS))
 PNGS  = $(wildcard assets/*/*.png)
 AUDIO = $(wildcard assets/*/*.wav) $(wildcard assets/*/*.mp3)
 BINS  = $(wildcard assets/*/*.bin)
 # <name>.import.json beside a model holds its import settings (decimate,
 # texture size and format): not a scene
-IMPORTS = $(wildcard assets/*/*.import.json)
+IMPORTS = $(shell find assets -name '*.import.json' 2>/dev/null)
 SCENES = $(filter-out $(IMPORTS),$(wildcard assets/*/*.json))
 
 assets: $(patsubst assets/%.glb,$(PC)/%.dms,$(GLBS)) \

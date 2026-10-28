@@ -21,120 +21,9 @@
 #include <set>
 #include <zlib.h>
 
-static const float INCH = 0.0254f;
-
-/* Source (Z up, X forward) to glTF (Y up, Z forward), as a rotation */
-static void to_gl(const Vec3& s, float* o, float scale) { o[0] = s.y * scale; o[1] = s.z * scale; o[2] = s.x * scale; }
-static void to_gl(const Quat& q, float* o) { o[0] = q.y; o[1] = q.z; o[2] = q.x; o[3] = q.w; }
-static const int PERM[3] = { 1, 2, 0 };    /* gl axis i is Source axis PERM[i] */
-
-/* ================================================================
- * PNG (zlib)
- * ================================================================ */
-
-static void be32(std::vector<uint8_t>& o, uint32_t v) { for (int s = 24; s >= 0; s -= 8) o.push_back((uint8_t)(v >> s)); }
-
-static void chunk(std::vector<uint8_t>& o, const char* type, const std::vector<uint8_t>& data) {
-    be32(o, (uint32_t)data.size());
-    size_t at = o.size();
-    o.insert(o.end(), type, type + 4);
-    o.insert(o.end(), data.begin(), data.end());
-    be32(o, (uint32_t)crc32(0, &o[at], (uInt)(o.size() - at)));
-}
-
-static std::vector<uint8_t> png(const Image& im, bool alpha) {
-    int ch = alpha ? 4 : 3;
-    std::vector<uint8_t> raw;
-    raw.reserve((size_t)im.h * (im.w * ch + 1));
-    for (int y = 0; y < im.h; y++) {
-        raw.push_back(0);
-        for (int x = 0; x < im.w; x++) {
-            const uint8_t* p = &im.rgba[((size_t)y * im.w + x) * 4];
-            raw.insert(raw.end(), p, p + ch);
-        }
-    }
-    uLongf n = compressBound((uLong)raw.size());
-    std::vector<uint8_t> z(n);
-    compress2(z.data(), &n, raw.data(), (uLong)raw.size(), 6);
-    z.resize(n);
-    std::vector<uint8_t> o = { 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' }, ihdr;
-    be32(ihdr, im.w);
-    be32(ihdr, im.h);
-    ihdr.insert(ihdr.end(), { 8, (uint8_t)(alpha ? 6 : 2), 0, 0, 0 });
-    chunk(o, "IHDR", ihdr);
-    chunk(o, "IDAT", z);
-    chunk(o, "IEND", {});
-    return o;
-}
-
-/* ================================================================
- * GLB
- * ================================================================ */
-
-struct Glb {
-    std::vector<uint8_t> bin;
-    std::vector<std::string> views, accessors;
-
-    int view(const void* data, size_t n, int target = 0) {
-        while (bin.size() % 4) bin.push_back(0);
-        size_t at = bin.size();
-        bin.insert(bin.end(), (const uint8_t*)data, (const uint8_t*)data + n);
-        char b[128];
-        snprintf(b, sizeof(b), "{\"buffer\":0,\"byteOffset\":%zu,\"byteLength\":%zu%s}", at, n,
-                 target == 1 ? ",\"target\":34962" : target == 2 ? ",\"target\":34963" : "");
-        views.push_back(b);
-        return (int)views.size() - 1;
-    }
-    /* comp: 5126 float, 5125 uint, 5123 ushort, 5121 ubyte */
-    int accessor(const void* data, size_t count, int comp, const char* type, int target = 0,
-                 const float* mn = nullptr, const float* mx = nullptr, int ncomp = 0) {
-        size_t csize = comp == 5126 || comp == 5125 ? 4 : comp == 5123 ? 2 : 1;
-        int per = !strcmp(type, "SCALAR") ? 1 : !strcmp(type, "VEC2") ? 2 : !strcmp(type, "VEC3") ? 3 : !strcmp(type, "VEC4") ? 4 : 16;
-        int v = view(data, count * per * csize, target);
-        std::string s = "{\"bufferView\":" + std::to_string(v) + ",\"componentType\":" + std::to_string(comp) +
-                        ",\"count\":" + std::to_string(count) + ",\"type\":\"" + type + "\"";
-        if (mn && mx) {
-            s += ",\"min\":[";
-            for (int i = 0; i < ncomp; i++) s += (i ? "," : "") + std::to_string(mn[i]);
-            s += "],\"max\":[";
-            for (int i = 0; i < ncomp; i++) s += (i ? "," : "") + std::to_string(mx[i]);
-            s += "]";
-        }
-        accessors.push_back(s + "}");
-        return (int)accessors.size() - 1;
-    }
-};
-
-static std::string esc(const std::string& s) {
-    std::string o;
-    for (char c : s) { if (c == '"' || c == '\\') o += '\\'; o += c; }
-    return o;
-}
-
-static std::string join(const std::vector<std::string>& v) {
-    std::string o;
-    for (size_t i = 0; i < v.size(); i++) o += (i ? "," : "") + v[i];
-    return o;
-}
-
-static bool write_glb(const std::string& path, const std::string& json_in, std::vector<uint8_t> bin) {
-    std::string json = json_in;
-    while (json.size() % 4) json += ' ';
-    while (bin.size() % 4) bin.push_back(0);
-    FILE* f = fopen(path.c_str(), "wb");
-    if (!f) return false;
-    uint32_t h[3] = { 0x46546C67, 2, (uint32_t)(12 + 8 + json.size() + (bin.empty() ? 0 : 8 + bin.size())) };
-    fwrite(h, 4, 3, f);
-    uint32_t jc[2] = { (uint32_t)json.size(), 0x4E4F534A };
-    fwrite(jc, 4, 2, f);
-    fwrite(json.data(), 1, json.size(), f);
-    if (!bin.empty()) {
-        uint32_t bc[2] = { (uint32_t)bin.size(), 0x004E4942 };
-        fwrite(bc, 4, 2, f);
-        fwrite(bin.data(), 1, bin.size(), f);
-    }
-    return fclose(f) == 0;
-}
+#include "bsp.h"
+#include "glb.h"
+#include <sys/stat.h>
 
 /* ================================================================
  * Animations from the model and what it includes, on its bones by name
@@ -175,6 +64,7 @@ struct Options {
     int tex = 256;
     std::vector<std::string> anims;
     bool anims_only = false;
+    float simplify = 0;     /* a map: bsp_simplify's error, 0 none */
     MdlPick pick;
 };
 
@@ -405,10 +295,14 @@ static bool convert(const Vfs& vfs, const std::string& path, const std::string& 
  *   body <part> <choice>...          mat <name> <vmt> <texture> <w> <h> <flags>
  *   anim <name> <in .mdl>            include <.mdl>
  *
- * The preview file, little-endian: "GMPV" u32 1; u32 materials, each u16 w,
+ * The preview file, little-endian: "GMPV" u32 2; u32 materials, each u16 w,
  * u16 h, u8 flags (1 alphatest, 2 translucent, 4 two-sided, 8 additive),
  * w*h RGBA; u32 vertices, each float pos[3], normal[3], uv[2] (glTF's axes,
- * metres); u32 meshes, each u32 material, u32 indices, the indices
+ * metres), u8 rgba (a map's light; white for a model); u32 meshes, each u32
+ * material, u32 indices, the indices
+ *
+ * A map (.bsp) is the same, with "map" for "model" and a line a prop:
+ *   prop <model> <how many>                      spawn <x> <y> <z>
  * ================================================================ */
 
 static bool info(const Vfs& vfs, const std::string& path, const Options& opt, const std::string& preview) {
@@ -430,7 +324,7 @@ static bool info(const Vfs& vfs, const std::string& path, const Options& opt, co
     std::map<int, int> slot;
     for (const MdlMesh& me : m.meshes)
         if (!slot.count(me.material)) { slot[me.material] = (int)used.size(); used.push_back(me.material); }
-    std::vector<uint8_t> out = { 'G', 'M', 'P', 'V', 1, 0, 0, 0 };
+    std::vector<uint8_t> out = { 'G', 'M', 'P', 'V', 2, 0, 0, 0 };
     auto u32 = [&](uint32_t v) { out.insert(out.end(), (uint8_t*)&v, (uint8_t*)&v + 4); };
     auto f32 = [&](float v) { out.insert(out.end(), (uint8_t*)&v, (uint8_t*)&v + 4); };
     u32((uint32_t)used.size());
@@ -463,6 +357,7 @@ static bool info(const Vfs& vfs, const std::string& path, const Options& opt, co
         for (float x : n) f32(x);
         f32(v.u);
         f32(v.v);
+        u32(0xffffffff);
     }
     u32((uint32_t)m.meshes.size());
     for (const MdlMesh& me : m.meshes) {
@@ -487,6 +382,230 @@ static bool info(const Vfs& vfs, const std::string& path, const Options& opt, co
     return true;
 }
 
+/* ================================================================
+ * Maps
+ * ================================================================ */
+
+static std::string vmt_base(const std::string& vmt) {
+    std::string b = vmt.substr(vmt.find_last_of('/') + 1);
+    return b.size() > 4 && !b.compare(b.size() - 4, 4, ".vmt") ? b.substr(0, b.size() - 4) : b;
+}
+
+static uint8_t mat_flags(const Material& m) {
+    return (m.alphatest ? 1 : 0) | (m.translucent ? 2 : 0) | (m.nocull ? 4 : 0) | (m.additive ? 8 : 0);
+}
+
+static bool map_info(Vfs& vfs, const std::string& path, const Options& opt, const std::string& preview) {
+    Bsp b;
+    std::string why;
+    if (!bsp_load(vfs, path, b, &why)) { fprintf(stderr, "%s: %s\n", path.c_str(), why.c_str()); return false; }
+    size_t unsimplified = opt.simplify > 0 ? bsp_simplify(b, opt.simplify) : 0;
+    const VfsEntry* e = vfs.find(path);
+    size_t verts = 0;
+    for (const BspGroup& g : b.groups) verts += g.pos.size() / 3;
+    printf("map\t%s\t%s\n", b.path.c_str(), e ? vfs.sources[e->source].label.c_str() : "");
+    printf("counts\t0\t%zu\t%zu\t1\n", verts, b.tris());
+    if (unsimplified) printf("simplified\t%zu\n", unsimplified);
+    std::vector<uint8_t> out = { 'G', 'M', 'P', 'V', 2, 0, 0, 0 };
+    auto u32 = [&](uint32_t v) { out.insert(out.end(), (uint8_t*)&v, (uint8_t*)&v + 4); };
+    auto f32 = [&](float v) { out.insert(out.end(), (uint8_t*)&v, (uint8_t*)&v + 4); };
+    u32((uint32_t)b.groups.size());
+    for (const BspGroup& g : b.groups) {
+        Material mat;
+        Image im;
+        std::string err;
+        int fw = 0, fh = 0;
+        bool ok = texture_of(vfs, g.material, opt.tex, mat, im, err, &fw, &fh);
+        printf("mat\t%s\t%s\t%s\t%d\t%d\t%s\n", vmt_base(g.material).c_str(), g.material.c_str(), mat.basetexture.c_str(),
+               fw, fh, ok ? "" : err.c_str());
+        uint16_t w = ok ? (uint16_t)im.w : 0, h = ok ? (uint16_t)im.h : 0;
+        out.insert(out.end(), (uint8_t*)&w, (uint8_t*)&w + 2);
+        out.insert(out.end(), (uint8_t*)&h, (uint8_t*)&h + 2);
+        out.push_back(mat_flags(mat));
+        if (ok) out.insert(out.end(), im.rgba.begin(), im.rgba.end());
+    }
+    u32((uint32_t)verts);
+    for (const BspGroup& g : b.groups)
+        for (size_t i = 0; i < g.pos.size() / 3; i++) {
+            for (int k = 0; k < 3; k++) f32(g.pos[i * 3 + k]);
+            for (int k = 0; k < 3; k++) f32(g.nrm[i * 3 + k]);
+            f32(g.uv[i * 2]);
+            f32(g.uv[i * 2 + 1]);
+            out.insert(out.end(), &g.rgba[i * 4], &g.rgba[i * 4] + 4);
+        }
+    u32((uint32_t)b.groups.size());
+    uint32_t base = 0;
+    for (size_t gi = 0; gi < b.groups.size(); gi++) {
+        const BspGroup& g = b.groups[gi];
+        u32((uint32_t)gi);
+        u32((uint32_t)g.idx.size());
+        for (uint32_t i : g.idx) u32(base + i);
+        base += (uint32_t)(g.pos.size() / 3);
+    }
+    std::map<std::string, int> props;
+    for (const BspProp& p : b.props) props[p.model]++;
+    for (auto& kv : props) printf("prop\t%s\t%d\n", kv.first.c_str(), kv.second);
+    if (b.has_spawn) printf("spawn\t%g\t%g\t%g\n", b.spawn[0], b.spawn[1], b.spawn[2]);
+    printf("skybox\t%d\t%d\n", b.sky_faces, b.sky_props);
+    if (!preview.empty()) {
+        FILE* f = fopen(preview.c_str(), "wb");
+        if (!f || fwrite(out.data(), 1, out.size(), f) != out.size()) { if (f) fclose(f); fprintf(stderr, "cannot write %s\n", preview.c_str()); return false; }
+        fclose(f);
+    }
+    return true;
+}
+
+/* The world: a primitive a material, its light in COLOR_0 */
+static bool write_world(const Vfs& vfs, const Bsp& b, const std::string& out, int tex) {
+    Glb g;
+    std::vector<std::string> materials, textures, images, prims;
+    for (size_t gi = 0; gi < b.groups.size(); gi++) {
+        const BspGroup& gr = b.groups[gi];
+        Material mat;
+        Image im;
+        std::string err;
+        std::string json = "{\"name\":\"" + esc(vmt_base(gr.material)) + "\"";
+        if (texture_of(vfs, gr.material, tex, mat, im, err)) {
+            bool alpha = mat.alphatest || mat.translucent;
+            if (!alpha) for (size_t i = 3; i < im.rgba.size(); i += 4) im.rgba[i] = 255;
+            std::vector<uint8_t> p = png(im, alpha);
+            int v = g.view(p.data(), p.size());
+            images.push_back("{\"bufferView\":" + std::to_string(v) + ",\"mimeType\":\"image/png\",\"name\":\"" +
+                             esc(mat.basetexture.substr(mat.basetexture.find_last_of('/') + 1)) + "\"}");
+            textures.push_back("{\"source\":" + std::to_string(images.size() - 1) + "}");
+            json += ",\"pbrMetallicRoughness\":{\"baseColorTexture\":{\"index\":" + std::to_string(textures.size() - 1) +
+                    "},\"metallicFactor\":0,\"roughnessFactor\":1}";
+            if (mat.translucent || mat.additive) json += ",\"alphaMode\":\"BLEND\"";
+            else if (mat.alphatest) json += ",\"alphaMode\":\"MASK\"";
+        } else if (mat.shader == "water") {
+            json += ",\"pbrMetallicRoughness\":{\"baseColorFactor\":[0.25,0.38,0.45,0.6],\"metallicFactor\":0,\"roughnessFactor\":1}"
+                    ",\"alphaMode\":\"BLEND\"";
+        } else {
+            fprintf(stderr, "  %s: %s\n", gr.material.c_str(), err.c_str());
+            json += ",\"pbrMetallicRoughness\":{\"baseColorFactor\":[0.6,0.6,0.6,1],\"metallicFactor\":0,\"roughnessFactor\":1}";
+        }
+        if (mat.nocull) json += ",\"doubleSided\":true";
+        materials.push_back(json + "}");
+
+        size_t nv = gr.pos.size() / 3;
+        float mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
+        for (size_t i = 0; i < nv; i++)
+            for (int k = 0; k < 3; k++) { mn[k] = std::min(mn[k], gr.pos[i * 3 + k]); mx[k] = std::max(mx[k], gr.pos[i * 3 + k]); }
+        std::vector<float> col(nv * 4);
+        for (size_t i = 0; i < nv * 4; i++) col[i] = gr.rgba[i] / 255.0f;
+        std::string attrs = "\"POSITION\":" + std::to_string(g.accessor(gr.pos.data(), nv, 5126, "VEC3", 1, mn, mx, 3)) +
+                            ",\"NORMAL\":" + std::to_string(g.accessor(gr.nrm.data(), nv, 5126, "VEC3", 1)) +
+                            ",\"TEXCOORD_0\":" + std::to_string(g.accessor(gr.uv.data(), nv, 5126, "VEC2", 1)) +
+                            ",\"COLOR_0\":" + std::to_string(g.accessor(col.data(), nv, 5126, "VEC4", 1));
+        int ai = g.accessor(gr.idx.data(), gr.idx.size(), 5125, "SCALAR", 2);
+        prims.push_back("{\"attributes\":{" + attrs + "},\"indices\":" + std::to_string(ai) + ",\"material\":" +
+                        std::to_string(gi) + "}");
+    }
+    std::string json = "{\"asset\":{\"version\":\"2.0\",\"generator\":\"DMS gmod2glb\"},\"scene\":0,\"scenes\":[{\"nodes\":[0]}]";
+    json += ",\"nodes\":[{\"name\":\"" + esc(b.name) + "\",\"mesh\":0}]";
+    json += ",\"meshes\":[{\"name\":\"" + esc(b.name) + "\",\"primitives\":[" + join(prims) + "]}]";
+    json += ",\"materials\":[" + join(materials) + "]";
+    if (!textures.empty()) json += ",\"textures\":[" + join(textures) + "],\"images\":[" + join(images) + "]";
+    json += ",\"accessors\":[" + join(g.accessors) + "],\"bufferViews\":[" + join(g.views) + "]";
+    json += ",\"buffers\":[{\"byteLength\":" + std::to_string((g.bin.size() + 3) & ~(size_t)3) + "}]}";
+    return write_glb(out, json, g.bin);
+}
+
+static bool exists(const std::string& p) { FILE* f = fopen(p.c_str(), "rb"); if (f) fclose(f); return f != nullptr; }
+
+static void mkdirs(const std::string& dir) {
+    for (size_t at = 1; at <= dir.size(); at++)
+        if (at == dir.size() || dir[at] == '/') mkdir(dir.substr(0, at).c_str(), 0755);
+}
+
+/* A map into a project: its world, each prop it uses (once, shared by every
+ * map), and a scene with them all where the map has them */
+static bool bring_map(Vfs& vfs, const std::string& path, const std::string& assets_in, std::string name, const Options& opt,
+                      bool props,
+                      const std::string& player, float player_scale) {
+    Bsp b;
+    std::string why;
+    if (!bsp_load(vfs, path, b, &why)) { fprintf(stderr, "%s: %s\n", path.c_str(), why.c_str()); return false; }
+    size_t unsimplified = opt.simplify > 0 ? bsp_simplify(b, opt.simplify) : 0;
+    if (name.empty()) name = b.name;
+    std::string assets = assets_in;
+    if (!assets.empty() && assets.back() != '/') assets += '/';
+    std::string world_rel = "gmod/maps/" + name + "/" + name;
+    mkdirs(assets + "gmod/maps/" + name);
+    if (!write_world(vfs, b, assets + world_rel + ".glb", opt.tex)) { fprintf(stderr, "cannot write the world\n"); return false; }
+    printf("%s: %zu triangles, %zu materials -> %s.glb\n", b.path.c_str(), b.tris(), b.groups.size(), world_rel.c_str());
+    if (unsimplified) printf("simplified from %zu triangles\n", unsimplified);
+    if (b.sky_faces || b.sky_props)
+        printf("the 3D skybox left out: %d faces, %d props\n", b.sky_faces, b.sky_props);
+
+    struct Obj { std::string name, model; float pos[3], rot[3]; };
+    std::vector<Obj> objs;
+    std::map<std::string, std::string> done;     /* model and skin -> its .dms under assets */
+    std::map<std::string, int> names;
+    int made = 0, failed = 0;
+    if (props)
+        for (const BspProp& p : b.props) {
+            std::string key = p.model + "#" + std::to_string(p.skin);
+            auto it = done.find(key);
+            if (it == done.end()) {
+                std::string m = p.model;
+                if (!m.compare(0, 7, "models/")) m = m.substr(7);
+                if (m.size() > 4) m.resize(m.size() - 4);
+                std::string rel = "gmod/" + m + (p.skin ? "_skin" + std::to_string(p.skin) : "");
+                std::string glb = assets + rel + ".glb";
+                bool ok = exists(glb);
+                if (!ok) {
+                    mkdirs(glb.substr(0, glb.find_last_of('/')));
+                    Options po = opt;
+                    po.pick = MdlPick();
+                    po.pick.skin = p.skin;
+                    po.anims.clear();
+                    ok = convert(vfs, p.model, glb, po);
+                    if (ok) made++; else failed++;
+                }
+                it = done.emplace(key, ok ? rel + ".dms" : "").first;
+            }
+            if (it->second.empty()) continue;
+            Obj o;
+            std::string base = p.model.substr(p.model.find_last_of('/') + 1);
+            base = base.substr(0, base.size() - 4);
+            o.name = base + "_" + std::to_string(++names[base]);
+            o.model = it->second;
+            memcpy(o.pos, p.pos, sizeof(o.pos));
+            bsp_rot_degrees(p.rot, o.rot);
+            objs.push_back(o);
+        }
+
+    /* The scene: the world (World, which the examples stand on), the props,
+     * the camera where a player starts */
+    mkdirs(assets + "scenes");
+    std::string scene = assets + "scenes/" + name + ".json";
+    FILE* f = fopen(scene.c_str(), "w");
+    if (!f) { fprintf(stderr, "cannot write %s\n", scene.c_str()); return false; }
+    float cam[3] = { b.spawn[0], b.spawn[1] + 1.6f, b.spawn[2] };
+    fprintf(f, "{\n  \"dms_scene\": 1,\n  \"background\": \"#8db4d8\",\n");
+    fprintf(f, "  \"camera\": { \"pos\": [%g, %g, %g], \"yaw\": %g, \"pitch\": 0, \"fov\": 60 },\n", cam[0], cam[1], cam[2],
+            b.spawn_yaw);
+    fprintf(f, "  \"lights\": [],\n  \"objects\": [\n");
+    fprintf(f, "    { \"name\": \"World\", \"model\": \"%s.dms\",\n      \"pos\": [0, 0, 0], \"rot\": [0, 0, 0], \"scale\": [1, 1, 1],\n"
+               "      \"tint\": \"#ffffff\", \"add\": false, \"visible\": true }",
+            esc(world_rel).c_str());
+    /* Player: where the map starts a player (on the ground below it), as the
+     * examples spawn there. The project's character, or a marker */
+    fprintf(f, ",\n    { \"name\": \"Player\", \"model\": \"%s\",\n      \"pos\": [%g, %g, %g], \"rot\": [0, %g, 0], "
+               "\"scale\": [%g, %g, %g],\n      \"tint\": \"#ffffff\", \"add\": false, \"visible\": true }",
+            esc(player).c_str(), b.spawn[0], b.spawn[1], b.spawn[2], b.spawn_yaw, player_scale, player_scale, player_scale);
+    for (const Obj& o : objs)
+        fprintf(f, ",\n    { \"name\": \"%s\", \"model\": \"%s\",\n      \"pos\": [%g, %g, %g], \"rot\": [%g, %g, %g], "
+                   "\"scale\": [1, 1, 1],\n      \"tint\": \"#ffffff\", \"add\": false, \"visible\": true }",
+                esc(o.name).c_str(), esc(o.model).c_str(), o.pos[0], o.pos[1], o.pos[2], o.rot[0], o.rot[1], o.rot[2]);
+    fprintf(f, "\n  ]\n}\n");
+    fclose(f);
+    printf("%zu props placed (%zu kinds, %d converted now, %d failed) -> scenes/%s.json\n", objs.size(), done.size(), made,
+           failed, name.c_str());
+    return true;
+}
+
 static std::vector<std::string> split(const std::string& l) {
     std::vector<std::string> v;
     for (size_t at = 0; at <= l.size();) {
@@ -503,14 +622,18 @@ static void usage(const char* self) {
             "usage: %s [--gmod dir] [--no-workshop] --list [text]\n"
             "       %s [--gmod dir] --anims model.mdl\n"
             "       %s [--gmod dir] model.mdl -o out.glb [--tex 256] [--anims name,prefix*,all] [--anims-only]\n"
-            "       %s [--gmod dir] --info model.mdl [--preview out.bin] [--tex 512]\n"
+            "       %s [--gmod dir] --info model.mdl|maps/x.bsp [--preview out.bin] [--tex 512]\n"
+            "       %s [--gmod dir] maps/x.bsp --assets <project>/assets [--name x] [--tex 128] [--no-props]\n"
+            "           [--simplify 0.02]   (fewer triangles: how far shape (metres) and light (0..1) may move)\n"
+            "           [--player char/model.dms --player-scale 1]   (the scene's Player, at the map's start)\n"
             "  and --skin N, --body a,b,c (a choice per body part) for a model's other looks\n",
-            self, self, self, self);
+            self, self, self, self, self);
 }
 
 int main(int argc, char** argv) {
-    std::string gmod, model, out, list, preview;
-    bool do_list = false, list_anims = false, workshop = true, do_info = false;
+    std::string gmod, model, out, list, preview, assets, name, player;
+    float player_scale = 1.0f;
+    bool do_list = false, list_anims = false, workshop = true, do_info = false, tex_set = false, props = true;
     Options opt;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -518,7 +641,13 @@ int main(int argc, char** argv) {
         else if (a == "--no-workshop") workshop = false;
         else if (a == "--list") { do_list = true; if (i + 1 < argc && argv[i + 1][0] != '-') list = argv[++i]; }
         else if (a == "-o" && i + 1 < argc) out = argv[++i];
-        else if (a == "--tex" && i + 1 < argc) opt.tex = atoi(argv[++i]);
+        else if (a == "--tex" && i + 1 < argc) { opt.tex = atoi(argv[++i]); tex_set = true; }
+        else if (a == "--assets" && i + 1 < argc) assets = argv[++i];
+        else if (a == "--name" && i + 1 < argc) name = argv[++i];
+        else if (a == "--no-props") props = false;
+        else if (a == "--simplify" && i + 1 < argc) opt.simplify = (float)atof(argv[++i]);
+        else if (a == "--player" && i + 1 < argc) player = argv[++i];
+        else if (a == "--player-scale" && i + 1 < argc) player_scale = (float)atof(argv[++i]);
         else if (a == "--anims-only") opt.anims_only = true;
         else if (a == "--info") do_info = true;
         else if (a == "--preview" && i + 1 < argc) preview = argv[++i];
@@ -542,11 +671,20 @@ int main(int argc, char** argv) {
     if (do_list) {
         std::string l = Vfs::norm(list);
         for (auto& kv : vfs.files)
-            if (kv.first.size() > 4 && !kv.first.compare(kv.first.size() - 4, 4, ".mdl") && kv.first.find(l) != std::string::npos)
+            if (kv.first.size() > 4 && (!kv.first.compare(kv.first.size() - 4, 4, ".mdl") ||
+                                        (!kv.first.compare(kv.first.size() - 4, 4, ".bsp") && !kv.first.compare(0, 5, "maps/"))) &&
+                kv.first.find(l) != std::string::npos)
                 printf("%s\t%s\n", kv.first.c_str(), vfs.sources[kv.second.source].label.c_str());
         return 0;
     }
     if (model.empty()) { usage(argv[0]); return 2; }
+    bool is_map = model.size() > 4 && !model.compare(model.size() - 4, 4, ".bsp");
+    if (is_map && !tex_set) opt.tex = 128;     /* a map has a lot of them */
+    if (is_map && do_info) return map_info(vfs, model, opt, preview) ? 0 : 1;
+    if (is_map) {
+        if (assets.empty()) { fprintf(stderr, "a map goes into a project: --assets <project>/assets\n"); return 2; }
+        return bring_map(vfs, model, assets, name, opt, props, player, player_scale) ? 0 : 1;
+    }
     if (do_info) return info(vfs, model, opt, preview) ? 0 : 1;
     if (list_anims && out.empty()) {
         Mdl m;
