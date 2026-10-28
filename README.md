@@ -2,316 +2,79 @@
 
 A 3D engine for the Sega Dreamcast, built on KallistiOS and sh4zam. Models are
 converted from `.glb` to the engine's `.dms` format with the converter in
-`converter/`.
+`tools/converter/`.
 
-## Building an example
+## Layout
 
-Each example is its own folder with a `Makefile`, a `main.c` and an `assets/`
-folder of `.glb` files.
+| Folder | What it is |
+|---|---|
+| `dms/` | The engine. Projects include it as `#include "dms/dc_engine.h"` |
+| `examples/` | One small demo per folder: `main.c`, `assets/`, a 1–3 line `Makefile` |
+| `games/` | Full games (multi-file `src/`) built the same way |
+| `host/` | Linux/SDL3 desktop preview of the engine |
+| `tools/converter/` | `strippy` (`.glb` → `.dms`) and the `dcaconv` audio submodule |
+| `mk/example.mk` | The shared build rules every project Makefile includes |
+| `build/` | All build output, one folder per project (git-ignored) |
+
+## Building
+
+Load the KOS environment (`source /opt/toolchains/dc/kos/environ.sh`), then from
+the repo root:
 
 | Command | What it does |
 |---|---|
-| `make assets` | Converts `assets/*/*.glb` into `pc/` |
-| `make` | Builds `test.elf`. Assets are read over dcload from `/pc/` (run `dc-tool` with `-c pc`) |
-| `make disc` | Builds `test.elf` reading from `/cd/`, and a `.cdi` named after the folder with `pc/` as the disc root (needs `mkdcdisc`) |
+| `make teapot` | Converts `examples/teapot/assets/` into `examples/teapot/pc/` and builds `build/teapot/teapot.elf` |
+| `make teapot/run` | Sends the ELF with `dc-tool`, serving `pc/` as `/pc/` |
+| `make teapot/disc` | Builds `build/teapot/teapot.cdi`, reading from `/cd/` with `pc/` as the disc root (needs `mkdcdisc`) |
+| `make teapot/assets` | Converts assets only |
+| `make teapot/clean`, `make teapot/assets-clean` | Removes `build/teapot/` or `pc/` |
+| `make all` / `make list` | Builds or lists every project |
+| `make host EXAMPLE=teapot` | Runs the Linux desktop preview (needs SDL3) |
+
+The same targets work inside a project folder: `cd examples/teapot && make run`.
+
+### Adding a project
+
+Make `examples/<name>/` with a `main.c` and `assets/<dir>/*.glb`, and a Makefile:
+
+```make
+BAKE = 1                    # optional: bake vertex lighting (AO, shadows)
+ENGINE_EXTRA = dc_audio     # optional: dc_audio, dc_particles, dc_corona
+include ../../mk/example.mk
+```
+
+Asset conversion is automatic: `.glb` → `.dms`, `.png` → `.dt`, `.wav`/`.mp3` →
+`.dca` (files in `assets/music/` are converted for streaming) and `.bin` is copied.
+Multi-file projects set `SRCS` (see `games/botboy/Makefile`).
 
 ## Examples
 
-### picophysics
-
-![picophysics](picophysics/resources/example.png)
-
-Rigid body physics.
-(`dms/picophysics.h`). Bodies collide with the level through the engine's
-collision grid. A crate and a ball drop at the start, and a wrecking ball
-swings on a chain of 14 jointed links.
-
-| Button | Action |
+| Project | |
 |---|---|
-| A | Throw a ball |
-| X | Throw a crate |
-| Y | Reset |
-| Start | Exit |
-
-Credits:
-- Level: [GameCube - Mario Kart Double Dash - Block City](https://sketchfab.com/3d-models/gamecube-mario-kart-double-dash-block-city-9d8002b53a884d0290759f05694a49c3)
-  by [jkimmel694](https://sketchfab.com/jkimmel694)
-- Ball, crate, chain: to add
-
-### bowling
-
-![bowling](bowling/resources/example.png)
-
-Ten-pin bowling with picophysics. Two lanes of ten pins, and balls rolled from
-the camera.
-
-| Button | Action |
-|---|---|
-| A | Roll a ball |
-| Y | Reset the pins |
-| Start | Exit |
-
-Credits: to add
-
-### race_track
-
-![race_track](race_track/resources/example.png)
-
-A large racing track with a car, third-person camera and collision. The
-track is close to a worst case for per-mesh overhead: many materials spread
-over many small meshes.
-
-Credits:
-- Track: [nurburgring (race driver grid ds)](https://sketchfab.com/3d-models/nurburgring-race-driver-grid-ds-fc6393b88aa64fc98e63ee65846d3fc3)
-  by [amogusstrikesback2](https://sketchfab.com/amogusstrikesback2)
-- Car: to add
-
-### 1st_person
-
-![1st_person](1st_person/resources/example.png)
-
-First-person walk through a level with collision. Stresses the near-plane
-clipper, since walls and floors are always crossing the camera.
-
-### e1m1
-
-![e1m1](e1m1/resources/example.png)
-
-Free camera through Quake's first level, The Slipgate Complex. An indoor
-level with baked vertex lighting.
-
-Credits:
-- Level: [Quake E1M1 - The slipgate complex](https://sketchfab.com/3d-models/quake-e1m1-the-slipgate-complex-73b496882bce49bb975300ab38295a0b)
-  by [barney86](https://sketchfab.com/barney86)
-
-### animation
-
-![animation](animation/resources/example.png)
-
-A skinned, animated character (stand, walk, attack on X) in a level, with a
-third-person camera and collision.
-
-Credits:
-- Character: [D.Va Base Default - HotS](https://sketchfab.com/3d-models/dva-base-default-hots-ead4a55a18e145338196e10ce4193820)
-  by [Catholomew](https://sketchfab.com/Catholomew)
-
-### sonic_streets
-
-![sonic_streets](sonic_streets/resources/example.png)
-
-Free camera over City Escape from Sonic Adventure 2. A general draw and
-culling stress test.
-
-Credits:
-- Level: [City Escape - Sonic Adventure 2](https://models.spriters-resource.com/dreamcast/sonicadventure2/asset/297940/)
-  ripped by dshaynie, The Models Resource
-
-### highpoly
-
-![highpoly](highpoly/resources/example.png)
-
-Free camera over a high-poly model (about 40,000 triangles on screen), to find
-the polygon rate limit: about 2.3 million polygons a second. 
-
-
-Credits:
-- Model: [[Free] Ugandan Tails](https://sketchfab.com/3d-models/free-ugandan-tails-cd6dca09d7ed4838b6c0d71c5adc448c)
-  by [LuAnton](https://sketchfab.com/LuAnton)
-
-### projector
-
-![projector](projector/resources/example.png)
-
-First-person walk through a room with a TV that shows the room live, from a
-camera turning on the projector (render to texture). The TV's screen is a
-plain rectangle with a material named `RTT_effect`; one call puts the picture
-on it.
-
-Credits:
-- Room, TV, projector, table: to add
-
-### dragonfly
-
-![dragonfly](dragonfly/resources/example.png)
-
-The dragonfly from Sega's Katana SDK demo, with motion blur. Its 18 parts move
-on their own (no skin). Every frame it is also drawn into a texture over a
-faded copy of last frame's texture, and that is added over the screen, so
-what moves leaves a trail. Shots are a flat glow drawn additive
-(`dc_draw_ex` with `.add`); the trail draws them out into beams.
-
-| Button | Action |
-|---|---|
-| Stick | Turn the camera around the dragonfly |
-| L / R | Zoom |
-| X | Fire |
-| Start | Exit |
-
-Credits:
-- Model and textures: DragonFly demo, Sega Katana SDK (PowerVR / VideoLogic)
-
-### shady
-
-![shady](shady/resources/example.png)
-
-A wooden knot turning over a marble floor, with a flat shadow thrown away from
-a light you can move. After Shady from Sega's Katana SDK. The shadow is one
-field on the draw (`.shadow`), for any model, moving or not.
-
-| Button | Action |
-|---|---|
-| Stick | Turn the camera around the knot |
-| L / R | Zoom |
-| D-pad | Move the light |
-| Start | Exit |
-
-Credits: to add
-
-### particles
-
-![particles](particles/resources/example.png)
-
-A fountain of fire over a marble floor: 600 particles thrown up from a spot,
-pulled back down and bouncing when they land, grey-pink as they are born, red
-at their height, out as they die. After Particles from the PowerVR SDK. The
-whole thing is one `dc_particles_create` and one `dc_particles_draw` a frame.
-
-Still a work in progress.. Needs speeding up. 
-
-| Button | Action |
-|---|---|
-| Stick | Turn the camera around the fountain |
-| L / R | Zoom |
-| A | Throw a burst of 200 |
-| Start | Exit |
-
-Credits:
-
-### vase
-
-![vase](vase/resources/example.png)
-
-The first DMS demo, redone on the engine. After Vase from the PowerVR SDK: a
-chrome and glass vase turning over a tiled floor, with the silver drawn as a
-mirror and the glass carrying Katana's reflection passes. Reflections are asked
-for with Metallic in Blender and switched on with one call,
-`dc_set_environment()`.
-
-| Button | Action |
-|---|---|
-| D-pad | Move the vase |
-| A / B | Turn it left and right |
-| X / Y | Tip it up and down |
-| Start | Exit |
-
-Credits:
-- Model, background and reflection image: Vase demo, PowerVR SDK / Sega Katana SDK
-
-### scanner
-
-![scanner](scanner/resources/example.png)
-
-A dinosaur under an x-ray scanner: where the scanner window crosses its skin,
-the skin goes see-through and the skeleton underneath shows. After Scanner from
-Sega's Katana SDK. The window is a modifier volume, and the whole set —
-dinosaur, bones, scanner, stand and the animation — is one `.glb`.
-
-| Button | Action |
-|---|---|
-| Stick | Turn the camera around the dinosaur |
-| L / R | Zoom |
-| A | Pause the animation |
-| B | Hide the scanner ring |
-| Y | Turn the window off |
-| Start | Exit |
-
-Credits:
-- Model and textures: Scanner demo, Sega Katana SDK (PowerVR / VideoLogic)
-
-### fire
-
-![fire](fire/resources/example.png)
-
-Four gas flames on a burner lighting a head and torso, after Fire from Sega's
-Katana SDK. Turning the gas up makes the flames stand taller and the light on
-the face brighter: one number does both, so they cannot drift apart. The flames
-are not in the model and never were — the `.glb` holds eight points in a mesh
-that is never drawn, four at the bottom of the flames and four at the top, and
-`dc_model_points()` reads them out so the particles land where the artist put
-them.
-
-| Button | Action |
-|---|---|
-| D-pad up / down | Turn the gas up and down |
-| Stick | Turn the camera |
-| L / R | Zoom |
-| X | Swap the light in the burner for the original's moving sun |
-| B | Light off |
-| Y | Flames off |
-| Start | Exit |
-
-Credits:
-- Model and textures: Fire demo, Sega Katana SDK (`Kamui2/k2Gasfl`)
-
-### bloom
-
-![bloom](bloom/resources/example.png)
-
-Credits:
-- Level: [Mine Dungeon - Game Level](https://sketchfab.com/3d-models/mine-dungeon-game-level-7f40ddc776454ebb820be19110ed0403)
-  by [Karthik Naidu](https://sketchfab.com/Karthiknaidu97)
-
-### cel
-
-![cel](cel/resources/example.png)
-
-Credits:
-- Model: [Michaelangelo](https://sketchfab.com/3d-models/michaelangelo-c59ff51a24dd41c1837da37ab9106d10)
-  by [saidovspiderman](https://sketchfab.com/saidovspiderman)
-
-### arcade
-
-![arcade](arcade/resources/example.png)
-
-An arcade cabinet with a game playing on its screen. The screen is a flipbook
-of 64 frames shown 12 times a second, with the video's sound looping along.
-
-### fresnel
-
-![fresnel](fresnel/resources/example.png)
-
-A rounded block drawn as a mirror of a small environment image, turning so the
-reflection slides over it.
-
-### teapot
-
-![teapot](teapot/resources/example.png)
-
-A chrome teapot over a blurred photo, with bloom: the bright parts of its
-reflection flare.
-
-### stained
-
-![stained](stained/resources/example.png)
-
-A lamp behind a wall shines through a stained glass window onto the floor,
-after Katana's stained glass sample. Each frame every floor vertex takes the
-glass's colour, shadow or light, depending on what lies between it and the lamp.
-
-### police
-
-![police](police/resources/example.png)
-
-A police car under a sun, with a paint highlight, a flashing siren, headlights
-and their beams on the road.
-
-### botboy
-
-![botboy](botboy/resources/example.png)
-
-BotBoy!64 from the N64brew Game Jam 2025, being rewritten on DMS as a test of
-the engine on a whole game: the menu room, the levels and two player split
-screen.
+| [rail_shooter](examples/rail_shooter/README.md) | On-rails shooter prototype inspired by `test.jpg`: a textured jet flies through an endless generated city. |
+| [picophysics](examples/picophysics/README.md) | Rigid body physics with `dms/picophysics.h`. |
+| [bowling](examples/bowling/README.md) | Ten-pin bowling with picophysics. |
+| [race_track](examples/race_track/README.md) | A large racing track with a car, third-person camera and collision. |
+| [1st_person](examples/1st_person/README.md) | First-person walk through a level with collision. |
+| [e1m1](examples/e1m1/README.md) | Free camera through Quake's first level, The Slipgate Complex. |
+| [animation](examples/animation/README.md) | A skinned, animated character (stand, walk, attack on X) in a level, with a third-person camera and collision. |
+| [sonic_streets](examples/sonic_streets/README.md) | Free camera over City Escape from Sonic Adventure 2. |
+| [highpoly](examples/highpoly/README.md) | Free camera over a high-poly model (about 40,000 triangles on screen), to find the polygon rate limit: about 2.3 million polygons a second. |
+| [projector](examples/projector/README.md) | First-person walk through a room with a TV that shows the room live, from a camera turning on the projector (render to texture). |
+| [dragonfly](examples/dragonfly/README.md) | The dragonfly from Sega's Katana SDK demo, with motion blur. |
+| [shady](examples/shady/README.md) | A wooden knot turning over a marble floor, with a flat shadow thrown away from a light you can move. |
+| [particles](examples/particles/README.md) | A fountain of fire over a marble floor: 600 particles thrown up from a spot, pulled back down and bouncing when they land, grey-pink as they are born, red at their height, out as they die. |
+| [vase](examples/vase/README.md) | The first DMS demo, redone on the engine. |
+| [scanner](examples/scanner/README.md) | A dinosaur under an x-ray scanner: where the scanner window crosses its skin, the skin goes see-through and the skeleton underneath shows. |
+| [fire](examples/fire/README.md) | Four gas flames on a burner lighting a head and torso, after Fire from Sega's Katana SDK. |
+| [bloom](examples/bloom/README.md) | Bloom post-processing in a mine dungeon level. |
+| [cel](examples/cel/README.md) | Cel shading. |
+| [arcade](examples/arcade/README.md) | An arcade cabinet with a game playing on its screen. |
+| [fresnel](examples/fresnel/README.md) | A rounded block drawn as a mirror of a small environment image, turning so the reflection slides over it. |
+| [teapot](examples/teapot/README.md) | A chrome teapot over a blurred photo, with bloom: the bright parts of its reflection flare. |
+| [stained](examples/stained/README.md) | A lamp behind a wall shines through a stained glass window onto the floor, after Katana's stained glass sample. |
+| [police](examples/police/README.md) | A police car under a sun, with a paint highlight, a flashing siren, headlights and their beams on the road. |
+| [botboy](games/botboy/README.md) | BotBoy!64 from the N64brew Game Jam 2025, being rewritten on DMS as a test of the engine on a whole game: the menu room, the levels and two player split screen. |
 
 ## Blender settings
 

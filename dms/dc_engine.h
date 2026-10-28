@@ -141,18 +141,29 @@ static inline void dc_cxt_clip(pvr_poly_cxt_t* cxt) {
     cxt->gen.clip_mode = dc_clip_cmd ? PVR_USERCLIP_INSIDE : PVR_USERCLIP_DISABLE;
 }
 
+/* A PVR store-queue copy also submits the line. The portable maths
+ * implementation only copies memory, so the host shim needs an explicit flush. */
+static inline void dc_sq_copy32(void* dst, const void* src) {
+#ifdef DMS_HOST
+    __builtin_memcpy(dst, src, 32);
+    sq_flush(dst);
+#else
+    shz_sq_memcpy32_1_xmtrx(dst, src);
+#endif
+}
+
 /* Engine use: send a header compiled ahead of time (in RAM, with no clip
  * bit) to the TA, adding the clip bit when the scene clips. Goes through
  * XMTRX, like the copy it replaces; load the matrix after. */
 static inline void dc_send_hdr(pvr_dr_state_t* dr, const pvr_poly_hdr_t* hdr) {
     (void)dr;
     if (!dc_clip_cmd) {
-        shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), hdr);
+        dc_sq_copy32(pvr_dr_target(*dr), hdr);
         return;
     }
     alignas(32) pvr_poly_hdr_t h = *hdr;
     h.cmd |= dc_clip_cmd;
-    shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &h);
+    dc_sq_copy32(pvr_dr_target(*dr), &h);
 }
 
 /* Engine use (the draw queue): draw a scene into a texture (RGB565, not

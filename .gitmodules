@@ -1,3 +1,3 @@
 [submodule "converter/dcaconv"]
-	path = converter/dcaconv
+	path = tools/converter/dcaconv
 	url = https://github.com/TapamN/dcaconv.git

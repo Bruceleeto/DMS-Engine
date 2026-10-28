@@ -43,13 +43,27 @@ typedef uint32_t __attribute__((may_alias)) uint32_alias;
  * pref that sends them takes the last one's. */
 static inline uint32_t sq_next(uint32_t sq) { return sq ^ 32; }
 static inline __attribute__((always_inline)) void sq_f(uint32_t* p, float f) {
+#ifdef DMS_HOST
+    *p -= 4;
+    memcpy((void*)*p, &f, 4);
+#else
     __asm__("fmov %1,@-%0" : "+r"(*p) : "f"(f));
+#endif
 }
 static inline __attribute__((always_inline)) void sq_w(uint32_t* p, uint32_t w) {
+#ifdef DMS_HOST
+    *p -= 4;
+    memcpy((void*)*p, &w, 4);
+#else
     __asm__("mov.l %1,@-%0" : "+r"(*p) : "r"(w));
+#endif
 }
 static inline __attribute__((always_inline)) void sq_send(uint32_t sq) {
+#ifdef DMS_HOST
+    sq_flush((void*)sq);
+#else
     __asm__ volatile("pref @%0" : : "r"(sq));
+#endif
 }
 static inline __attribute__((always_inline))
 void sq_put(uint32_t sq, uint32_t flags, float x, float y, float z, float a, float b,
@@ -1064,7 +1078,7 @@ static bool render_packed_lights(pvr_dr_state_t* dr, const DMSMesh* mesh,
         h[0] = (h[0] | dc_clip_cmd) & ~(PVR_TA_CMD_CLRFMT_MASK | PVR_TA_CMD_SPECULAR_MASK);
         h[0] |= PVR_CLRFMT_ARGBPACKED << PVR_TA_CMD_CLRFMT_SHIFT;
         if (power) h[0] |= PVR_TA_CMD_SPECULAR_MASK;
-        shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), h);
+        dc_sq_copy32(pvr_dr_target(*dr), h);
     }
 
     alignas(8) shz_vec4_t row[4];
@@ -1173,11 +1187,11 @@ static void send_intensity_header(pvr_dr_state_t* dr, const DMSMesh* mesh, bool 
         col[4] = 1.0f;
         col[5] = sr * lr * s; col[6] = sg * lg * s; col[7] = sb * lb * s;
         for (int i = 1; i < 8; i++) if (col[i] > 1.0f) col[i] = 1.0f;
-        shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &h[0]);
-        shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &h[8]);
+        dc_sq_copy32(pvr_dr_target(*dr), &h[0]);
+        dc_sq_copy32(pvr_dr_target(*dr), &h[8]);
     } else {
         for (int i = 1; i < 4; i++) if (col[i] > 1.0f) col[i] = 1.0f;
-        shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &h[0]);
+        dc_sq_copy32(pvr_dr_target(*dr), &h[0]);
     }
 }
 
@@ -1944,7 +1958,7 @@ static inline void send_header(pvr_dr_state_t* dr, const DMSMesh* mesh) {
     h.mode2 &= ~(PVR_TA_PM2_SRCBLEND_MASK | PVR_TA_PM2_DSTBLEND_MASK);
     h.mode2 |= (PVR_BLEND_SRCALPHA << PVR_TA_PM2_SRCBLEND_SHIFT) |
                (PVR_BLEND_ONE << PVR_TA_PM2_DSTBLEND_SHIFT);
-    shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &h);
+    dc_sq_copy32(pvr_dr_target(*dr), &h);
 }
 
 /* Skinned mesh: cull the whole animated bound, then skin + submit.
@@ -4103,7 +4117,7 @@ void dc_model_draw_modified(DMSModel* model, shz_vec3_t pos, float scale, float 
     }
 
     g_stats.meshes_drawn++;
-    shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), (pvr_poly_hdr_t*)model->mod_headers);
+    dc_sq_copy32(pvr_dr_target(*dr), (pvr_poly_hdr_t*)model->mod_headers);
 
     const DMSVertex* src = mesh_verts(mesh);
     int last_bone = -1;
@@ -4266,7 +4280,7 @@ void dc_model_draw_volume(DMSModel* model, shz_vec3_t pos, float scale, float ya
     if (tris > 1) {
         pvr_mod_compile(&hdr, VOL_MOD_LIST, PVR_MODIFIER_OTHER_POLY,
                         PVR_CULLING_NONE);
-        shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &hdr);
+        dc_sq_copy32(pvr_dr_target(*dr), &hdr);
     }
 
     uint32_t sent = 0;
@@ -4277,7 +4291,7 @@ void dc_model_draw_volume(DMSModel* model, shz_vec3_t pos, float scale, float ya
         if (sent == tris - 1) {
             pvr_mod_compile(&hdr, VOL_MOD_LIST, PVR_MODIFIER_INCLUDE_LAST_POLY,
                             PVR_CULLING_NONE);
-            shz_sq_memcpy32_1_xmtrx(pvr_dr_target(*dr), &hdr);
+            dc_sq_copy32(pvr_dr_target(*dr), &hdr);
         }
 
         const ClipVertex* a = &g_clip_buffer[i - 2];
