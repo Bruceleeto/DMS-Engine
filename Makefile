@@ -11,12 +11,15 @@ PROJECTS := $(patsubst %/Makefile,%,$(wildcard examples/*/Makefile games/*/Makef
 NAMES    := $(notdir $(PROJECTS))
 dir_of    = $(filter %/$(1),$(PROJECTS))
 
-.PHONY: all list clean converter editor $(NAMES)
+.PHONY: all list clean converter editor engine $(NAMES)
 all: $(NAMES)
 list:
 	@echo $(NAMES)
-$(NAMES):
+# The engine first, once, so projects built side by side don't race to build it
+$(NAMES): engine
 	$(MAKE) -C $(call dir_of,$@)
+engine:
+	$(MAKE) -f mk/engine.mk
 TARGETS  := run disc flycast assets clean assets-clean dist host host-run shot check edit scene-shot
 $(foreach n,$(NAMES),$(foreach t,$(TARGETS),$(eval $(n)/$(t): ; $$(MAKE) -C $(call dir_of,$(n)) $(t))))
 

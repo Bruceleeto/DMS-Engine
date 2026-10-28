@@ -25,9 +25,6 @@
 # make scene-shot  that scene drawn by the engine -> build/<name>/scene.png
 
 # Only the Dreamcast build needs KOS; the Linux build and .glb conversion don't.
-# Not KOS_CC: environ.sh exports that, and kos-cc runs it, so it must stay sh-elf-gcc.
-DC_CC = $(if $(KOS_BASE),kos-cc,$(error KOS_BASE is not set: source the KallistiOS environ.sh first))
-
 DMS_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))..)
 NAME ?= $(notdir $(CURDIR))
 SRCS ?= main.c
@@ -41,22 +38,18 @@ OUT := $(DMS_ROOT)/build/$(NAME)
 ELF := $(OUT)/$(NAME).elf
 CDI := $(OUT)/$(NAME).cdi
 
-CFLAGS += -std=gnu2x -O3 -I$(DMS_ROOT) -I$(CURDIR) \
-          -fomit-frame-pointer -flto -fbuiltin -ffast-math -ffp-contract=fast -mfsrra -mfsca \
-          -fmerge-all-constants -funroll-loops -fno-PIC -fipa-pta \
-          -ftree-vectorize -I$(KOS_BASE)/utils -MMD -MP $(DEFINES)
 LIBS = -lsh4zam -lkosutils -lm -Wl,--gc-sections
-
-# Each project builds its own engine objects, so per-project flags never clash.
-ENGINE_OBJS = $(addprefix $(OUT)/dms/,$(addsuffix .o,$(ENGINE)))
-OBJS        = $(addprefix $(OUT)/dc/,$(SRCS:.c=.o))
 
 .PHONY: all assets assets-clean clean run disc flycast dist host host-run shot check
 all: assets $(ELF)
 
-$(OUT)/dms/%.o: $(DMS_ROOT)/dms/%.c
-	@mkdir -p $(@D)
-	$(DC_CC) $(CFLAGS) -c $< -o $@
+# The engine is built once for every project (build/dms/); the project's own
+# sources get its DEFINES and its folder on the include path
+include $(DMS_ROOT)/mk/engine.mk
+CFLAGS += $(DC_CFLAGS) -I$(CURDIR) $(DEFINES)
+ENGINE_OBJS = $(addprefix $(ENGINE_DIR)/,$(addsuffix .o,$(ENGINE)))
+OBJS        = $(addprefix $(OUT)/dc/,$(SRCS:.c=.o))
+
 $(OUT)/dc/%.o: %.c
 	@mkdir -p $(@D)
 	$(DC_CC) $(CFLAGS) -c $< -o $@
@@ -155,7 +148,7 @@ $(PC)/%.json: assets/%.json
 	@mkdir -p $(@D)
 	cp $< $@
 
--include $(OBJS:.o=.d) $(ENGINE_OBJS:.o=.d)
+-include $(OBJS:.o=.d)
 
 # The scene editor on this project (tools/editor), and its scene drawn by the
 # engine to a PNG without a window: make scene-shot SCENE=scenes/main.json
