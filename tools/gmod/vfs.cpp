@@ -95,6 +95,25 @@ bool Vfs::mount_gmod(const std::string& g, bool with_workshop) {
     return true;
 }
 
+int Vfs::mount_games(const std::string& common) {
+    /* Each game's folder, its label (the first word is which game, for lists) */
+    static const char* const GAMES[][2] = {
+        { "Half-Life 2/hl2", "hl2" },           { "Half-Life 2/episodic", "hl2/episodic" },
+        { "Half-Life 2/ep2", "hl2/ep2" },        { "Half-Life 2/lostcoast", "hl2/lostcoast" },
+        { "Counter-Strike Source/cstrike", "cstrike" }, { "Team Fortress 2/tf", "tf" },
+    };
+    int n = 0;
+    for (auto& g : GAMES) {
+        std::string dir = common + "/" + g[0];
+        if (!is_dir(dir)) continue;
+        add_dir(dir, g[1]);
+        for (const std::string& f : list_dir(dir))
+            if (ends_with(f, "_dir.vpk")) add_vpk(dir + "/" + f, std::string(g[1]) + "/" + f.substr(0, f.size() - 8));
+        n++;
+    }
+    return n;
+}
+
 static void walk(Vfs& v, int src, const std::string& root, const std::string& rel) {
     for (const std::string& f : list_dir(root + "/" + rel)) {
         std::string r = rel.empty() ? f : rel + "/" + f;

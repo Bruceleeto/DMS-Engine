@@ -63,7 +63,7 @@
 #define WIN_CONSOLE   ICON_CONSOLE "  Console###Console"
 #define WIN_VRAM      ICON_IMAGE "  VRAM###VRAM"
 #define WIN_MODEL     ICON_MODEL "  Model###Model"
-#define WIN_GMOD      ICON_BOXES "  Garry's Mod###GarrysMod"
+#define WIN_GMOD      ICON_BOXES "  Source###GarrysMod"
 
 namespace ui {
 

@@ -39,6 +39,10 @@ public:
     /* Everything the game mounts, from the GarrysMod folder; workshop addons
      * too when with_workshop */
     bool mount_gmod(const std::string& gmod, bool with_workshop = true);
+    /* The other Source games installed beside it (Steam's common/): Half-Life 2
+     * and its episodes, Counter-Strike: Source, Team Fortress 2. Under what
+     * is already mounted; how many */
+    int mount_games(const std::string& steam_common);
 
     bool add_dir(const std::string& dir, const std::string& label);
     bool add_vpk(const std::string& dir_vpk, const std::string& label);

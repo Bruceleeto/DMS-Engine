@@ -400,7 +400,8 @@ static bool is_code(const std::string& dir) { return dir.compare(0, 5, CODE_ROOT
 /* The Library, the .glb of the other projects, a third: "lib:", "lib:/examples/vase"... */
 #define LIB_ROOT "lib:"
 static bool is_lib(const std::string& dir) { return dir.compare(0, 4, LIB_ROOT) == 0; }
-struct Entry { std::string name, rel; EntryKind kind; };
+/* In a namespace of its own: gmod.cpp has an Entry too */
+namespace { struct Entry { std::string name, rel; EntryKind kind; }; }
 static std::map<std::string, std::vector<Entry>> folders;   /* "" is the top */
 static int indexed_gen = -1;
 static std::string cwd;

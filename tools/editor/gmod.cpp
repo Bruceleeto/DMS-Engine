@@ -1,5 +1,7 @@
-/* The Garry's Mod tab: the game's models (and the HL2 / CS:S content it
- * mounts, and workshop addons) as the game has them, untouched, and the
+/* The Garry's Mod tab: the models and maps of Garry's Mod (its addons and
+ * workshop too) and of the other Source games installed beside it (Half-Life 2
+ * and its episodes, Counter-Strike: Source, Team Fortress 2), as the games
+ * have them, untouched, and the
  * choices for bringing one into the project: its skin, its body parts, its
  * animations, how big its textures may be. Nothing is converted until asked:
  * Bring in writes a .glb under assets/gmod/, which the Model tab then sets
@@ -9,6 +11,7 @@
 #include "imgui.h"
 #include "imgui_internal.h"
 #include <SDL3/SDL.h>
+#include <SDL3/SDL_opengl.h>
 #include <sys/stat.h>
 #include <algorithm>
 #include <atomic>
@@ -62,14 +65,32 @@ static std::vector<std::string> fields(const std::string& line) {
 
 static std::string base_name(const std::string& p) {
     std::string b = p.substr(p.find_last_of('/') + 1);
-    return b.size() > 4 && !b.compare(b.size() - 4, 4, ".mdl") ? b.substr(0, b.size() - 4) : b;
+    bool ext = b.size() > 4 && (!b.compare(b.size() - 4, 4, ".mdl") || !b.compare(b.size() - 4, 4, ".bsp"));
+    return ext ? b.substr(0, b.size() - 4) : b;
 }
 
 /* ================================================================
  * What gmod2glb says
  * ================================================================ */
 
-struct Entry { std::string path, from; bool workshop, map; };
+/* This file's own types, out of the other files' way (panels.cpp has an
+ * Entry: two of one name share their inline code, whichever is the size) */
+namespace {
+
+/* Which game a file is from, by where it was found */
+enum Game { ALL, GMOD, HL2, CSS, TF2, ADDONS, GAMES };
+static const char* const GAME_NAMES[GAMES] = { "Every game", "Garry's Mod", "Half-Life 2", "Counter-Strike: Source",
+                                               "Team Fortress 2", "Addons" };
+static Game game_of(const std::string& from) {
+    auto starts = [&](const char* p) { return !from.compare(0, strlen(p), p); };
+    if (starts("workshop/") || starts("addons/")) return ADDONS;
+    if (starts("hl2") || starts("content_hl2")) return HL2;
+    if (starts("cstrike") || starts("content_cstrike")) return CSS;
+    if (starts("tf/") || from == "tf") return TF2;
+    return GMOD;
+}
+
+struct Entry { std::string path, from; Game game; bool map; };
 struct Node { std::map<std::string, Node> dirs; std::vector<int> files; };
 
 enum { ALPHATEST = 1, TRANSLUCENT = 2, TWO_SIDED = 4, ADDITIVE = 8 };
@@ -80,10 +101,15 @@ struct Mat {
     int pw = 0, ph = 0;                     /* in the preview */
     uint8_t flags = 0;
     std::vector<uint8_t> rgba;              /* the preview's, until it is a texture */
-    SDL_Texture* tex = nullptr;
+    SDL_Texture* tex = nullptr;             /* the Textures list's */
+    unsigned gl = 0;                        /* the view's */
 };
 
-struct PMesh { int mat; std::vector<uint32_t> idx; };
+/* A material's triangles: idx until they are on the card, then where */
+struct PMesh { int mat; std::vector<uint32_t> idx; uint32_t first = 0, count = 0; bool placed = false; };
+
+/* A map's prop: its meshes, drawn at each place (pos[3], rot[9] by columns) */
+struct Part { uint32_t first, count; std::vector<float> places; };
 
 /* One model (or map) as gmod2glb --info reads it */
 struct Loaded {
@@ -93,14 +119,19 @@ struct Loaded {
     std::vector<std::pair<std::string, int>> props;     /* a map's: each model, how many */
     int bones = 0, verts = 0, tris = 0, skins = 1;
     std::vector<std::pair<std::string, std::vector<std::string>>> body;
-    std::vector<Mat> mats;
+    int prop_tris = 0, props_missing = 0;               /* a map's props', as placed */
+    std::vector<Mat> mats;                  /* the first `listed` named; then the props' */
+    int listed = 0;
     std::vector<std::string> anims;
     std::set<std::string> anim_files;
-    std::vector<float> pos, nrm, uv;
-    std::vector<uint8_t> rgba;              /* a map's light at each vertex */
+    std::vector<uint8_t> vdata;             /* float pos[3], nrm[3], uv[2], u8 rgba: the file's */
     std::vector<PMesh> meshes;
+    std::vector<Part> parts;
+    unsigned vbo = 0, ibo = 0;
     float centre[3] = { 0, 0, 0 }, radius = 1;
 };
+
+}  // namespace
 
 static bool read_preview(const std::string& file, Loaded& L) {
     FILE* f = fopen(file.c_str(), "rb");
@@ -113,8 +144,9 @@ static bool read_preview(const std::string& file, Loaded& L) {
     size_t p = 0;
     auto need = [&](size_t k) { return p + k <= d.size(); };
     auto u32 = [&]() { uint32_t v = 0; if (need(4)) memcpy(&v, &d[p], 4); p += 4; return v; };
-    if (!need(8) || memcmp(d.data(), "GMPV", 4) || d[4] != 2) return false;
+    if (!need(8) || memcmp(d.data(), "GMPV", 4) || d[4] != 3) return false;
     p = 8;
+    L.listed = (int)L.mats.size();
     uint32_t nm = u32();
     for (uint32_t i = 0; i < nm && need(5); i++) {
         uint16_t w, h;
@@ -124,48 +156,23 @@ static bool read_preview(const std::string& file, Loaded& L) {
         p += 5;
         size_t bytes = (size_t)w * h * 4;
         if (!need(bytes)) return false;
-        if (i < L.mats.size()) {
-            Mat& m = L.mats[i];
-            m.flags = flags;
-            m.pw = w;
-            m.ph = h;
-            m.rgba.assign(d.begin() + p, d.begin() + p + bytes);
-        }
+        if (i >= L.mats.size()) L.mats.push_back(Mat());
+        Mat& m = L.mats[i];
+        m.flags = flags;
+        m.pw = w;
+        m.ph = h;
+        m.rgba.assign(d.begin() + p, d.begin() + p + bytes);
         p += bytes;
     }
     uint32_t nv = u32();
     if (!need((size_t)nv * 36)) return false;
-    L.rgba.resize(nv * 4);
-    L.pos.resize(nv * 3);
-    L.nrm.resize(nv * 3);
-    L.uv.resize(nv * 2);
-    float mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
-    for (uint32_t i = 0; i < nv; i++) {
-        float v[8];
-        memcpy(v, &d[p], 32);
-        memcpy(&L.rgba[i * 4], &d[p + 32], 4);
-        p += 36;
-        for (int k = 0; k < 3; k++) {
-            L.pos[i * 3 + k] = v[k];
-            L.nrm[i * 3 + k] = v[3 + k];
-            mn[k] = std::min(mn[k], v[k]);
-            mx[k] = std::max(mx[k], v[k]);
-        }
-        L.uv[i * 2] = v[6];
-        L.uv[i * 2 + 1] = v[7];
-    }
-    if (nv) {
-        float r = 0;
-        for (int k = 0; k < 3; k++) {
-            L.centre[k] = (mn[k] + mx[k]) * 0.5f;
-            r += (mx[k] - mn[k]) * (mx[k] - mn[k]);
-        }
-        L.radius = std::max(0.01f, sqrtf(r) * 0.5f);
-    }
+    L.vdata.assign(d.begin() + p, d.begin() + p + (size_t)nv * 36);
+    p += (size_t)nv * 36;
     uint32_t nmesh = u32();
     for (uint32_t i = 0; i < nmesh && need(8); i++) {
         PMesh m;
         m.mat = (int)u32();
+        if (m.mat < 0 || m.mat >= (int)L.mats.size()) m.mat = -1;
         uint32_t ni = u32();
         if (!need((size_t)ni * 4)) return false;
         m.idx.resize(ni);
@@ -173,6 +180,39 @@ static bool read_preview(const std::string& file, Loaded& L) {
         p += (size_t)ni * 4;
         for (uint32_t& x : m.idx) if (x >= nv) x = 0;
         L.meshes.push_back(std::move(m));
+    }
+    uint32_t nparts = u32();
+    for (uint32_t i = 0; i < nparts && need(12); i++) {
+        Part pt;
+        pt.first = u32();
+        pt.count = u32();
+        uint32_t n = u32();
+        if (!need((size_t)n * 48) || pt.first + pt.count > L.meshes.size()) return false;
+        pt.places.resize((size_t)n * 12);
+        memcpy(pt.places.data(), &d[p], (size_t)n * 48);
+        p += (size_t)n * 48;
+        for (uint32_t k = 0; k < pt.count; k++) L.meshes[pt.first + k].placed = true;
+        L.parts.push_back(std::move(pt));
+    }
+    /* Its size: the world's (or the model's), the props aside */
+    float mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
+    bool any = false;
+    for (const PMesh& m : L.meshes) {
+        if (m.placed) continue;
+        for (uint32_t x : m.idx) {
+            float v[3];
+            memcpy(v, &L.vdata[(size_t)x * 36], 12);
+            for (int k = 0; k < 3; k++) { mn[k] = std::min(mn[k], v[k]); mx[k] = std::max(mx[k], v[k]); }
+            any = true;
+        }
+    }
+    if (any) {
+        float r = 0;
+        for (int k = 0; k < 3; k++) {
+            L.centre[k] = (mn[k] + mx[k]) * 0.5f;
+            r += (mx[k] - mn[k]) * (mx[k] - mn[k]);
+        }
+        L.radius = std::max(0.01f, sqrtf(r) * 0.5f);
     }
     return true;
 }
@@ -202,6 +242,10 @@ static void load(const std::string& path, int skin, const std::vector<int>& body
         if ((k == "model" || k == "map") && f.size() > 2) L.from = f[2];
         else if (k == "simplified" && f.size() > 1) L.unsimplified = atoi(f[1].c_str());
         else if (k == "prop" && f.size() > 2) L.props.push_back({ f[1], atoi(f[2].c_str()) });
+        else if (k == "proptris" && f.size() > 2) {
+            L.prop_tris = atoi(f[1].c_str());
+            L.props_missing = atoi(f[2].c_str());
+        }
         else if (k == "counts" && f.size() > 4) {
             L.bones = atoi(f[1].c_str());
             L.verts = atoi(f[2].c_str());
@@ -241,7 +285,7 @@ static struct {
     std::thread list_worker;
     std::vector<Entry> entries;
     std::string list_error;
-    int show = 0;                           /* 0 everything, 1 the game's, 2 workshop addons */
+    int show = ALL;                         /* Game: which game's files are listed */
     int kind = 0, kind_was = -1;            /* 0 models, 1 maps */
     int simplify = 2;                       /* a map's: SIMPLIFY[] */
     char filter[128] = "";
@@ -307,11 +351,14 @@ static void list_start() {
             if (f[0].empty()) continue;
             std::string from = f.size() > 1 ? f[1] : "";
             bool map = f[0].size() > 4 && !f[0].compare(f[0].size() - 4, 4, ".bsp");
-            g.entries.push_back({ f[0], from, !from.compare(0, 9, "workshop/") || !from.compare(0, 7, "addons/"), map });
+            g.entries.push_back({ f[0], from, game_of(from), map });
         }
         g.list_state = 2;
     });
 }
+
+static void gl_upload(Loaded& L);
+static void gl_free(Loaded& L);
 
 static void textures_free(Loaded& L) {
     for (Mat& m : L.mats)
@@ -356,40 +403,194 @@ static void poll() {
     g.worker.join();
     g.state = 0;
     textures_free(g.cur);
+    gl_free(g.cur);
     g.cur = std::move(g.next);
     g.next = Loaded();
     g.have = true;
     g.dirty = true;
     if (!g.cur.error.empty()) ed_log("Garry's Mod: %s: %s", g.cur.path.c_str(), g.cur.error.c_str());
+    for (Mat& m : g.cur.mats)
+        /* The alpha of an opaque material's texture is a mask for something
+         * else (shine, mostly): it is drawn solid */
+        if (!(m.flags & (ALPHATEST | TRANSLUCENT | ADDITIVE)))
+            for (size_t i = 3; i < m.rgba.size(); i += 4) m.rgba[i] = 255;
     if (g.renderer)
-        for (Mat& m : g.cur.mats) {
+        for (int i = 0; i < g.cur.listed; i++) {
+            Mat& m = g.cur.mats[i];
             if (m.rgba.empty() || !m.pw) continue;
-            /* The alpha of an opaque material's texture is a mask for something
-             * else (shine, mostly): it is drawn solid */
-            if (!(m.flags & (ALPHATEST | TRANSLUCENT | ADDITIVE)))
-                for (size_t i = 3; i < m.rgba.size(); i += 4) m.rgba[i] = 255;
             m.tex = SDL_CreateTexture(g.renderer, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STATIC, m.pw, m.ph);
             if (!m.tex) continue;
             SDL_UpdateTexture(m.tex, nullptr, m.rgba.data(), m.pw * 4);
             SDL_SetTextureScaleMode(m.tex, SDL_SCALEMODE_LINEAR);
             SDL_SetTextureBlendMode(m.tex, m.flags & ADDITIVE ? SDL_BLENDMODE_ADD
                                            : m.flags & (ALPHATEST | TRANSLUCENT) ? SDL_BLENDMODE_BLEND : SDL_BLENDMODE_NONE);
-            std::vector<uint8_t>().swap(m.rgba);
         }
+    gl_upload(g.cur);
+    for (Mat& m : g.cur.mats) std::vector<uint8_t>().swap(m.rgba);
     if (g.want) request();
 }
 
 /* ================================================================
- * The preview: the model's triangles as they are, far ones first (SDL's
- * renderer has no depth buffer), lit from beside the camera
+ * The preview: drawn by OpenGL in a context of its own (whatever SDL's
+ * renderer is), off the screen, then copied to a texture the tab shows. A
+ * model lit from beside the camera; a map by its own light, its props lit
+ * as models are
  * ================================================================ */
+
+#define GL_1(X) X(Viewport) X(ClearColor) X(Clear) X(Enable) X(Disable) X(DepthMask) X(BlendFunc) X(AlphaFunc) \
+    X(CullFace) X(MatrixMode) X(LoadMatrixf) X(LoadIdentity) X(MultMatrixf) X(PushMatrix) X(PopMatrix) X(GenTextures) \
+    X(DeleteTextures) X(BindTexture) X(TexImage2D) X(TexParameteri) X(TexEnvi) X(EnableClientState) X(VertexPointer) \
+    X(NormalPointer) X(ColorPointer) X(TexCoordPointer) X(DrawElements) X(ReadPixels) X(Lightfv) X(LightModelfv) \
+    X(ColorMaterial) X(PixelStorei) X(GetError)
+#define GL_X(X) X(GENBUFFERS, GenBuffers) X(DELETEBUFFERS, DeleteBuffers) X(BINDBUFFER, BindBuffer) \
+    X(BUFFERDATA, BufferData) X(GENFRAMEBUFFERS, GenFramebuffers) X(DELETEFRAMEBUFFERS, DeleteFramebuffers) \
+    X(BINDFRAMEBUFFER, BindFramebuffer) X(FRAMEBUFFERRENDERBUFFER, FramebufferRenderbuffer) \
+    X(CHECKFRAMEBUFFERSTATUS, CheckFramebufferStatus) X(GENRENDERBUFFERS, GenRenderbuffers) \
+    X(DELETERENDERBUFFERS, DeleteRenderbuffers) X(BINDRENDERBUFFER, BindRenderbuffer) \
+    X(RENDERBUFFERSTORAGEMULTISAMPLE, RenderbufferStorageMultisample) X(BLITFRAMEBUFFER, BlitFramebuffer) \
+    X(GENERATEMIPMAP, GenerateMipmap)
+
+static struct {
+#define F1(n) decltype(&::gl##n) n = nullptr;
+#define FX(N, n) PFNGL##N##PROC n = nullptr;
+    GL_1(F1) GL_X(FX)
+#undef F1
+#undef FX
+    int state = 0;                  /* 0 not tried, 1 working, 2 none to be had */
+    SDL_Window* window = nullptr;
+    SDL_GLContext ctx = nullptr;
+    SDL_Window* old_window = nullptr;
+    SDL_GLContext old_ctx = nullptr;
+    unsigned fbo = 0, rb[2] = { 0, 0 }, resolve = 0, resolve_rb = 0, grey = 0;
+    int w = 0, h = 0;
+    std::vector<uint8_t> pixels;
+} gl;
+
+/* Our context current, for a while; false if there is none */
+static bool gl_begin() {
+    if (gl.state == 2) return false;
+    gl.old_window = SDL_GL_GetCurrentWindow();
+    gl.old_ctx = SDL_GL_GetCurrentContext();
+    if (gl.state == 0) {
+        gl.state = 2;
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, 0);
+        gl.window = SDL_CreateWindow("preview", 16, 16, SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
+        gl.ctx = gl.window ? SDL_GL_CreateContext(gl.window) : nullptr;
+        if (!gl.ctx) {
+            ed_log("Source preview: no OpenGL (%s)", SDL_GetError());
+            if (gl.window) SDL_DestroyWindow(gl.window);
+            gl.window = nullptr;
+            SDL_GL_MakeCurrent(gl.old_window, gl.old_ctx);
+            return false;
+        }
+        bool all = true;
+#define F1(n) all &= (gl.n = (decltype(gl.n))SDL_GL_GetProcAddress("gl" #n)) != nullptr;
+#define FX(N, n) all &= (gl.n = (decltype(gl.n))SDL_GL_GetProcAddress("gl" #n)) != nullptr;
+        GL_1(F1) GL_X(FX)
+#undef F1
+#undef FX
+        if (!all) {
+            ed_log("Source preview: this OpenGL is missing what the preview needs");
+            SDL_GL_MakeCurrent(gl.old_window, gl.old_ctx);
+            return false;
+        }
+        gl.state = 1;
+        /* What a mesh without a texture is drawn with */
+        uint8_t grey[4] = { 180, 180, 180, 255 };
+        gl.GenTextures(1, &gl.grey);
+        gl.BindTexture(GL_TEXTURE_2D, gl.grey);
+        gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, grey);
+        gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        return true;
+    }
+    return SDL_GL_MakeCurrent(gl.window, gl.ctx);
+}
+
+/* Whoever had the current context has it back (SDL's renderer, if OpenGL) */
+static void gl_end() { SDL_GL_MakeCurrent(gl.old_window, gl.old_ctx); }
+
+/* A read's textures and triangles onto the card */
+static void gl_upload(Loaded& L) {
+    if (!gl_begin()) return;
+    gl.PixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    for (Mat& m : L.mats) {
+        if (m.rgba.empty() || !m.pw) continue;
+        gl.GenTextures(1, &m.gl);
+        gl.BindTexture(GL_TEXTURE_2D, m.gl);
+        gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, m.pw, m.ph, 0, GL_RGBA, GL_UNSIGNED_BYTE, m.rgba.data());
+        gl.GenerateMipmap(GL_TEXTURE_2D);
+        gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    }
+    std::vector<uint32_t> all;
+    for (PMesh& m : L.meshes) {
+        m.first = (uint32_t)all.size();
+        m.count = (uint32_t)m.idx.size();
+        all.insert(all.end(), m.idx.begin(), m.idx.end());
+        std::vector<uint32_t>().swap(m.idx);
+    }
+    gl.GenBuffers(1, &L.vbo);
+    gl.BindBuffer(GL_ARRAY_BUFFER, L.vbo);
+    gl.BufferData(GL_ARRAY_BUFFER, L.vdata.size(), L.vdata.data(), GL_STATIC_DRAW);
+    gl.GenBuffers(1, &L.ibo);
+    gl.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, L.ibo);
+    gl.BufferData(GL_ELEMENT_ARRAY_BUFFER, all.size() * 4, all.data(), GL_STATIC_DRAW);
+    std::vector<uint8_t>().swap(L.vdata);
+    gl_end();
+}
+
+static void gl_free(Loaded& L) {
+    if (gl.state != 1 || !gl_begin()) return;
+    for (Mat& m : L.mats)
+        if (m.gl) { gl.DeleteTextures(1, &m.gl); m.gl = 0; }
+    if (L.vbo) gl.DeleteBuffers(1, &L.vbo);
+    if (L.ibo) gl.DeleteBuffers(1, &L.ibo);
+    L.vbo = L.ibo = 0;
+    gl_end();
+}
+
+/* Somewhere w x h to draw (4 samples a pixel), and one to read it from */
+static bool gl_target(int w, int h) {
+    if (gl.fbo && gl.w == w && gl.h == h) return true;
+    if (gl.fbo) {
+        gl.DeleteFramebuffers(1, &gl.fbo);
+        gl.DeleteFramebuffers(1, &gl.resolve);
+        gl.DeleteRenderbuffers(2, gl.rb);
+        gl.DeleteRenderbuffers(1, &gl.resolve_rb);
+    }
+    gl.GenFramebuffers(1, &gl.fbo);
+    gl.GenRenderbuffers(2, gl.rb);
+    gl.BindFramebuffer(GL_FRAMEBUFFER, gl.fbo);
+    gl.BindRenderbuffer(GL_RENDERBUFFER, gl.rb[0]);
+    gl.RenderbufferStorageMultisample(GL_RENDERBUFFER, 4, GL_RGBA8, w, h);
+    gl.FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, gl.rb[0]);
+    gl.BindRenderbuffer(GL_RENDERBUFFER, gl.rb[1]);
+    gl.RenderbufferStorageMultisample(GL_RENDERBUFFER, 4, GL_DEPTH_COMPONENT24, w, h);
+    gl.FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, gl.rb[1]);
+    bool ok = gl.CheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    gl.GenFramebuffers(1, &gl.resolve);
+    gl.GenRenderbuffers(1, &gl.resolve_rb);
+    gl.BindFramebuffer(GL_FRAMEBUFFER, gl.resolve);
+    gl.BindRenderbuffer(GL_RENDERBUFFER, gl.resolve_rb);
+    gl.RenderbufferStorageMultisample(GL_RENDERBUFFER, 0, GL_RGBA8, w, h);
+    gl.FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, gl.resolve_rb);
+    ok &= gl.CheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    gl.w = w;
+    gl.h = h;
+    if (!ok) ed_log("Source preview: OpenGL cannot draw off the screen here");
+    return ok;
+}
 
 static void render_preview(int w, int h) {
     SDL_Renderer* r = g.renderer;
     if (!r || w < 8 || h < 8) return;
     if (!g.target || g.tw != w || g.th != h) {
         if (g.target) SDL_DestroyTexture(g.target);
-        g.target = SDL_CreateTexture(r, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET, w, h);
+        g.target = SDL_CreateTexture(r, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, w, h);
         g.tw = w;
         g.th = h;
         g.dirty = true;
@@ -397,91 +598,116 @@ static void render_preview(int w, int h) {
     if (!g.target || !g.dirty) return;
     g.dirty = false;
     const Loaded& L = g.cur;
-    SDL_Texture* old = SDL_GetRenderTarget(r);
-    SDL_SetRenderTarget(r, g.target);
-    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
-    SDL_SetRenderDrawColor(r, 38, 41, 48, 255);
-    SDL_RenderClear(r);
-    size_t nv = L.pos.size() / 3;
-    if (nv) {
-        if (g.dist <= 0) g.dist = L.radius * (L.map ? 1.5f : 2.6f);
-        float cp = cosf(g.pitch), sp = sinf(g.pitch), cy = cosf(g.yaw), sy = sinf(g.yaw);
-        float eye[3] = { L.centre[0] + g.dist * cp * sy, L.centre[1] + g.dist * sp, L.centre[2] + g.dist * cp * cy };
-        float fw[3] = { -cp * sy, -sp, -cp * cy };
-        float rt[3] = { -fw[2], 0, fw[0] };     /* forward x up */
-        float rl = sqrtf(rt[0] * rt[0] + rt[2] * rt[2]);
-        rt[0] /= rl; rt[2] /= rl;
-        float up[3] = { rt[1] * fw[2] - rt[2] * fw[1], rt[2] * fw[0] - rt[0] * fw[2], rt[0] * fw[1] - rt[1] * fw[0] };
-        float lt[3];
-        for (int k = 0; k < 3; k++) lt[k] = -fw[k] + up[k] * 0.6f - rt[k] * 0.4f;
-        float ll = sqrtf(lt[0] * lt[0] + lt[1] * lt[1] + lt[2] * lt[2]);
-        for (float& x : lt) x /= ll;
-        float focal = (h * 0.5f) / tanf(20.0f * 3.14159265f / 180.0f);
+    if (!gl_begin()) return;
+    if (!gl_target(w, h)) { gl_end(); return; }
 
-        std::vector<float> sx(nv), syv(nv), sz(nv), shade(nv);
-        for (size_t i = 0; i < nv; i++) {
-            const float* p = &L.pos[i * 3];
-            float d[3] = { p[0] - eye[0], p[1] - eye[1], p[2] - eye[2] };
-            float x = d[0] * rt[0] + d[1] * rt[1] + d[2] * rt[2];
-            float y = d[0] * up[0] + d[1] * up[1] + d[2] * up[2];
-            float z = d[0] * fw[0] + d[1] * fw[1] + d[2] * fw[2];
-            sz[i] = z;
-            float iz = z > 1e-4f ? 1.0f / z : 0;
-            sx[i] = w * 0.5f + x * iz * focal;
-            syv[i] = h * 0.5f - y * iz * focal;
-            if (L.map) continue;            /* lit by its own lightmap */
-            const float* n = &L.nrm[i * 3];
-            float l = n[0] * lt[0] + n[1] * lt[1] + n[2] * lt[2];
-            shade[i] = 0.42f + 0.58f * (l > 0 ? l : 0);
+    gl.BindFramebuffer(GL_FRAMEBUFFER, gl.fbo);
+    gl.Viewport(0, 0, w, h);
+    gl.ClearColor(0x26 / 255.0f, 0x29 / 255.0f, 0x2f / 255.0f, 1);
+    gl.DepthMask(GL_TRUE);
+    gl.Clear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    if (g.dist <= 0) g.dist = L.radius * (L.map ? 1.5f : 2.6f);
+    float cp = cosf(g.pitch), sp = sinf(g.pitch), cy = cosf(g.yaw), sy = sinf(g.yaw);
+    float eye[3] = { L.centre[0] + g.dist * cp * sy, L.centre[1] + g.dist * sp, L.centre[2] + g.dist * cp * cy };
+    float fw[3] = { -cp * sy, -sp, -cp * cy };
+    float rt[3] = { -fw[2], 0, fw[0] };         /* forward x up */
+    float rl = sqrtf(rt[0] * rt[0] + rt[2] * rt[2]);
+    rt[0] /= rl; rt[2] /= rl;
+    float up[3] = { rt[1] * fw[2] - rt[2] * fw[1], rt[2] * fw[0] - rt[0] * fw[2], rt[0] * fw[1] - rt[1] * fw[0] };
+
+    /* 40 degrees top to bottom; near and far from how far out and how big */
+    float zn = std::max(0.01f, std::min(g.dist, L.radius) * 0.002f), zf = g.dist + L.radius * 4;
+    float f = 1.0f / tanf(20.0f * 3.14159265f / 180.0f), aspect = (float)w / h;
+    float proj[16] = { f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, (zf + zn) / (zn - zf), -1, 0, 0, 2 * zf * zn / (zn - zf), 0 };
+    float view[16] = { rt[0], up[0], -fw[0], 0, rt[1], up[1], -fw[1], 0, rt[2], up[2], -fw[2], 0, 0, 0, 0, 1 };
+    for (int k = 0; k < 3; k++) view[12 + k] = -(view[k] * eye[0] + view[4 + k] * eye[1] + view[8 + k] * eye[2]);
+    gl.MatrixMode(GL_PROJECTION);
+    gl.LoadMatrixf(proj);
+    gl.MatrixMode(GL_MODELVIEW);
+    gl.LoadIdentity();
+
+    /* The light, from up and to the left of the camera, set where the camera is */
+    float lt[4] = { -0.4f, 0.6f, 1.0f, 0 }, amb[4] = { 0.42f, 0.42f, 0.42f, 1 }, dif[4] = { 0.58f, 0.58f, 0.58f, 1 };
+    float none[4] = { 0, 0, 0, 1 };
+    gl.Lightfv(GL_LIGHT0, GL_POSITION, lt);
+    gl.Lightfv(GL_LIGHT0, GL_DIFFUSE, dif);
+    gl.Lightfv(GL_LIGHT0, GL_AMBIENT, none);
+    gl.LightModelfv(GL_LIGHT_MODEL_AMBIENT, amb);
+    gl.Enable(GL_LIGHT0);
+    gl.ColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE);
+    gl.Enable(GL_COLOR_MATERIAL);
+    gl.Enable(GL_NORMALIZE);
+    gl.LoadMatrixf(view);
+
+    gl.Enable(GL_DEPTH_TEST);
+    gl.Enable(GL_TEXTURE_2D);
+    gl.TexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+    gl.CullFace(GL_BACK);
+    gl.AlphaFunc(GL_GREATER, 0.5f);
+    gl.BindBuffer(GL_ARRAY_BUFFER, L.vbo);
+    gl.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, L.ibo);
+    gl.EnableClientState(GL_VERTEX_ARRAY);
+    gl.EnableClientState(GL_NORMAL_ARRAY);
+    gl.EnableClientState(GL_TEXTURE_COORD_ARRAY);
+    gl.EnableClientState(GL_COLOR_ARRAY);
+    gl.VertexPointer(3, GL_FLOAT, 36, (void*)0);
+    gl.NormalPointer(GL_FLOAT, 36, (void*)12);
+    gl.TexCoordPointer(2, GL_FLOAT, 36, (void*)24);
+    gl.ColorPointer(4, GL_UNSIGNED_BYTE, 36, (void*)32);
+
+    /* One mesh as its material has it; the see-through ones on the second pass */
+    auto mesh = [&](const PMesh& m, bool see_pass) {
+        const Mat* mat = m.mat >= 0 ? &L.mats[m.mat] : nullptr;
+        uint8_t fl = mat ? mat->flags : 0;
+        bool see = fl & (TRANSLUCENT | ADDITIVE);
+        if (see != see_pass || !m.count) return;
+        gl.BindTexture(GL_TEXTURE_2D, mat && mat->gl ? mat->gl : gl.grey);
+        if (fl & TWO_SIDED) gl.Disable(GL_CULL_FACE); else gl.Enable(GL_CULL_FACE);
+        if (fl & ALPHATEST) gl.Enable(GL_ALPHA_TEST); else gl.Disable(GL_ALPHA_TEST);
+        if (see) {
+            gl.Enable(GL_BLEND);
+            gl.BlendFunc(GL_SRC_ALPHA, fl & ADDITIVE ? GL_ONE : GL_ONE_MINUS_SRC_ALPHA);
+            gl.DepthMask(GL_FALSE);
+        } else {
+            gl.Disable(GL_BLEND);
+            gl.DepthMask(GL_TRUE);
         }
-        struct Tri { float z; int mesh; uint32_t at; };
-        std::vector<Tri> solid, blend;
-        float near_z = L.radius * 0.01f;
-        for (size_t mi = 0; mi < L.meshes.size(); mi++) {
-            const PMesh& m = L.meshes[mi];
-            uint8_t flags = m.mat >= 0 && m.mat < (int)L.mats.size() ? L.mats[m.mat].flags : 0;
-            for (uint32_t t = 0; t + 2 < m.idx.size(); t += 3) {
-                uint32_t a = m.idx[t], b = m.idx[t + 1], c = m.idx[t + 2];
-                if (sz[a] < near_z || sz[b] < near_z || sz[c] < near_z) continue;
-                /* Front faces (counter-clockwise, y up) turn clockwise with y down */
-                float cr = (sx[b] - sx[a]) * (syv[c] - syv[a]) - (syv[b] - syv[a]) * (sx[c] - sx[a]);
-                if (cr >= 0 && !(flags & TWO_SIDED)) continue;
-                Tri tri = { sz[a] + sz[b] + sz[c], (int)mi, t };
-                ((flags & (TRANSLUCENT | ADDITIVE)) ? blend : solid).push_back(tri);
+        gl.DrawElements(GL_TRIANGLES, m.count, GL_UNSIGNED_INT, (void*)(uintptr_t)(m.first * 4));
+    };
+    for (int pass = 0; pass < 2; pass++) {
+        /* The world (a map's lit by itself) or the model */
+        if (L.map) gl.Disable(GL_LIGHTING); else gl.Enable(GL_LIGHTING);
+        for (const PMesh& m : L.meshes)
+            if (!m.placed) mesh(m, pass == 1);
+        /* The props, each where it stands */
+        gl.Enable(GL_LIGHTING);
+        for (const Part& pt : L.parts)
+            for (size_t i = 0; i + 12 <= pt.places.size(); i += 12) {
+                const float* at = &pt.places[i];
+                float m4[16] = { at[3], at[4], at[5], 0, at[6], at[7], at[8], 0, at[9], at[10], at[11], 0,
+                                 at[0], at[1], at[2], 1 };
+                gl.PushMatrix();
+                gl.MultMatrixf(m4);
+                for (uint32_t k = 0; k < pt.count; k++) mesh(L.meshes[pt.first + k], pass == 1);
+                gl.PopMatrix();
             }
-        }
-        auto far_first = [](const Tri& x, const Tri& y) { return x.z > y.z; };
-        std::sort(solid.begin(), solid.end(), far_first);
-        std::sort(blend.begin(), blend.end(), far_first);
-        SDL_SetRenderTextureAddressMode(r, SDL_TEXTURE_ADDRESS_WRAP, SDL_TEXTURE_ADDRESS_WRAP);
-        std::vector<SDL_Vertex> batch;
-        int batch_mat = -2;
-        auto flush = [&]() {
-            if (batch.empty()) return;
-            SDL_Texture* t = batch_mat >= 0 && batch_mat < (int)L.mats.size() ? L.mats[batch_mat].tex : nullptr;
-            SDL_RenderGeometry(r, t, batch.data(), (int)batch.size(), nullptr, 0);
-            batch.clear();
-        };
-        for (const std::vector<Tri>* list : { &solid, &blend })
-            for (const Tri& tri : *list) {
-                const PMesh& m = L.meshes[tri.mesh];
-                if (m.mat != batch_mat) { flush(); batch_mat = m.mat; }
-                bool textured = m.mat >= 0 && m.mat < (int)L.mats.size() && L.mats[m.mat].tex;
-                for (int k = 0; k < 3; k++) {
-                    uint32_t i = m.idx[tri.at + k];
-                    float s = (L.map ? 1.0f : shade[i]) * (textured ? 1.0f : 0.7f);
-                    const uint8_t* c = &L.rgba[i * 4];
-                    SDL_Vertex v;
-                    v.position = { sx[i], syv[i] };
-                    v.color = { s * c[0] / 255.0f, s * c[1] / 255.0f, s * c[2] / 255.0f, 1.0f };
-                    v.tex_coord = { L.uv[i * 2], L.uv[i * 2 + 1] };
-                    batch.push_back(v);
-                }
-            }
-        flush();
-        SDL_SetRenderTextureAddressMode(r, SDL_TEXTURE_ADDRESS_AUTO, SDL_TEXTURE_ADDRESS_AUTO);
     }
-    SDL_SetRenderTarget(r, old);
+    gl.DepthMask(GL_TRUE);
+
+    /* Down to a pixel each, and read back (bottom row first: shown flipped) */
+    gl.BindFramebuffer(GL_READ_FRAMEBUFFER, gl.fbo);
+    gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, gl.resolve);
+    gl.BlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    gl.BindFramebuffer(GL_FRAMEBUFFER, gl.resolve);
+    gl.PixelStorei(GL_PACK_ALIGNMENT, 4);
+    gl.pixels.resize((size_t)w * h * 4);
+    gl.ReadPixels(0, 0, w, h, GL_BGRA, GL_UNSIGNED_BYTE, gl.pixels.data());
+    gl.BindFramebuffer(GL_FRAMEBUFFER, 0);
+    gl.BindBuffer(GL_ARRAY_BUFFER, 0);
+    gl.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    gl_end();
+    SDL_UpdateTexture(g.target, nullptr, gl.pixels.data(), w * 4);
 }
 
 /* ================================================================
@@ -577,7 +803,7 @@ static void build_tree() {
     g.tree = Node();
     for (int i = 0; i < (int)g.entries.size(); i++) {
         const Entry& e = g.entries[i];
-        if ((g.show == 1 && e.workshop) || (g.show == 2 && !e.workshop) || e.map != (g.kind == 1)) continue;
+        if ((g.show != ALL && e.game != g.show) || e.map != (g.kind == 1)) continue;
         Node* n = &g.tree;
         size_t at = 0;
         for (;;) {
@@ -631,8 +857,7 @@ static void browser() {
     ImGui::InputTextWithHint("##gf", ICON_SEARCH "  Search", g.filter, sizeof(g.filter));
     ImGui::SameLine();
     ImGui::SetNextItemWidth(-1);
-    const char* shows[] = { "Everything", "The game's", "Addons" };
-    ImGui::Combo("##show", &g.show, shows, 3);
+    ImGui::Combo("##show", &g.show, GAME_NAMES, GAMES);
     if (g.show != g.show_was || g.kind != g.kind_was) {
         build_tree();
         g.filter_was = "\x01";
@@ -647,7 +872,7 @@ static void browser() {
         if (!f.empty())
             for (int i = 0; i < (int)g.entries.size(); i++) {
                 const Entry& e = g.entries[i];
-                if ((g.show == 1 && e.workshop) || (g.show == 2 && !e.workshop) || e.map != (g.kind == 1)) continue;
+                if ((g.show != ALL && e.game != g.show) || e.map != (g.kind == 1)) continue;
                 if (e.path.find(f) != std::string::npos) g.matches.push_back(i);
             }
     }
@@ -673,7 +898,7 @@ static void preview_view() {
     int w = (int)avail.x, h = (int)avail.y;
     render_preview(w, h);
     if (!g.target) return;
-    ImGui::Image((ImTextureID)(intptr_t)g.target, ImVec2((float)w, (float)h));
+    ImGui::Image((ImTextureID)(intptr_t)g.target, ImVec2((float)w, (float)h), ImVec2(0, 1), ImVec2(1, 0));
     if (ImGui::IsItemHovered()) {
         ImGuiIO& io = ImGui::GetIO();
         if (ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0) || ImGui::IsMouseDragging(ImGuiMouseButton_Right, 0)) {
@@ -685,7 +910,11 @@ static void preview_view() {
     }
     ImDrawList* dl = ImGui::GetWindowDrawList();
     char b[96];
-    snprintf(b, sizeof(b), "As in the game: %d triangles%s", g.cur.tris, g.state == 1 ? "   reading..." : "");
+    if (g.cur.prop_tris)
+        snprintf(b, sizeof(b), "As in the game: %d triangles, %d more in props%s", g.cur.tris, g.cur.prop_tris,
+                 g.state == 1 ? "   reading..." : "");
+    else
+        snprintf(b, sizeof(b), "As in the game: %d triangles%s", g.cur.tris, g.state == 1 ? "   reading..." : "");
     dl->AddText(ImVec2(top.x + 8, top.y + 6), IM_COL32(200, 204, 212, 220), b);
     dl->AddText(ImVec2(top.x + 8, top.y + h - ImGui::GetFontSize() - 6), IM_COL32(200, 204, 212, 160), "drag to turn, wheel to zoom");
 }
@@ -700,7 +929,7 @@ static void details() {
     ImGui::TextDisabled("from %s", L.from.c_str());
     if (!L.error.empty()) { ImGui::TextColored(ImColor(ui::ERROR), "%s", L.error.c_str()); }
     if (L.map) {
-        ImGui::Text("%d triangles, %d vertices, %zu materials", L.tris, L.verts, L.mats.size());
+        ImGui::Text("%d triangles, %d vertices, %d materials", L.tris, L.verts, L.listed);
         ImGui::SetNextItemWidth(ImGui::GetFontSize() * 10);
         if (ImGui::SliderInt("Simplify", &g.simplify, 0, 5, SIMPLIFY_NAMES[g.simplify])) request();
         ui::tooltip("Joins the pieces the map was cut into where it doesn't show: flat, evenly lit surfaces\n"
@@ -749,7 +978,8 @@ static void details() {
 
     if (ui::component(ICON_IMAGE, "Textures", !L.map)) {
         if (ImGui::BeginTable("tex", 3, ImGuiTableFlags_SizingStretchProp)) {
-            for (const Mat& m : L.mats) {
+            for (int mi = 0; mi < L.listed; mi++) {
+                const Mat& m = L.mats[mi];
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn();
                 if (m.tex) {
@@ -864,5 +1094,8 @@ void gmod_shutdown() {
     for (std::thread* t : { &g.list_worker, &g.worker, &g.bring_worker })
         if (t->joinable()) t->join();
     textures_free(g.cur);
+    gl_free(g.cur);
     if (g.target) SDL_DestroyTexture(g.target);
+    if (gl.ctx) SDL_GL_DestroyContext(gl.ctx);
+    if (gl.window) SDL_DestroyWindow(gl.window);
 }

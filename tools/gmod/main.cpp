@@ -1,4 +1,4 @@
-/* gmod2glb: Garry's Mod models (and the HL2 / CS:S content it mounts, and
+/* gmod2glb: Garry's Mod models and maps (and the HL2, CS:S and TF2 installed beside it, and
  * workshop addons) to .glb, which strippy makes .dms of.
  *
  *   gmod2glb --list [text]             the models whose path has text in it
@@ -295,11 +295,14 @@ static bool convert(const Vfs& vfs, const std::string& path, const std::string& 
  *   body <part> <choice>...          mat <name> <vmt> <texture> <w> <h> <flags>
  *   anim <name> <in .mdl>            include <.mdl>
  *
- * The preview file, little-endian: "GMPV" u32 2; u32 materials, each u16 w,
+ * The preview file, little-endian: "GMPV" u32 3; u32 materials, each u16 w,
  * u16 h, u8 flags (1 alphatest, 2 translucent, 4 two-sided, 8 additive),
  * w*h RGBA; u32 vertices, each float pos[3], normal[3], uv[2] (glTF's axes,
  * metres), u8 rgba (a map's light; white for a model); u32 meshes, each u32
- * material, u32 indices, the indices
+ * material, u32 indices, the indices; u32 parts (a map's props), each u32
+ * first mesh, u32 meshes, u32 places, each float pos[3], rot[9] (by columns):
+ * those meshes drawn again at each place. Meshes in no part are drawn as
+ * they are
  *
  * A map (.bsp) is the same, with "map" for "model" and a line a prop:
  *   prop <model> <how many>                      spawn <x> <y> <z>
@@ -324,7 +327,7 @@ static bool info(const Vfs& vfs, const std::string& path, const Options& opt, co
     std::map<int, int> slot;
     for (const MdlMesh& me : m.meshes)
         if (!slot.count(me.material)) { slot[me.material] = (int)used.size(); used.push_back(me.material); }
-    std::vector<uint8_t> out = { 'G', 'M', 'P', 'V', 2, 0, 0, 0 };
+    std::vector<uint8_t> out = { 'G', 'M', 'P', 'V', 3, 0, 0, 0 };
     auto u32 = [&](uint32_t v) { out.insert(out.end(), (uint8_t*)&v, (uint8_t*)&v + 4); };
     auto f32 = [&](float v) { out.insert(out.end(), (uint8_t*)&v, (uint8_t*)&v + 4); };
     u32((uint32_t)used.size());
@@ -365,6 +368,7 @@ static bool info(const Vfs& vfs, const std::string& path, const Options& opt, co
         u32((uint32_t)me.indices.size());
         for (uint32_t i : me.indices) u32(i);
     }
+    u32(0);     /* no parts placed again */
 
     std::vector<AnimSource> all;
     std::set<std::string> seen, taken;
@@ -401,53 +405,115 @@ static bool map_info(Vfs& vfs, const std::string& path, const Options& opt, cons
     if (!bsp_load(vfs, path, b, &why)) { fprintf(stderr, "%s: %s\n", path.c_str(), why.c_str()); return false; }
     size_t unsimplified = opt.simplify > 0 ? bsp_simplify(b, opt.simplify) : 0;
     const VfsEntry* e = vfs.find(path);
-    size_t verts = 0;
-    for (const BspGroup& g : b.groups) verts += g.pos.size() / 3;
+    size_t world_verts = 0;
+    for (const BspGroup& g : b.groups) world_verts += g.pos.size() / 3;
     printf("map\t%s\t%s\n", b.path.c_str(), e ? vfs.sources[e->source].label.c_str() : "");
-    printf("counts\t0\t%zu\t%zu\t1\n", verts, b.tris());
+    printf("counts\t0\t%zu\t%zu\t1\n", world_verts, b.tris());
     if (unsimplified) printf("simplified\t%zu\n", unsimplified);
-    std::vector<uint8_t> out = { 'G', 'M', 'P', 'V', 2, 0, 0, 0 };
-    auto u32 = [&](uint32_t v) { out.insert(out.end(), (uint8_t*)&v, (uint8_t*)&v + 4); };
-    auto f32 = [&](float v) { out.insert(out.end(), (uint8_t*)&v, (uint8_t*)&v + 4); };
-    u32((uint32_t)b.groups.size());
-    for (const BspGroup& g : b.groups) {
+
+    /* The preview's pieces, put together at the end */
+    std::vector<uint8_t> mats, verts, meshes, parts;
+    uint32_t nmats = 0, nverts = 0, nmeshes = 0, nparts = 0;
+    auto put32 = [](std::vector<uint8_t>& v, uint32_t x) { v.insert(v.end(), (uint8_t*)&x, (uint8_t*)&x + 4); };
+    auto putf = [](std::vector<uint8_t>& v, float x) { v.insert(v.end(), (uint8_t*)&x, (uint8_t*)&x + 4); };
+    std::map<std::string, uint32_t> mat_of;
+    /* A material once, however many use it; printed for the world's only */
+    auto material = [&](const std::string& vmt, bool print) {
+        auto it = mat_of.find(vmt);
+        if (it != mat_of.end()) return it->second;
         Material mat;
         Image im;
         std::string err;
         int fw = 0, fh = 0;
-        bool ok = texture_of(vfs, g.material, opt.tex, mat, im, err, &fw, &fh);
-        printf("mat\t%s\t%s\t%s\t%d\t%d\t%s\n", vmt_base(g.material).c_str(), g.material.c_str(), mat.basetexture.c_str(),
-               fw, fh, ok ? "" : err.c_str());
+        bool ok = texture_of(vfs, vmt, opt.tex, mat, im, err, &fw, &fh);
+        if (print)
+            printf("mat\t%s\t%s\t%s\t%d\t%d\t%s\n", vmt_base(vmt).c_str(), vmt.c_str(), mat.basetexture.c_str(), fw, fh,
+                   ok ? "" : err.c_str());
         uint16_t w = ok ? (uint16_t)im.w : 0, h = ok ? (uint16_t)im.h : 0;
-        out.insert(out.end(), (uint8_t*)&w, (uint8_t*)&w + 2);
-        out.insert(out.end(), (uint8_t*)&h, (uint8_t*)&h + 2);
-        out.push_back(mat_flags(mat));
-        if (ok) out.insert(out.end(), im.rgba.begin(), im.rgba.end());
-    }
-    u32((uint32_t)verts);
-    for (const BspGroup& g : b.groups)
+        mats.insert(mats.end(), (uint8_t*)&w, (uint8_t*)&w + 2);
+        mats.insert(mats.end(), (uint8_t*)&h, (uint8_t*)&h + 2);
+        mats.push_back(mat_flags(mat));
+        if (ok) mats.insert(mats.end(), im.rgba.begin(), im.rgba.end());
+        mat_of[vmt] = nmats;
+        return nmats++;
+    };
+
+    /* The world, where it is */
+    for (const BspGroup& g : b.groups) {
+        uint32_t mi = material(g.material, true);
         for (size_t i = 0; i < g.pos.size() / 3; i++) {
-            for (int k = 0; k < 3; k++) f32(g.pos[i * 3 + k]);
-            for (int k = 0; k < 3; k++) f32(g.nrm[i * 3 + k]);
-            f32(g.uv[i * 2]);
-            f32(g.uv[i * 2 + 1]);
-            out.insert(out.end(), &g.rgba[i * 4], &g.rgba[i * 4] + 4);
+            for (int k = 0; k < 3; k++) putf(verts, g.pos[i * 3 + k]);
+            for (int k = 0; k < 3; k++) putf(verts, g.nrm[i * 3 + k]);
+            putf(verts, g.uv[i * 2]);
+            putf(verts, g.uv[i * 2 + 1]);
+            verts.insert(verts.end(), &g.rgba[i * 4], &g.rgba[i * 4] + 4);
         }
-    u32((uint32_t)b.groups.size());
-    uint32_t base = 0;
-    for (size_t gi = 0; gi < b.groups.size(); gi++) {
-        const BspGroup& g = b.groups[gi];
-        u32((uint32_t)gi);
-        u32((uint32_t)g.idx.size());
-        for (uint32_t i : g.idx) u32(base + i);
-        base += (uint32_t)(g.pos.size() / 3);
+        put32(meshes, mi);
+        put32(meshes, (uint32_t)g.idx.size());
+        for (uint32_t i : g.idx) put32(meshes, nverts + i);
+        nverts += (uint32_t)(g.pos.size() / 3);
+        nmeshes++;
     }
+
+    /* Each prop's model once (as its skin has it), drawn where each stands */
+    std::map<std::string, std::vector<const BspProp*>> kinds;
+    for (const BspProp& p : b.props) kinds[p.model + "#" + std::to_string(p.skin)].push_back(&p);
+    size_t prop_tris = 0;
+    int missing = 0;
+    for (auto& kv : kinds) {
+        const BspProp& first = *kv.second[0];
+        Mdl m;
+        MdlPick pick;
+        pick.skin = first.skin;
+        if (!mdl_load(vfs, first.model, m, nullptr, pick)) { missing++; continue; }
+        uint32_t first_mesh = nmeshes;
+        for (const MdlVertex& v : m.vertices) {
+            float p[3], n[3];
+            to_gl(v.pos, p, INCH);
+            to_gl(v.normal, n, 1.0f);
+            for (float x : p) putf(verts, x);
+            for (float x : n) putf(verts, x);
+            putf(verts, v.u);
+            putf(verts, v.v);
+            put32(verts, 0xffffffff);
+        }
+        size_t tris = 0;
+        for (const MdlMesh& me : m.meshes) {
+            uint32_t mi = material(me.material < (int)m.materials.size() ? m.materials[me.material] : "", false);
+            put32(meshes, mi);
+            put32(meshes, (uint32_t)me.indices.size());
+            for (uint32_t i : me.indices) put32(meshes, nverts + i);
+            nmeshes++;
+            tris += me.indices.size() / 3;
+        }
+        nverts += (uint32_t)m.vertices.size();
+        put32(parts, first_mesh);
+        put32(parts, nmeshes - first_mesh);
+        put32(parts, (uint32_t)kv.second.size());
+        for (const BspProp* p : kv.second) {
+            for (float x : p->pos) putf(parts, x);
+            for (float x : p->rot) putf(parts, x);
+        }
+        nparts++;
+        prop_tris += tris * kv.second.size();
+    }
+
     std::map<std::string, int> props;
     for (const BspProp& p : b.props) props[p.model]++;
     for (auto& kv : props) printf("prop\t%s\t%d\n", kv.first.c_str(), kv.second);
+    printf("proptris\t%zu\t%d\n", prop_tris, missing);
     if (b.has_spawn) printf("spawn\t%g\t%g\t%g\n", b.spawn[0], b.spawn[1], b.spawn[2]);
     printf("skybox\t%d\t%d\n", b.sky_faces, b.sky_props);
     if (!preview.empty()) {
+        std::vector<uint8_t> out = { 'G', 'M', 'P', 'V', 3, 0, 0, 0 };
+        put32(out, nmats);
+        out.insert(out.end(), mats.begin(), mats.end());
+        put32(out, nverts);
+        out.insert(out.end(), verts.begin(), verts.end());
+        put32(out, nmeshes);
+        out.insert(out.end(), meshes.begin(), meshes.end());
+        put32(out, nparts);
+        out.insert(out.end(), parts.begin(), parts.end());
         FILE* f = fopen(preview.c_str(), "wb");
         if (!f || fwrite(out.data(), 1, out.size(), f) != out.size()) { if (f) fclose(f); fprintf(stderr, "cannot write %s\n", preview.c_str()); return false; }
         fclose(f);
@@ -633,6 +699,7 @@ static void usage(const char* self) {
 int main(int argc, char** argv) {
     std::string gmod, model, out, list, preview, assets, name, player;
     float player_scale = 1.0f;
+    bool games = true;
     bool do_list = false, list_anims = false, workshop = true, do_info = false, tex_set = false, props = true;
     Options opt;
     for (int i = 1; i < argc; i++) {
@@ -645,6 +712,7 @@ int main(int argc, char** argv) {
         else if (a == "--assets" && i + 1 < argc) assets = argv[++i];
         else if (a == "--name" && i + 1 < argc) name = argv[++i];
         else if (a == "--no-props") props = false;
+        else if (a == "--no-games") games = false;
         else if (a == "--simplify" && i + 1 < argc) opt.simplify = (float)atof(argv[++i]);
         else if (a == "--player" && i + 1 < argc) player = argv[++i];
         else if (a == "--player-scale" && i + 1 < argc) player_scale = (float)atof(argv[++i]);
@@ -667,6 +735,7 @@ int main(int argc, char** argv) {
     if (gmod.empty()) { fprintf(stderr, "Garry's Mod not found: --gmod <GarrysMod folder>\n"); return 1; }
     Vfs vfs;
     if (!vfs.mount_gmod(gmod, workshop)) { fprintf(stderr, "Not a Garry's Mod folder: %s\n", gmod.c_str()); return 1; }
+    if (games) vfs.mount_games(gmod + "/..");
 
     if (do_list) {
         std::string l = Vfs::norm(list);
