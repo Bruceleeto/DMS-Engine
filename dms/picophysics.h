@@ -732,6 +732,7 @@ void pp_body_limit_angular_velocity(PPBody *body, float speed);
 #endif
 
 #ifdef PICOPHYSICS_IMPLEMENTATION
+#include "dc_profile.h"
 
 #ifndef PICOPHYSICS_MAX_OBJECTS
 #define PICOPHYSICS_MAX_OBJECTS 32
@@ -4945,7 +4946,17 @@ static void pp_update_sleeping(const PPCollision *manifolds, int manifold_count,
     }
 }
 
+static void pp_physics_step_(float t, int vel_iterations, int pos_iterations);
+
+/* Timed by the engine's profiler */
 void pp_physics_step(float t, int vel_iterations, int pos_iterations)
+{
+    int zone = dc_zone_enter(DC_ZONE_PHYSICS);
+    pp_physics_step_(t, vel_iterations, pos_iterations);
+    dc_zone_leave(zone);
+}
+
+static void pp_physics_step_(float t, int vel_iterations, int pos_iterations)
 {
     int manifold_count = 0;
     static PPCollision manifolds[PICOPHYSICS_MAX_MANIFOLDS];

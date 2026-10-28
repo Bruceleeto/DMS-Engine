@@ -8,7 +8,6 @@
 #include "dms/dc_model.h"
 #include "dms/dc_draw.h"
 #include "dms/dc_draw2d.h"
-#include "dms/dc_debug.h"
 #include "dms/dc_corona.h"
 #include "dms/dc_scene.h"
 
@@ -100,7 +99,6 @@ static bool check_exit(void) {
 int main(int argc, char* argv[]) {
     dc_init((DCInitParams){ .vram_size = 2240 * 1024 });
     dc_draw2d_init();
-    dc_debug_init();
 
     /* Not baked, so the scene's sun gives it shape and the paint its
      * highlight. The siren does not light the car: a point light is worked
@@ -211,7 +209,6 @@ int main(int argc, char* argv[]) {
         dc_scene_draw(scene);
         if (has_siren) siren(siren_l, siren_r, siren_size);
 
-        dc_debug_stats();
         dc_frame_end();
     }
 

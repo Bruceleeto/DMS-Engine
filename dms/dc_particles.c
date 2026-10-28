@@ -361,6 +361,12 @@ static void particles_draw_cb(void* user) {
     if (in_batch) dc_model_submit_quads(batch, in_batch, dr);
 }
 
+static void particles_timed_cb(void* user) {
+    int zone = dc_zone_enter(DC_ZONE_PARTICLES);
+    particles_draw_cb(user);
+    dc_zone_leave(zone);
+}
+
 void dc_particles_draw(DCParticles* s) {
     if (!s) return;
 
@@ -368,7 +374,9 @@ void dc_particles_draw(DCParticles* s) {
     uint32_t frame = dc_frame_count();
     if (s->stepped != frame) {
         s->stepped = frame;
+        int zone = dc_zone_enter(DC_ZONE_PARTICLES);
         step(s, dc_delta_time());
+        dc_zone_leave(zone);
     }
     if (!s->live) return;
 
@@ -377,5 +385,5 @@ void dc_particles_draw(DCParticles* s) {
     if (dc_frustum_cull_sphere(cam, s->mid, s->radius) < 0) return;
     s->cam = cam;
 
-    dc_draw_call(PVR_LIST_TR_POLY, particles_draw_cb, s);
+    dc_draw_call(PVR_LIST_TR_POLY, particles_timed_cb, s);
 }

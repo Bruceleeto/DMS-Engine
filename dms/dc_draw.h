@@ -16,7 +16,6 @@
  *     dc_set_camera(&camera);
  *     dc_draw(world, origin);
  *     dc_draw_ex(crate, &(DCDrawOpts){ .pos = pos, .rot = rot });
- *     dc_debug_stats();
  *     dc_frame_end();
  *
  * Things draw in the order they were queued. The dc_model_draw_list* calls

@@ -51,7 +51,6 @@ static uint32_t seed, rng;
 static float ship_x, ship_y, distance, cooldown, hurt;
 static float velocity_x, velocity_y, bank, pitch, camera_x, camera_y;
 static float flight_speed, camera_back;
-static uint32_t polygons_drawn;
 static int score, shield;
 static bool bloom_enabled = true;
 static const DCBloom city_bloom = { .strength = 0.40f, .spread = 1.1f, .size = 128 };
@@ -308,17 +307,12 @@ static void draw(void) {
     }
 
     char text[96];
-    dc_draw_rect(16, 12, 306, 77, 0x9007111F);
-    dc_draw_rect(16, 12, 3, 77, 0xFF52BDCC);
-    dc_draw_rect(508, 12, 116, 32, 0x9007111F);
-    snprintf(text, sizeof(text), "FPS %.1f", dc_fps());
-    dc_draw_text(text, (int)SCR_W - 24 - dc_text_width(text, 20), 20, 20, DC_COLOR_WHITE);
+    dc_draw_rect(16, 12, 306, 55, 0x9007111F);
+    dc_draw_rect(16, 12, 3, 55, 0xFF52BDCC);
     snprintf(text, sizeof(text), "SCORE %06d   DIST %dm", score, (int)distance);
     dc_draw_text(text, 24, 20, 20, DC_COLOR_WHITE);
     snprintf(text, sizeof(text), "NIGHT RUN  /  SECTOR %02d", 1+(int)distance/500);
     dc_draw_text(text, 24, 45, 14, 0xFF7EA4BA);
-    snprintf(text, sizeof(text), "POLYS %lu", (unsigned long)polygons_drawn);
-    dc_draw_text(text, 24, 68, 16, DC_COLOR_WHITE);
     dc_draw_rect(16, 386, 180, 58, 0xB007111F);
     dc_draw_text("SHIELD", 24, 394, 14, 0xFF7EA4BA);
     for (int i = 0; i < 5; ++i)
@@ -394,8 +388,6 @@ int main(int argc, char** argv) {
         update(input, fminf(dc_delta_time(), 1.0f / 30.0f));
         draw();
         dc_frame_end();
-        /* Queue has now rendered: display this count on the next frame. */
-        polygons_drawn = dc_model_get_stats()->tris_drawn;
     }
     dc_model_free(cube);
     dc_set_bloom(NULL);

@@ -302,19 +302,8 @@ typedef struct {
     uint32_t verts_clipped;
     uint32_t tris_drawn;
     uint32_t meshes_vtxfull;   /* skipped: PVR vertex buffer nearly full */
-    /* Profiling: nanoseconds spent, and vertices sent, in each kind of draw */
-    uint64_t ns_lit, ns_plain, ns_clip, ns_reflect, ns_env;
-    uint32_t verts_lit, verts_plain, verts_reflect, verts_env;
-    uint64_t stall_lit, stall_env, stall_reflect;   /* cycles frozen on data cache misses */
-    uint64_t ns_lights, stall_lights;   /* several lights over a packed mesh: the loop alone */
-    uint32_t verts_lights;
-    uint64_t ns_skin;          /* skinned meshes: skin + submit */
     uint32_t verts_skin, skin_bone_loads;   /* bone_loads: skin matrix changes */
-    uint64_t ns_cull, ns_hdr;  /* static meshes: sphere tests; header + matrix reload */
     uint32_t hdrs_sent;
-    /* The sun loop over packed meshes: [0] no highlight, [1] highlight, [2] env image */
-    uint64_t ns_sun[3];
-    uint32_t verts_sun[3], sun_power_v;   /* power_v: highlight power x vertices */
 } DCModelStats;
 
 /* Reset counters to zero. */

@@ -9,7 +9,6 @@
 #include "dms/dc_draw.h"
 #include "dms/dc_player.h"
 #include "dms/dc_draw2d.h"
-#include "dms/dc_debug.h"
 #include "dms/collision.h"
 #include "dms/dc_scene.h"
 
@@ -48,7 +47,6 @@ int main(int argc, char* argv[]) {
      * keeps two, so a small one leaves the VRAM for textures and the TV */
     dc_init((DCInitParams){ .vram_size = 512 * 1024 });
     dc_draw2d_init();
-    dc_debug_init();
 
     dc_player_init(&player);
     player.cam_mode = DC_CAM_FPS;
@@ -125,7 +123,6 @@ int main(int argc, char* argv[]) {
         dc_set_target(NULL);
         dc_set_camera(&camera);
         dc_scene_draw(scene);
-        dc_debug_stats();
         dc_frame_end();
     }
 

@@ -8,7 +8,6 @@
 #include "dms/dc_model.h"
 #include "dms/dc_draw.h"
 #include "dms/dc_draw2d.h"
-#include "dms/dc_debug.h"
 #include "dms/dc_audio.h"
 #include "dms/dc_scene.h"
 
@@ -44,7 +43,6 @@ static bool check_exit(void) {
 int main(int argc, char* argv[]) {
     dc_init((DCInitParams){ .vram_size = 1024 * 1024 });
     dc_draw2d_init();
-    dc_debug_init();
 
     scene = dc_scene_play(ASSETS, "scenes/main.json");
     if (!scene) return 1;
@@ -82,7 +80,6 @@ int main(int argc, char* argv[]) {
         dc_set_camera(&camera);
         dc_scene_draw(scene);
 
-        dc_debug_stats();
         dc_frame_end();
     }
 

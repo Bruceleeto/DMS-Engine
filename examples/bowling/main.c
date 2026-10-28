@@ -10,7 +10,6 @@
 #include "dms/dc_draw.h"
 #include "dms/dc_player.h"
 #include "dms/dc_draw2d.h"
-#include "dms/dc_debug.h"
 #include "dms/collision.h"
 #include "dms/dc_scene.h"
 
@@ -235,7 +234,6 @@ int main(int argc, char* argv[]) {
     /* Vertex buffer is double-buffered by KOS, so this costs 2x in VRAM */
     dc_init((DCInitParams){ .vram_size = 2300 * 1024 });
     dc_draw2d_init();
-    dc_debug_init();
 
     dc_player_init(&player);
     player.cam_mode = DC_CAM_NOCLIP;
@@ -289,7 +287,6 @@ int main(int argc, char* argv[]) {
         dc_set_camera(&camera);
         dc_scene_draw(scene);
         balls_draw();
-        dc_debug_stats();
         dc_frame_end();
     }
 

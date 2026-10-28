@@ -1506,13 +1506,8 @@ static void render_fast_sun_packed(const DMSMesh* mesh, int power, bool env) {
     loop_consts(&k[19]);
     /* The loop takes z as it is; the unpacked ones negate it going in */
     shz_xmtrx_scale_3x3(1.0f, 1.0f, -1.0f);
-    uint64_t t0 = perf_cntr_timer_ns();
     pvr_dr_addr = sun_c((const DMSPacked*)mesh->vertices, (int)mesh->vertex_count, k,
                         pvr_dr_addr, power, env);
-    int b = env ? 2 : power ? 1 : 0;
-    g_stats.ns_sun[b] += perf_cntr_timer_ns() - t0;
-    g_stats.verts_sun[b] += mesh->vertex_count;
-    g_stats.sun_power_v += power * mesh->vertex_count;
 }
 
 /* Debug: the sun loop's parts, each over all the model's packed meshes into
@@ -2023,9 +2018,9 @@ static int draw_skinned_mesh(DMSMesh* mesh, DMSModel* model,
 
     g_stats.verts_xformed += mesh->vertex_count;
     uv_scroll_set(mesh);
-    uint64_t t0 = perf_cntr_timer_ns();
+    int zone = dc_zone_enter(DC_ZONE_SKIN);
     render_skinned(mesh->vertices, mesh->vertex_count, model->skeleton, &mvp, dr);
-    g_stats.ns_skin += perf_cntr_timer_ns() - t0;
+    dc_zone_leave(zone);
     g_stats.verts_skin += mesh->vertex_count;
     return 1;
 }
@@ -2170,7 +2165,7 @@ static void draw_blocks_list(DMSModel* model, shz_vec3_t pos, float scale,
                 shz_xmtrx_load_4x4((shz_mat4x4_t*)&fr->side_planes);
                 xm = XM_PLANES;
             }
-            uint64_t tc0 = perf_cntr_timer_ns();
+            int zone = dc_zone_enter(DC_ZONE_CULL);
             for (; m < run_end && n < DRAW_BATCH; m++) {
                 const DMSMesh* mesh = &model->meshes[m];
                 if (mesh->material_flags & skip) continue;
@@ -2188,7 +2183,7 @@ static void draw_blocks_list(DMSModel* model, shz_vec3_t pos, float scale,
                 batch[n++] = m | (clip ? 0x80000000u : 0);
             }
 
-            g_stats.ns_cull += perf_cntr_timer_ns() - tc0;
+            dc_zone_leave(zone);
 
             /* Draw the survivors */
             for (int i = 0; i < n; i++) {
@@ -2211,26 +2206,17 @@ static void draw_blocks_list(DMSModel* model, shz_vec3_t pos, float scale,
                 lights_at(mesh->bound_cx, mesh->bound_cy, mesh->bound_cz);
                 uv_scroll_set(mesh);
                 bool clipped = (batch[i] & 0x80000000u) != 0;
-                uint64_t t0 = perf_cntr_timer_ns();
                 if (!clipped && intensity_ok(mesh)) {
-                    uint64_t c0 = perf_cntr_count(PRFC1);
+                    zone = dc_zone_enter(env_single(mesh) ? DC_ZONE_ENV : DC_ZONE_LIT);
                     render_fast_intensity(dr, mesh, &mvp);   /* sends its own header, */
-                    if (env_single(mesh)) {
-                        g_stats.ns_env += perf_cntr_timer_ns() - t0;
-                        g_stats.stall_env += perf_cntr_count(PRFC1) - c0;
-                        g_stats.verts_env += mesh->vertex_count;
-                    } else {
-                        g_stats.ns_lit += perf_cntr_timer_ns() - t0;
-                        g_stats.stall_lit += perf_cntr_count(PRFC1) - c0;
-                        g_stats.verts_lit += mesh->vertex_count;
-                    }
+                    dc_zone_leave(zone);
                     last_hdr = NULL;                         /* so the next mesh does too */
                     xm = XM_MVP;
                     g_stats.verts_xformed += mesh->vertex_count;
                     continue;
                 }
 
-                uint64_t th0 = perf_cntr_timer_ns();
+                zone = dc_zone_enter(DC_ZONE_HEADERS);
                 if (!last_hdr || memcmp(last_hdr, &mesh->header, sizeof(pvr_poly_hdr_t))) {
                     send_header(dr, mesh);
                     last_hdr = &mesh->header;
@@ -2242,34 +2228,26 @@ static void draw_blocks_list(DMSModel* model, shz_vec3_t pos, float scale,
                     shz_xmtrx_load_4x4(&mvp);
                     xm = XM_MVP;
                 }
-                g_stats.ns_hdr += perf_cntr_timer_ns() - th0;
                 int shaded = g_lit || g_rim_on || g_tint_on;
                 if (clipped) {
+                    dc_zone_enter(DC_ZONE_CLIP);
                     g_stats.verts_clipped += mesh->vertex_count;
                     render_clipped(mesh_verts(mesh), mesh->vertex_count, dr, shaded);
-                    g_stats.ns_clip += perf_cntr_timer_ns() - t0;
                 } else {
+                    dc_zone_enter(DC_ZONE_MESH);
                     g_stats.verts_xformed += mesh->vertex_count;
                     if (g_flat)      render_fast_flat(mesh_verts(mesh), mesh->vertex_count, dr);
                     else if (g_lit && mesh->packed && !g_rim_on && !g_tint_on) {
-                        uint64_t t1 = perf_cntr_timer_ns();
-                        uint64_t c1 = perf_cntr_count(PRFC1);
+                        dc_zone_enter(DC_ZONE_LIGHTS);
                         if (render_packed_lights(dr, mesh, &mvp))
                             last_hdr = NULL;   /* sent its own: the next mesh sends again */
-                        uint64_t dt = perf_cntr_timer_ns() - t1;
-                        g_stats.ns_lights += dt;
-                        g_stats.stall_lights += perf_cntr_count(PRFC1) - c1;
-                        g_stats.verts_lights += mesh->vertex_count;
-                        g_stats.ns_plain -= dt;          /* plain keeps the rest: header, setup */
-                        g_stats.verts_plain -= mesh->vertex_count;
                         xm = XM_OTHER;   /* the lights are in the matrix now */
                     }
                     else if (shaded) (g_uv_on ? render_fast_lit_uv : render_fast_lit)(mesh_verts(mesh), mesh->vertex_count, dr);
                     else if (mesh->packed) render_fast_packed(mesh);
                     else             (g_uv_on ? render_fast_uv : render_fast)(mesh_verts(mesh), mesh->vertex_count, dr);
-                    g_stats.ns_plain += perf_cntr_timer_ns() - t0;
-                    g_stats.verts_plain += mesh->vertex_count;
                 }
+                dc_zone_leave(zone);
             }
         }
     }
@@ -2310,12 +2288,12 @@ void dc_model_draw_list_rotated(DMSModel* model, shz_vec3_t pos, float scale,
     else {
         draw_blocks_list(model, pos, scale, yaw, NULL, cam, target_list);
         if (!g_add) {
-            uint64_t t0 = perf_cntr_timer_ns(), c0 = perf_cntr_count(PRFC1);
+            int zone = dc_zone_enter(DC_ZONE_REFLECT);
             draw_reflections(model, pos, scale, yaw, NULL, cam, target_list);
-            g_stats.ns_reflect += perf_cntr_timer_ns() - t0;
-            g_stats.stall_reflect += perf_cntr_count(PRFC1) - c0;
+            dc_zone_enter(DC_ZONE_CEL);
+            draw_cel(model, pos, scale, yaw, NULL, cam, target_list);
+            dc_zone_leave(zone);
         }
-        if (!g_add) draw_cel(model, pos, scale, yaw, NULL, cam, target_list);
     }
 }
 
@@ -2337,12 +2315,12 @@ void dc_model_draw_list_oriented(DMSModel* model, shz_vec3_t pos, float scale,
 
     draw_blocks_list(model, pos, scale, 0.0f, rot, cam, target_list);
     if (!g_add) {
-        uint64_t t0 = perf_cntr_timer_ns(), c0 = perf_cntr_count(PRFC1);
+        int zone = dc_zone_enter(DC_ZONE_REFLECT);
         draw_reflections(model, pos, scale, 0.0f, rot, cam, target_list);
-        g_stats.ns_reflect += perf_cntr_timer_ns() - t0;
-        g_stats.stall_reflect += perf_cntr_count(PRFC1) - c0;
+        dc_zone_enter(DC_ZONE_CEL);
+        draw_cel(model, pos, scale, 0.0f, rot, cam, target_list);
+        dc_zone_leave(zone);
     }
-    if (!g_add) draw_cel(model, pos, scale, 0.0f, rot, cam, target_list);
 }
 
 void dc_model_draw_list(DMSModel* model, shz_vec3_t pos, float scale,
@@ -2705,7 +2683,6 @@ static void draw_reflections(DMSModel* model, shz_vec3_t pos, float scale, float
             dc_send_hdr(dr, hdrs[p]);
             shz_xmtrx_load_4x4(&mvp);
             g_stats.tris_drawn += mesh->tri_count;
-            g_stats.verts_reflect += mesh->vertex_count;
             if (clip) {
                 g_stats.verts_clipped += mesh->vertex_count;
                 render_clipped(vtx[p], mesh->vertex_count, dr, 0);
@@ -2930,10 +2907,10 @@ static void update_bounds_from_skeleton(DMSModel* model) {
 void dc_model_animate(DMSModel* model, float dt) {
     if (!model || !model->skeleton) return;
 
-    dc_prof_begin(DC_PROF_ANIM);
+    int zone = dc_zone_enter(DC_ZONE_ANIM);
     update_skeleton(model->skeleton, dt);
     update_bounds_from_skeleton(model);
-    dc_prof_end(DC_PROF_ANIM);
+    dc_zone_leave(zone);
 }
 
 void dc_model_set_anim(DMSModel* model, int anim_index) {

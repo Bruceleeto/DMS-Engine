@@ -8,7 +8,6 @@
 #include "dms/dc_model.h"
 #include "dms/dc_draw.h"
 #include "dms/dc_draw2d.h"
-#include "dms/dc_debug.h"
 #include "dms/dc_scene.h"
 
 /* Where assets are read from: /pc/ over dcload; on a disc the engine finds them at /cd/ */
@@ -119,7 +118,6 @@ int main(int argc, char* argv[]) {
      * keeps two, so a small one leaves the VRAM for the trail */
     dc_init((DCInitParams){ .vram_size = 512 * 1024 });
     dc_draw2d_init();
-    dc_debug_init();
 
     scene = dc_scene_play(ASSETS, "scenes/main.json");
     if (!scene) return 1;
@@ -183,7 +181,6 @@ int main(int argc, char* argv[]) {
         dc_scene_draw(scene);
         shots_draw();
         dc_draw_target_ex(trail, &(DCTargetOpts){ .add = true });
-        dc_debug_stats();
         dc_frame_end();
     }
 

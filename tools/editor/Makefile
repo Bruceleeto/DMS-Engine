@@ -27,7 +27,7 @@ include $(GPU_PVR_DIR)/gpu_pvr.mk
 HEAP_START ?= 0x8c200000
 KOS_BYTES ?= 105472
 
-ENGINE := dc_engine dc_input dc_camera dc_model dc_player dc_draw2d dc_draw dc_debug collision dc_scene
+ENGINE := dc_engine dc_input dc_camera dc_model dc_player dc_draw2d dc_draw dc_debug dc_profile collision dc_scene
 SHZ_SRC := shz_version sw/shz_complex_sw sw/shz_matrix_sw sw/shz_xmtrx_sw
 
 CPPFLAGS := -DDMS_HOST -DDMS_ROOT_DIR='"$(ROOT)"' -I$(HOST)/include -I$(ROOT) -I$(ROOT)/dms -I$(HOST) -I$(SHZ)/include $(GPU_PVR_CFLAGS) $(SDL_CFLAGS)

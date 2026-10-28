@@ -30,17 +30,11 @@ int main(int argc, char* argv[]) {
         scene_start(SCENE_SPLASH);
     }
 
-    float since = 0.0f;   /* TEMP: fps to the console every 5 s */
     for (;;) {
         dc_frame_begin();
         scene_update(dc_delta_time());
         scene_draw();
         dc_frame_end();
-        since += dc_delta_time();
-        if (since >= 5.0f) {
-            since = 0.0f;
-            printf("fps %.1f  frame %.2f ms\n", dc_fps(), dc_frame_stats()->frame_ms);
-        }
     }
     return 0;
 }

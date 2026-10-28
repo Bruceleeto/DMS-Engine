@@ -88,7 +88,7 @@ static void build_frustum(DCCamera* cam, float fov_rad, float aspect) {
 }
 
 void dc_camera_update(DCCamera* cam) {
-    dc_prof_begin(DC_PROF_CAM);
+    int zone = dc_zone_enter(DC_ZONE_CAMERA);
     float fov_rad = SHZ_DEG_TO_RAD(cam->fov);
     float vw = cam->view.w > 0.0f ? cam->view.w : SCR_W;
     float vh = cam->view.h > 0.0f ? cam->view.h : SCR_H;
@@ -122,7 +122,7 @@ void dc_camera_update(DCCamera* cam) {
 
     /* Build world-space frustum planes */
     build_frustum(cam, fov_rad, aspect);
-    dc_prof_end(DC_PROF_CAM);
+    dc_zone_leave(zone);
 }
 
 /* ================================================================

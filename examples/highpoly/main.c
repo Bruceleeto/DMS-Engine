@@ -9,7 +9,6 @@
 #include "dms/dc_draw.h"
 #include "dms/dc_player.h"
 #include "dms/dc_draw2d.h"
-#include "dms/dc_debug.h"
 #include "dms/collision.h"
 #include "dms/dc_scene.h"
 
@@ -40,7 +39,6 @@ int main(int argc, char* argv[]) {
     /* Vertex buffer is double-buffered by KOS, so this costs 2x in VRAM */
     dc_init((DCInitParams){ .vram_size = 2300 * 1024 });
     dc_draw2d_init();
-    dc_debug_init();
 
     scene = dc_scene_play(ASSETS, "scenes/main.json");
     if (!scene) return 1;
@@ -79,7 +77,6 @@ int main(int argc, char* argv[]) {
         /* ---- Rendering ---- */
         dc_set_camera(&camera);
         dc_scene_draw(scene);
-        dc_debug_stats();
         dc_frame_end();
     }
 

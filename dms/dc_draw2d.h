@@ -36,6 +36,13 @@ void dc_draw_rect(float x, float y, float w, float h, uint32_t argb);
 /* Engine use: draws the queued text and images. Called by dc_draw_flush(). */
 void dc_draw2d_flush(void);
 
+/* Engine use (the profiler): straight into the open translucent list, over
+ * what the queue drew. A header first, then any number of what it is for. */
+void dc_draw2d_now_rects(void);
+void dc_draw2d_now_rect(float x0, float y0, float x1, float y1, float z, uint32_t argb);
+void dc_draw2d_now_font(void);
+void dc_draw2d_now_text(const char* text, float x, float y, int size, uint32_t argb, float z);
+
 /* ---- Images ---- */
 
 typedef struct DCImage DCImage;

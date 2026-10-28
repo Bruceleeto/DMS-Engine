@@ -345,6 +345,12 @@ static void coronas_draw_cb(void* user) {
 
 /* At frame end (dc_draw_flush), whether or not any were asked for this
  * frame: the ones that weren't still have to fade out */
+static void coronas_timed_cb(void* user) {
+    int zone = dc_zone_enter(DC_ZONE_CORONAS);
+    coronas_draw_cb(user);
+    dc_zone_leave(zone);
+}
+
 void dc_corona_flush(void) {
     uint32_t frame = dc_frame_count();
     if (g_stepped == frame) return;
@@ -362,7 +368,7 @@ void dc_corona_flush(void) {
     dc_set_target(NULL);
     for (int i = 0; i < n; i++) {
         dc_set_camera(cams[i]);
-        dc_draw_call(PVR_LIST_TR_POLY, coronas_draw_cb, (void*)cams[i]);
+        dc_draw_call(PVR_LIST_TR_POLY, coronas_timed_cb, (void*)cams[i]);
     }
     dc_set_camera(now);
 }

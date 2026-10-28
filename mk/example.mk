@@ -32,7 +32,7 @@ DMS_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))..)
 NAME ?= $(notdir $(CURDIR))
 SRCS ?= main.c
 BAKE ?= 0
-ENGINE ?= dc_engine dc_input dc_camera dc_model dc_player dc_draw2d dc_draw dc_debug collision dc_scene
+ENGINE ?= dc_engine dc_input dc_camera dc_model dc_player dc_draw2d dc_draw dc_debug dc_profile collision dc_scene
 ENGINE += $(ENGINE_EXTRA)
 
 # Converted assets go to pc/, read over dcload at /pc or from the disc at /cd.

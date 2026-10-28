@@ -7,7 +7,6 @@
 #include "dms/dc_model.h"
 #include "dms/dc_draw.h"
 #include "dms/dc_draw2d.h"
-#include "dms/dc_debug.h"
 #include "dms/dc_scene.h"
 
 /* Where assets are read from: /pc/ over dcload; on a disc the engine finds them at /cd/ */
@@ -47,7 +46,6 @@ static bool check_exit(void) {
 int main(int argc, char* argv[]) {
     dc_init((DCInitParams){ .vram_size = 1024 * 1024 });
     dc_draw2d_init();
-    dc_debug_init();
 
     scene = dc_scene_play(ASSETS, "scenes/main.json");
     if (!scene) return 1;
@@ -119,7 +117,6 @@ int main(int argc, char* argv[]) {
         else    snprintf(line, sizeof(line), "bloom off");
         dc_draw_text(line, 16, 440, 16, DC_COLOR_WHITE);
 
-        dc_debug_stats();
         dc_frame_end();
     }
 

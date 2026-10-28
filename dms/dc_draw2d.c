@@ -11,7 +11,7 @@
 #include <string.h>
 
 void dc_draw2d_init(void) {
-    InitFont();
+    if (!fontLoaded) InitFont();
 }
 
 struct DCImage {
@@ -241,6 +241,27 @@ void dc_draw2d_flush(void) {
         }
     }
     queue_count = 0;
+}
+
+/* Straight into the open translucent list, for the profiler */
+void dc_draw2d_now_rects(void) {
+    rect_header(dc_dr_state());
+}
+
+void dc_draw2d_now_rect(float x0, float y0, float x1, float y1, float z, uint32_t argb) {
+    Entry e = { .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0, .argb = argb };
+    image_draw(dc_dr_state(), &e, z);
+}
+
+void dc_draw2d_now_font(void) {
+    if (!fontLoaded) InitFont();
+    font_header(dc_dr_state());
+    SetDrawingState(dc_dr_state());
+}
+
+void dc_draw2d_now_text(const char* text, float x, float y, int size, uint32_t argb, float z) {
+    Color c = { (argb >> 16) & 0xFF, (argb >> 8) & 0xFF, argb & 0xFF, (argb >> 24) & 0xFF };
+    DrawText(text, (int)x, (int)y, size, c, z);
 }
 
 /* Depth is 1/w. Just in front of the PVR's own background plane (0.0001 in

@@ -10,7 +10,7 @@ PROJECT ?= $(ROOT)/examples/teapot
 PROJECT := $(abspath $(PROJECT))
 NAME ?= $(notdir $(PROJECT))
 SRCS ?= main.c
-ENGINE ?= dc_engine dc_input dc_camera dc_model dc_player dc_draw2d dc_draw dc_debug collision dc_scene
+ENGINE ?= dc_engine dc_input dc_camera dc_model dc_player dc_draw2d dc_draw dc_debug dc_profile collision dc_scene
 # Shared by every project; each project's own objects go beside its DC build.
 SHARED := $(ROOT)/build/host
 OUT := $(ROOT)/build/$(NAME)/host
@@ -62,7 +62,7 @@ $(SHARED)/dms/%.o: $(ROOT)/dms/%.c
 $(SHARED)/sh4zam/%.o: $(SHZ)/source/%.c
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
-$(SHARED)/%.o: %.c
+$(SHARED)/%.o: $(CURDIR)/%.c
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 $(SHARED)/kos_%.o: $(GPU_PVR_DIR)/kos_%.c

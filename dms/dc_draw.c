@@ -773,17 +773,21 @@ static void flush_scene(const DCTarget* target) {
                  * the normal draw below leaves that mesh out. The glow pass
                  * wants none of it: a volume and a shadow both take light
                  * away rather than give it off. */
+                int zone = dc_zone_enter(DC_ZONE_VOLUME);
                 if (e->model->vol_shape && lists[l] == VOL_MOD_LIST) {
                     if (!e->glow)
                         dc_model_draw_volume(e->model, e->pos, e->scale, e->yaw, cam);
+                    dc_zone_leave(zone);
                     continue;
                 }
                 if (e->model->vol_on && lists[l] == VOL_POLY_LIST && !e->glow)
                     dc_model_draw_modified(e->model, e->pos, e->scale, e->yaw, cam);
+                dc_zone_enter(DC_ZONE_SHADOW);
                 if (e->has_shadow && lists[l] == PVR_LIST_TR_POLY)
                     dc_model_draw_shadow(e->model, e->pos, e->scale, e->yaw,
                                          e->has_rot ? e->rot : NULL, cam, e->shadow.light,
                                          e->shadow.sun, e->shadow.floor_y, e->shadow.dark);
+                dc_zone_leave(zone);
                 env_for(e->env, e->model);
                 if (e->add) dc_model_set_add(true);
                 if (e->tint) dc_model_set_tint(e->tint);
@@ -807,7 +811,10 @@ static void flush_scene(const DCTarget* target) {
         if (!target && lists[l] == PVR_LIST_TR_POLY) {
             dc_list_begin(PVR_LIST_TR_POLY);
             clip_for(NULL, NULL);               /* the 2D layer is over the whole screen */
+            int zone = dc_zone_enter(DC_ZONE_TEXT);
             dc_draw2d_flush();
+            dc_zone_leave(zone);
+            dc_profile_draw();                  /* over that */
         }
     }
 }
@@ -816,7 +823,9 @@ static void flush_scene(const DCTarget* target) {
 extern void dc_corona_flush(void) __attribute__((weak));
 
 void dc_draw_flush(void) {
+    int zone = dc_zone_enter(DC_ZONE_CORONAS);
     if (dc_corona_flush) dc_corona_flush();
+    dc_zone_leave(zone);
 
     /* Adds its own targets to the queue, so it goes before the loop below */
     bloom_queue();
