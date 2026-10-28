@@ -114,6 +114,8 @@ void view_focus_selection();
 void view_matrices(const DCCamera& cam, float view[16], float proj[16]);
 /* World point to the 640x480 frame; false if behind the camera */
 bool view_project(const DCCamera& cam, shz_vec3_t p, float* x, float* y);
+/* Where a window point over the scene view meets the ground; false if not over it */
+bool view_ground_at(float x, float y, shz_vec3_t* out);
 
 /* play.cpp: the game, built for Linux, running in the Game tab */
 enum class PlayState { Stopped, Building, Running, Paused };
@@ -129,8 +131,25 @@ bool play_has_keyboard();
 void game_window(void* renderer);
 void play_shutdown();
 
+/* import.cpp: a .glb (or .png) from anywhere into the project: copied under
+ * assets/, converted in the background, then a model put in the scene (at
+ * at, or in front of the view) */
+void ed_import_file(const std::string& path, const shz_vec3_t* at = nullptr);
+void ed_import_poll();                  /* each frame: starts the next conversion */
+std::vector<std::string> ed_library(); /* .glb in the other projects, from the repo root */
+
 /* panels.cpp */
 void panel_hierarchy();
 void panel_inspector();
 void panel_project();
 void panel_console();
+
+/* vram.cpp: the VRAM tab, and the toolbar's meter of it (scene, or the game's) */
+void panel_vram();
+void vram_meter(float width);
+
+/* model.cpp: the Model tab, a .glb (under assets/) on its own and how it converts */
+void model_window(void* renderer);
+void model_open(const std::string& src);
+void model_shutdown();
+bool model_busy();               /* converting a preview */

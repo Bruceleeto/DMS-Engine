@@ -45,6 +45,7 @@
 #include "libpvr/pvr.h"
 #include "libpvr/vram.h"
 #include "kos_pvr.h"
+#include "pvr_host.h"
 #include "kos/arch/arch.h" /* GPU_PVR_VRAM_MB */
 
 using R = pvr::RegisterName;
@@ -139,10 +140,48 @@ static inline void w32(uint32_t a, uint32_t v) { memcpy(vram + a, &v, 4); }
 static std::map<uint32_t, uint32_t> free_blocks;   /* addr -> size */
 static std::map<uint32_t, uint32_t> used_blocks;
 
+/* What each allocation is, for the editor's VRAM map (pvr_host_mem_tag) */
+struct BlockTag { char tag[64]; char fmt[24]; int w, h; };
+static std::map<uint32_t, BlockTag> block_tags;
+static BlockTag pending_tag;
+static bool pending_set;
+
+static void copy_tail(char *dst, size_t n, const char *src)
+{
+	size_t l = strlen(src);
+	/* a long path keeps its end: the file name is what tells them apart */
+	if (l >= n)
+		src += l - (n - 1);
+	snprintf(dst, n, "%s", src);
+}
+
+extern "C" void pvr_host_mem_tag(const char *tag)
+{
+	memset(&pending_tag, 0, sizeof pending_tag);
+	pending_set = tag != NULL;
+	if (!tag)
+		return;
+	/* an asset's path from the project's pc/ folder on */
+	for (const char *p = strstr(tag, "/pc/"); p; p = strstr(p + 1, "/pc/"))
+		tag = p + 4;
+	copy_tail(pending_tag.tag, sizeof pending_tag.tag, tag);
+}
+
+extern "C" void pvr_host_mem_tag_tex(const char *tag, int w, int h, const char *fmt)
+{
+	if (tag || !pending_set)
+		pvr_host_mem_tag(tag ? tag : "");
+	pending_set = true;
+	pending_tag.w = w;
+	pending_tag.h = h;
+	snprintf(pending_tag.fmt, sizeof pending_tag.fmt, "%s", fmt ? fmt : "");
+}
+
 static void heap_reset(void)
 {
 	free_blocks.clear();
 	used_blocks.clear();
+	block_tags.clear();
 	free_blocks[TEX_BASE] = VRAM_SIZE - TEX_BASE;
 }
 
@@ -157,9 +196,14 @@ extern "C" void *pvr_mem_malloc(size_t size)
 		if (rest)
 			free_blocks[addr + size] = rest;
 		used_blocks[addr] = size;
+		if (pending_set)
+			block_tags[addr] = pending_tag;
+		pending_set = false;
 		return vram + addr;
 	}
-	fprintf(stderr, "pvr_mem_malloc: out of VRAM (%zu bytes)\n", size);
+	fprintf(stderr, "pvr_mem_malloc: out of VRAM (%zu bytes)%s%s\n", size,
+		pending_set ? " for " : "", pending_set ? pending_tag.tag : "");
+	pending_set = false;
 	return NULL;
 }
 
@@ -175,6 +219,7 @@ extern "C" void pvr_mem_free(void *chunk)
 	}
 	uint32_t size = it->second;
 	used_blocks.erase(it);
+	block_tags.erase(addr);
 	/* coalesce with neighbours */
 	auto nx = free_blocks.lower_bound(addr);
 	if (nx != free_blocks.end() && nx->first == addr + size) {
@@ -200,6 +245,67 @@ extern "C" size_t pvr_mem_available(void)
 	size_t n = 0;
 	for (auto &b : free_blocks)
 		n += b.second;
+	return n;
+}
+
+/* The layout in the comment at the top, as blocks, then the heap */
+extern "C" int pvr_host_vram_map(pvr_host_vram_block *out, int max, uint32_t *total, uint32_t *used)
+{
+	int n = 0;
+	uint32_t at = 0;
+	auto put = [&](uint32_t end, int kind, const char *tag, const BlockTag *bt) {
+		if (end <= at)
+			return;
+		if (out && n < max) {
+			pvr_host_vram_block &b = out[n];
+			memset(&b, 0, sizeof b);
+			b.offset = at;
+			b.size = end - at;
+			b.kind = kind;
+			if (bt) {
+				memcpy(b.tag, bt->tag, sizeof b.tag);
+				memcpy(b.fmt, bt->fmt, sizeof b.fmt);
+				b.w = bt->w;
+				b.h = bt->h;
+			} else if (tag)
+				snprintf(b.tag, sizeof b.tag, "%s", tag);
+		}
+		n++;
+		at = end;
+	};
+	if (total)
+		*total = VRAM_SIZE;
+	if (used)
+		*used = VRAM_SIZE - (uint32_t)pvr_mem_available();
+	if (!hw)
+		return 0;
+	put(ol_limit + 64, PVR_VRAM_OPB, "object lists (OPBs, 3x overflow)", NULL);
+	put(L_REGION_BASE, PVR_VRAM_UNUSED, "padding", NULL);
+	put(L_REGION_BASE + L_REGION_BYTES, PVR_VRAM_REGION, "region array", NULL);
+	put(ISP_BASE, PVR_VRAM_UNUSED, "padding", NULL);
+	put(SET_END, PVR_VRAM_VERTEX, "vertex buffer (TA parameters)", NULL);
+	/* 64-bit image of the 32-bit [SET_END/2, SET_END) in both banks: nothing */
+	put(2 * SET_END, PVR_VRAM_UNUSED, "unused (under the frame buffers' interleave)", NULL);
+	put(TEX_BASE, PVR_VRAM_FRAME, "frame buffers x2 (640x480 RGB565)", NULL);
+	auto u = used_blocks.begin();
+	auto f = free_blocks.begin();
+	while (at < VRAM_SIZE) {
+		if (u != used_blocks.end() && u->first == at) {
+			auto t = block_tags.find(at);
+			BlockTag none = {};
+			put(at + u->second, PVR_VRAM_TEXTURE, NULL, t != block_tags.end() ? &t->second : &none);
+			++u;
+		} else if (f != free_blocks.end() && f->first == at) {
+			put(at + f->second, PVR_VRAM_FREE, NULL, NULL);
+			++f;
+		} else {
+			/* neither: should not happen; the gap to the next block known */
+			uint32_t next = VRAM_SIZE;
+			if (u != used_blocks.end() && u->first > at) next = u->first;
+			if (f != free_blocks.end() && f->first > at && f->first < next) next = f->first;
+			put(next, PVR_VRAM_UNUSED, "?", NULL);
+		}
+	}
 	return n;
 }
 

@@ -36,7 +36,7 @@ CXXFLAGS := $(ARCH_FLAGS) -std=gnu++17 -O2 -g -msse2 -mfpmath=sse -MMD -MP -D_St
             -I$(IMGUI) -I$(GIZMO)
 DCSIM := -include $(HOST)/dcsim/dcsim.h
 
-EDITOR_SRC := main view panels ui play
+EDITOR_SRC := main view panels ui play model import vram
 IMGUI_SRC := imgui imgui_draw imgui_tables imgui_widgets imgui_demo backends/imgui_impl_sdl3 backends/imgui_impl_sdlrenderer3
 
 OBJS := $(addprefix $(OUT)/,$(addsuffix .o,$(EDITOR_SRC))) \

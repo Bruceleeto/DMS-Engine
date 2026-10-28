@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "corona_default.h"
+#include "dc_vram_tag.h"
 
 /* ================================================================
  * Coronas
@@ -112,6 +113,8 @@ static bool flare_make(void) {
                 px[y * FLARE_SIZE + x] = grey565(f);
             }
 
+        DC_VRAM_TAG_TEX(t == 0 ? "corona flare (hexagon)" : t == 1 ? "corona flare (disc)" : "corona flare (ring)",
+                        FLARE_SIZE, FLARE_SIZE, "RGB565");
         pvr_ptr_t ptr = pvr_mem_malloc(sizeof px);
         if (!ptr) {
             printf("dc_corona: no VRAM for the flare, drawn without\n");
@@ -139,6 +142,7 @@ static bool tex_make(void) {
     g_tex_tried = true;
 
     const int n = CORONA_DEFAULT_SIZE;
+    DC_VRAM_TAG_TEX("corona (default)", n, n, "RGB565");
     g_tex.ptr = pvr_mem_malloc(n * n * 2);
     if (!g_tex.ptr) {
         printf("dc_corona: no VRAM for the picture\n");

@@ -189,6 +189,8 @@ typedef struct DMSModel {
     char       (*material_names)[32]; /* glTF material name of each mesh, or NULL */
     DMSEntity   *entities;          /* the Empties in the .glb */
     uint32_t     entity_count;
+    uint64_t     pal_slots;         /* the 16-colour slots of palette RAM its
+                                     * PAL4BPP / PAL8BPP textures hold */
     /* dc_model_volume(). Mesh or texture number plus one, so 0 is "not asked for" */
     void        *mod_headers;       /* the two-parameter header, built on first use */
     uint32_t     vol_shape;         /* the mesh that is the shape */

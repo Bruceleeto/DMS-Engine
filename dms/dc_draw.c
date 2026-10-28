@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <malloc.h>
+#include "dc_vram_tag.h"
 
 #define DRAW_QUEUE_MAX 256
 
@@ -127,6 +128,7 @@ static bool     g_env_default_tried;
 void dc_env_default_prepare(void) {
     if (g_env_default_tried) return;
     g_env_default_tried = true;
+    DC_VRAM_TAG("environment map (default)");
     g_env_default = dc_image_load_buffer(env_default_dt, sizeof(env_default_dt));
 }
 
@@ -291,6 +293,7 @@ DCTarget* dc_target_create(int width, int height) {
     t->width = width;
     t->height = height;
     for (int i = 0; i < 2; i++) {
+        DC_VRAM_TAG_TEX(i ? "render target (back)" : "render target (front)", width, height, "RGB565 rtt");
         t->txr[i] = pvr_mem_malloc(width * height * 2);
         if (!t->txr[i]) {
             /* Still a target, with no picture: what is drawn into it is

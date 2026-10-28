@@ -103,6 +103,8 @@ static int pvrtex_load_mem(const unsigned char *data, unsigned int len, dttex_in
     texinfo->height = fDtGetPvrHeight(&texinfo->hdr);
     texinfo->pvrformat = texinfo->hdr.pvr_type & 0xFFC00000;
 
+    DC_VRAM_TAG("font (built in)");
+    PVRTEX_HOST_TAG(texinfo);
     texinfo->ptr = pvr_mem_malloc(tdatasize);
     if (!texinfo->ptr) return 0;
 

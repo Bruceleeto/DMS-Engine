@@ -305,6 +305,7 @@ static float          g_cel_ramp_ambient = -1.0f;
 
 static bool cel_setup(int bands, float ambient) {
     if (!g_cel_tex) {
+        DC_VRAM_TAG_TEX("cel shading ramp", CEL_RAMP_W, CEL_RAMP_H, "RGB565");
         g_cel_tex = pvr_mem_malloc(CEL_RAMP_W * CEL_RAMP_H * 2);
         if (!g_cel_tex) return false;
 
@@ -712,6 +713,20 @@ static __attribute__((noinline)) void render_fast_lit_uv(const DMSVertex* src, i
 
 static bool g_add;   /* dc_model_set_add(), below */
 static const dttex_info_t* g_env;   /* dc_model_set_environment(), below */
+
+/* Palette RAM: 1024 ARGB8888 colours in 64 slots of 16. A PAL4BPP texture
+ * takes a slot, a PAL8BPP one 16 in a row on a 256 boundary (the PVR's
+ * banks); the bank goes in the texture's format word */
+static uint64_t g_pal_used;
+
+static int pal_alloc(int colours) {
+    int need = colours > 16 ? 16 : 1;
+    uint64_t mask = need == 16 ? 0xFFFFull : 1ull;
+    for (int s = 0; s < 64; s += need)
+        if (!(g_pal_used & (mask << s))) { g_pal_used |= mask << s; return s; }
+    return -1;
+}
+
 
 /* A vertex of the intensity mode: brightness in place of the colours */
 typedef struct __attribute__((aligned(32))) {
@@ -3151,6 +3166,32 @@ static int mf_seek(MemFile* f, long off, int whence) {
 static long mf_tell(MemFile* f) { return (long)f->pos; }
 static void mf_close(MemFile* f) { free(f->data); f->data = NULL; }
 
+/* "PALS": count, then each texture's id, colour count and colours */
+static void pal_load(DMSModel* model, MemFile* f, const char* filename) {
+    uint32_t count;
+    if (mf_read(&count, 4, 1, f) != 1) return;
+    pvr_set_pal_format(PVR_PAL_ARGB8888);
+    for (uint32_t p = 0; p < count; p++) {
+        uint32_t head[2];
+        if (mf_read(head, 4, 2, f) != 2 || head[1] > 256) return;
+        uint32_t colours[256];
+        if (mf_read(colours, 4, head[1], f) != head[1]) return;
+        int slot = pal_alloc((int)head[1]);
+        if (slot < 0) {
+            printf("DMS: %s: palette RAM is full, texture %lu draws wrong\n", filename, (unsigned long)head[0]);
+            continue;
+        }
+        int need = head[1] > 16 ? 16 : 1;
+        model->pal_slots |= (need == 16 ? 0xFFFFull : 1ull) << slot;
+        for (uint32_t i = 0; i < head[1]; i++) pvr_set_pal_entry(slot * 16 + i, colours[i]);
+        if (head[0] < (uint32_t)model->texture_count) {
+            dttex_info_t* t = &model->textures[head[0]];
+            t->pvrformat &= ~(0x3Fu << 21);
+            t->pvrformat |= need == 16 ? (uint32_t)(slot / 16) << 25 : (uint32_t)slot << 21;
+        }
+    }
+}
+
 DMSModel* dc_model_load(const char* filename) {
     MemFile mf;
     mf.data = dc_file_read(filename, &mf.size);
@@ -3379,6 +3420,11 @@ DMSModel* dc_model_load(const char* filename) {
             mf_seek(f, tex_table[i].offset, SEEK_SET);
             mf_read(buf, 1, tex_table[i].size, f);
 
+#ifdef DMS_HOST
+            char vram_tag[160];
+            snprintf(vram_tag, sizeof vram_tag, "%s #%lu", filename, (unsigned long)i);
+            DC_VRAM_TAG(vram_tag);
+#endif
             pvrtex_load_from_buffer(buf, tex_table[i].size, &model->textures[i]);
             if ((long)(tex_table[i].offset + tex_table[i].size) > tex_end)
                 tex_end = (long)(tex_table[i].offset + tex_table[i].size);
@@ -3417,6 +3463,7 @@ DMSModel* dc_model_load(const char* filename) {
                 model->entities = NULL;
             }
         }
+        if (mf_read(tag, 1, 4, f) == 4 && !memcmp(tag, "PALS", 4)) pal_load(model, f, filename);
     }
 
     /* Compile PVR headers using material_flags */
@@ -3689,6 +3736,7 @@ static pvr_poly_hdr_t g_shadow_flush_hdr __attribute__((aligned(32)));
 
 static bool shadow_setup(float dark) {
     if (!g_shadow_tex) {
+        DC_VRAM_TAG_TEX("shadow", SHADOW_TEX_SIZE, SHADOW_TEX_SIZE, "RGB565");
         g_shadow_tex = pvr_mem_malloc(SHADOW_TEX_SIZE * SHADOW_TEX_SIZE * 2);
         if (!g_shadow_tex) return false;
 
@@ -4345,6 +4393,7 @@ void dc_model_free(DMSModel* model) {
     free(model->runs);
     free(model->material_names);
     free(model->entities);
+    g_pal_used &= ~model->pal_slots;
 
     if (model->textures) {
         for (int i = 0; i < model->texture_count; i++)

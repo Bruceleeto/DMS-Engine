@@ -347,6 +347,7 @@ static bool blob_make(void) {
             a = a * a * (3.0f - 2.0f * a);
             pix[y * n + x] = (uint16_t)((uint32_t)(a * 15.0f + 0.5f) << 12);
         }
+    DC_VRAM_TAG_TEX("decal blob", n, n, "ARGB4444");
     blob.tex.ptr = pvr_mem_malloc(n * n * 2);
     if (!blob.tex.ptr) { free(pix); printf("dc_draw_decal: no VRAM for the blob\n"); return false; }
     pvr_txr_load(pix, blob.tex.ptr, n * n * 2);

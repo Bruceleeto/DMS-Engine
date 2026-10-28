@@ -10,6 +10,16 @@
 
 #define DMS_EMBED_MAGIC 0x444d5345u     /* "DMSE" */
 
+/* One block of the game's VRAM map (pvr_host_vram_block, compact) */
+#define DMS_EMBED_VRAM_MAX 256
+typedef struct DMSEmbedVram {
+    uint32_t offset, size;      /* 64-bit-path bytes */
+    uint16_t w, h;
+    uint8_t  kind, pad[3];      /* PVR_VRAM_* (pvr_host.h) */
+    char     fmt[16];
+    char     tag[32];           /* the end of a long path */
+} DMSEmbedVram;
+
 typedef struct DMSEmbed {
     uint32_t magic;
     volatile uint32_t frame;        /* frames shown, counting up */
@@ -22,6 +32,11 @@ typedef struct DMSEmbed {
     volatile uint32_t heap_used, heap_free;     /* the Dreamcast heap, bytes */
     volatile float    fps;
     uint8_t rgb[640 * 480 * 3];     /* the last frame, RGB24 rows */
+    /* VRAM (gpu_pvr's map, pvr_host_vram_map), a few times a second.
+     * vram_seq is odd while the game writes it. */
+    volatile uint32_t vram_seq;
+    volatile uint32_t vram_used, vram_total, vram_count;
+    DMSEmbedVram vram[DMS_EMBED_VRAM_MAX];
 } DMSEmbed;
 
 #endif

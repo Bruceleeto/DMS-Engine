@@ -373,10 +373,13 @@ void panel_inspector() {
  * Project: the folders on the left, their files as tiles
  * ================================================================ */
 
-enum EntryKind { ENTRY_MODEL, ENTRY_SCENE, ENTRY_TEXTURE, ENTRY_SOUND, ENTRY_SOURCE, ENTRY_CODE };
+enum EntryKind { ENTRY_MODEL, ENTRY_SCENE, ENTRY_TEXTURE, ENTRY_SOUND, ENTRY_SOURCE, ENTRY_CODE, ENTRY_LIBRARY };
 /* The game's code is a second tree beside assets/: its folders are "code:", "code:/src"... */
 #define CODE_ROOT "code:"
 static bool is_code(const std::string& dir) { return dir.compare(0, 5, CODE_ROOT) == 0; }
+/* The Library, the .glb of the other projects, a third: "lib:", "lib:/examples/vase"... */
+#define LIB_ROOT "lib:"
+static bool is_lib(const std::string& dir) { return dir.compare(0, 4, LIB_ROOT) == 0; }
 struct Entry { std::string name, rel; EntryKind kind; };
 static std::map<std::string, std::vector<Entry>> folders;   /* "" is the top */
 static int indexed_gen = -1;
@@ -410,6 +413,15 @@ static void index_assets() {
         folders[CODE_ROOT];
         folders[key].push_back({ c.substr(dir.empty() ? 0 : dir.size() + 1), c, ENTRY_CODE });
     }
+    /* examples/vase/assets/vase/vase.glb in lib:/examples/vase */
+    for (auto& g : ed_library()) {
+        size_t a = g.find('/'), b = a == std::string::npos ? a : g.find('/', a + 1);
+        if (b == std::string::npos) continue;
+        std::string key = LIB_ROOT "/" + g.substr(0, b);
+        folders[LIB_ROOT];
+        folders[LIB_ROOT "/" + g.substr(0, a)];
+        folders[key].push_back({ g.substr(g.find_last_of('/') + 1), g, ENTRY_LIBRARY });
+    }
     for (auto& f : folders)
         std::sort(f.second.begin(), f.second.end(), [](const Entry& a, const Entry& b) {
             return a.kind != b.kind ? a.kind < b.kind : a.name < b.name; });
@@ -420,7 +432,7 @@ static void index_assets() {
 static std::vector<std::string> subfolders(const std::string& dir) {
     std::vector<std::string> kids;
     for (auto& f : folders)
-        if (!f.first.empty() && f.first != dir && f.first != CODE_ROOT && parent_of(f.first) == dir) kids.push_back(f.first);
+        if (!f.first.empty() && f.first != dir && f.first != CODE_ROOT && f.first != LIB_ROOT && parent_of(f.first) == dir) kids.push_back(f.first);
     return kids;
 }
 
@@ -476,9 +488,10 @@ void panel_project() {
     static char filter[64];
 
     /* The bar: breadcrumbs, then search and the asset buttons */
-    bool in_code = is_code(cwd);
-    if (in_code ? ImGui::SmallButton(ICON_CODE " Code") : ImGui::SmallButton(ICON_FOLDER " Assets")) cwd = in_code ? CODE_ROOT : "";
-    for (size_t i = in_code ? sizeof(CODE_ROOT) : 0; i < cwd.size();) {
+    bool in_code = is_code(cwd), in_lib = is_lib(cwd);
+    if (in_lib ? ImGui::SmallButton(ICON_IMPORT " Library") : in_code ? ImGui::SmallButton(ICON_CODE " Code") : ImGui::SmallButton(ICON_FOLDER " Assets"))
+        cwd = in_lib ? LIB_ROOT : in_code ? CODE_ROOT : "";
+    for (size_t i = in_lib ? sizeof(LIB_ROOT) : in_code ? sizeof(CODE_ROOT) : 0; i < cwd.size();) {
         size_t j = cwd.find('/', i);
         if (j == std::string::npos) j = cwd.size();
         ImGui::SameLine(0, 4);
@@ -517,6 +530,13 @@ void panel_project() {
             if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) cwd = CODE_ROOT;
             if (copen) { folder_tree(CODE_ROOT); ImGui::TreePop(); }
         }
+        if (folders.count(LIB_ROOT)) {
+            bool lopen = ImGui::TreeNodeEx("##lib", ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_OpenOnArrow |
+                                           (cwd == LIB_ROOT ? ImGuiTreeNodeFlags_Selected : 0), ICON_IMPORT "  Library");
+            ui::tooltip("The .glb of the other examples and games: drag one into the scene to import it");
+            if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) cwd = LIB_ROOT;
+            if (lopen) { folder_tree(LIB_ROOT); ImGui::TreePop(); }
+        }
         ImGui::EndChild();
 
         ImGui::TableNextColumn();
@@ -532,12 +552,13 @@ void panel_project() {
                     cwd = d;
             }
         }
-        static const char* icons[] = { ICON_MODEL, ICON_SCENE, ICON_IMAGE, ICON_CONSOLE, ICON_PACKAGE, ICON_CODE };
+        static const char* icons[] = { ICON_MODEL, ICON_SCENE, ICON_IMAGE, ICON_CONSOLE, ICON_PACKAGE, ICON_CODE, ICON_MODEL };
         static const ImU32 cols[] = { IM_COL32(120, 170, 255, 255), IM_COL32(150, 180, 255, 255), IM_COL32(120, 210, 160, 255),
-                                      IM_COL32(220, 150, 240, 255), ui::WARN, IM_COL32(90, 200, 230, 255) };
-        static const char* tips[] = { "Drag into the scene, or double-click to add it", "Double-click to open",
-                                      "Texture (.dt)", "Sound (.dca)", "Not converted yet: press Convert assets",
-                                      "Double-click to open in VS Code" };
+                                      IM_COL32(220, 150, 240, 255), ui::WARN, IM_COL32(90, 200, 230, 255), IM_COL32(170, 150, 255, 255) };
+        static const char* tips[] = { "Drag into the scene, or double-click to add it\nRight-click: open in the Model tab", "Double-click to open",
+                                      "Texture (.dt)", "Sound (.dca)", "Not converted yet: press Convert assets\nDouble-click: open in the Model tab",
+                                      "Double-click to open in VS Code",
+                                      "Library: drag into the scene, or double-click, to copy it into this project and add it" };
         for (auto& f : folders) {
             if (*filter ? false : f.first != cwd) continue;
             for (const Entry& e : f.second) {
@@ -548,15 +569,29 @@ void panel_project() {
                 if (tile(e.rel.c_str(), icons[e.kind], cols[e.kind], 0.4f, e.name,
                          e.kind == ENTRY_SOURCE ? ui::WARN : ImGui::GetColorU32(ImGuiCol_Text), lit, size, tip.c_str())) {
                     if (e.kind == ENTRY_MODEL) ed_add_model(e.rel);
+                    else if (e.kind == ENTRY_SOURCE) model_open(e.rel);
+                    else if (e.kind == ENTRY_LIBRARY) ed_import_file(ed.root + e.rel);
                     else if (e.kind == ENTRY_CODE) ed_open_code(e.rel);
                     else if (e.kind == ENTRY_SCENE && e.rel != ed.scene_rel) {
                         if (ed.dirty) ed_log("Save first (or File > Reload): %s has unsaved changes", ed.scene_rel.c_str());
                         else ed_open(e.rel);
                     }
                 }
+                if ((e.kind == ENTRY_MODEL || e.kind == ENTRY_SOURCE) && ImGui::BeginPopupContextItem("model")) {
+                    std::string glb = e.kind == ENTRY_SOURCE ? e.rel : e.rel.substr(0, e.rel.size() - 4) + ".glb";
+                    bool have = std::find(ed.sources.begin(), ed.sources.end(), glb) != ed.sources.end();
+                    if (ImGui::MenuItem(ICON_MODEL "  Open in Model tab", nullptr, false, have)) model_open(glb);
+                    if (!have) ui::tooltip("No .glb for it under assets/");
+                    ImGui::EndPopup();
+                }
                 if (e.kind == ENTRY_MODEL && ImGui::BeginDragDropSource()) {
                     ImGui::SetDragDropPayload("DMS_MODEL", e.rel.data(), e.rel.size());
                     ImGui::Text(ICON_MODEL "  %s", e.rel.c_str());
+                    ImGui::EndDragDropSource();
+                }
+                if (e.kind == ENTRY_LIBRARY && ImGui::BeginDragDropSource()) {
+                    ImGui::SetDragDropPayload("DMS_LIBRARY", e.rel.data(), e.rel.size());
+                    ImGui::Text(ICON_IMPORT "  %s", e.rel.c_str());
                     ImGui::EndDragDropSource();
                 }
             }

@@ -606,8 +606,10 @@ static void default_layout(ImGuiID dock) {
     ImGui::DockBuilderDockWindow(WIN_INSPECTOR, right);
     ImGui::DockBuilderDockWindow(WIN_CONSOLE, bottom);
     ImGui::DockBuilderDockWindow(WIN_PROJECT, bottom);
+    ImGui::DockBuilderDockWindow(WIN_VRAM, bottom);
     ImGui::DockBuilderDockWindow(WIN_SCENE, mid);
     ImGui::DockBuilderDockWindow(WIN_GAME, mid);
+    ImGui::DockBuilderDockWindow(WIN_MODEL, mid);
     ImGui::DockBuilderFinish(dock);
 }
 
@@ -744,7 +746,7 @@ static void toolbar() {
         ui::segment_end();
 
         /* Right: build buttons and the RAM meter */
-        float meter_w = 230, right = meter_w + 2 * (ImGui::GetFrameHeight() + 8) + 30;
+        float meter_w = 230, vram_w = 200, right = meter_w + vram_w + 10 + 2 * (ImGui::GetFrameHeight() + 8) + 30;
         ImGui::SameLine(ImGui::GetWindowWidth() - right);
         ui::segment_begin();
         const char* job = ed_job();
@@ -767,6 +769,8 @@ static void toolbar() {
         ui::meter(g ? "Game RAM" : "Scene RAM", used / 1048576.0f, (used + freeb) / 1048576.0f, "MB", meter_w, 16.0f);
         ui::tooltip(g ? "The running game's Dreamcast heap: malloc'd now, of what is free after its image and KOS"
                       : "This scene's models on the Dreamcast heap, as the editor has them loaded");
+        ImGui::SameLine(0, 10);
+        vram_meter(vram_w);
     }
     ImGui::End();
     ImGui::PopStyleVar();
@@ -829,6 +833,7 @@ int main(int argc, char** argv) {
     const char* ui_shot = nullptr;
     const char* select = nullptr;
     const char* import = nullptr;
+    const char* model = nullptr;
     bool play = false;
     int frames = 3;
     for (int i = 1; i < argc; i++) {
@@ -838,11 +843,12 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--ui-shot") && i + 1 < argc) ui_shot = argv[++i];
         else if (!strcmp(argv[i], "--select") && i + 1 < argc) select = argv[++i];
         else if (!strcmp(argv[i], "--play")) play = true;
+        else if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
         else if (!strcmp(argv[i], "--import-empties") && i + 1 < argc) import = argv[++i];
         else if (argv[i][0] != '-') project = argv[i];
         else {
             fprintf(stderr, "Usage: %s <project> [--scene scenes/main.json] [--shot out.png | --ui-shot out.png]"
-                            " [--frames N] [--select Name] [--play] [--import-empties Object]\n", argv[0]);
+                            " [--frames N] [--select Name] [--play] [--model dir/name.glb] [--import-empties Object]\n", argv[0]);
             return 2;
         }
     }
@@ -947,8 +953,15 @@ int main(int argc, char** argv) {
         while (SDL_PollEvent(&e)) {
             ImGui_ImplSDL3_ProcessEvent(&e);
             if (e.type == SDL_EVENT_QUIT) quit = true;
+            if (e.type == SDL_EVENT_DROP_FILE && e.drop.data) {
+                shz_vec3_t at;
+                bool over = view_ground_at(e.drop.x, e.drop.y, &at);
+                ed_import_file(e.drop.data, over ? &at : nullptr);
+            }
         }
         job_poll();
+        ed_import_poll();
+        if (model && ImGui::GetFrameCount() == 2) model_open(model);
         play_poll();
         watch_file();
 
@@ -976,6 +989,8 @@ int main(int argc, char** argv) {
         panel_inspector();
         panel_project();
         panel_console();
+        model_window(renderer);
+        panel_vram();
 
         char title[256];
         snprintf(title, sizeof(title), "DMS Editor - %s%s - %s", ed.scene_rel.c_str(), ed.dirty ? " *" : "", ed.project.c_str());
@@ -987,7 +1002,7 @@ int main(int argc, char** argv) {
         ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), renderer);
         /* A ui shot waits for a played game's first frames */
         const DMSEmbed* g = play_shared();
-        bool waiting = play && (play_state() == PlayState::Building || (g && g->frame < 30));
+        bool waiting = (play && (play_state() == PlayState::Building || (g && g->frame < 30))) || model_busy();
         if (ui_shot && ++frame_no >= frames && !waiting) {
             SDL_Surface* s = SDL_RenderReadPixels(renderer, nullptr);
             SDL_Surface* rgb = s ? SDL_ConvertSurface(s, SDL_PIXELFORMAT_RGB24) : nullptr;
@@ -1004,6 +1019,7 @@ int main(int argc, char** argv) {
     }
 
     play_shutdown();
+    model_shutdown();
     ImGui_ImplSDLRenderer3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();

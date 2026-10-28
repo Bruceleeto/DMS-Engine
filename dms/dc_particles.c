@@ -95,6 +95,7 @@ static bool glow_make(DCParticles* s) {
         }
     }
 
+    DC_VRAM_TAG_TEX("particle glow", n, n, "ARGB4444");
     s->tex.ptr = pvr_mem_malloc(n * n * 2);
     if (!s->tex.ptr) {
         free(pix);

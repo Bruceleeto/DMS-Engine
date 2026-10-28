@@ -61,6 +61,8 @@
 #define WIN_INSPECTOR ICON_INSPECT "  Inspector###Inspector"
 #define WIN_PROJECT   ICON_FOLDER "  Project###Project"
 #define WIN_CONSOLE   ICON_CONSOLE "  Console###Console"
+#define WIN_VRAM      ICON_IMAGE "  VRAM###VRAM"
+#define WIN_MODEL     ICON_MODEL "  Model###Model"
 
 namespace ui {
 

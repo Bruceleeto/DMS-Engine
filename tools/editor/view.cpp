@@ -304,6 +304,14 @@ static shz_vec3_t ground_point(const DCCamera& c, float fx, float fy) {
     return add(c.pos, mul(d, 8.0f));
 }
 
+bool view_ground_at(float x, float y, shz_vec3_t* out) {
+    if (g_scale <= 0.0f) return false;
+    float fx = (x - g_origin.x) / g_scale, fy = (y - g_origin.y) / g_scale;
+    if (fx < 0 || fy < 0 || fx >= 640 || fy >= 480) return false;
+    *out = ground_point(ed.cam, fx, fy);
+    return true;
+}
+
 /* ================================================================
  * Gizmo
  * ================================================================ */
@@ -518,6 +526,7 @@ void view_window() {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     bool open = ImGui::Begin(WIN_SCENE);
     ImGui::PopStyleVar();
+    g_scale = 0.0f;     /* not over the view, until it is drawn */
     if (!open) { ImGui::End(); return; }
 
     /* The frame, as big as fits at 4:3, in the middle */
@@ -540,6 +549,12 @@ void view_window() {
             ed_add_model(model);
             if (ed.sel.kind == SelKind::Object)
                 ed.scene->objects[ed.sel.index].pos = ground_point(ed.cam, (mp.x - at.x) / g_scale, (mp.y - at.y) / g_scale);
+        }
+        /* from the Library: imported, then put here */
+        if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload("DMS_LIBRARY")) {
+            ImVec2 mp = ImGui::GetMousePos();
+            shz_vec3_t pos = ground_point(ed.cam, (mp.x - at.x) / g_scale, (mp.y - at.y) / g_scale);
+            ed_import_file(ed.root + std::string((const char*)p->Data, p->DataSize), &pos);
         }
         ImGui::EndDragDropTarget();
     }

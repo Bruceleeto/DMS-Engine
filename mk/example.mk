@@ -103,7 +103,10 @@ GLBS  = $(sort $(wildcard assets/*/*.glb) $(GENERATED_GLBS))
 PNGS  = $(wildcard assets/*/*.png)
 AUDIO = $(wildcard assets/*/*.wav) $(wildcard assets/*/*.mp3)
 BINS  = $(wildcard assets/*/*.bin)
-SCENES = $(wildcard assets/*/*.json)
+# <name>.import.json beside a model holds its import settings (decimate,
+# texture size and format): not a scene
+IMPORTS = $(wildcard assets/*/*.import.json)
+SCENES = $(filter-out $(IMPORTS),$(wildcard assets/*/*.json))
 
 assets: $(patsubst assets/%.glb,$(PC)/%.dms,$(GLBS)) \
         $(patsubst assets/%.png,$(PC)/%.dt,$(PNGS)) \
@@ -119,7 +122,11 @@ $(PC)/%.dms: assets/%.glb | $(STRIPPY)
 	@mkdir -p $(@D)
 	@echo "=== Converting $< $(if $(filter 1,$(BAKE)),(BAKED),) ==="
 	cp $< $(@D)/
-	cd $(@D) && $(STRIPPY) $(STRIPPY_FLAGS) $(notdir $<) && rm -f $(notdir $<)
+	cd $(@D) && $(STRIPPY) $(STRIPPY_FLAGS) $(call IMPORT_FLAG,$<) $(notdir $<) && rm -f $(notdir $<)
+
+# A model with an import file is converted again when the file changes
+IMPORT_FLAG = $(if $(wildcard $(1:.glb=.import.json)),-import $(abspath $(1:.glb=.import.json)))
+$(foreach i,$(IMPORTS),$(eval $(i:assets/%.import.json=$(PC)/%.dms): $(i)))
 
 $(PC)/%.dt: assets/%.png
 	@mkdir -p $(@D)

@@ -1,3 +1,6 @@
 [submodule "converter/dcaconv"]
 	path = tools/converter/dcaconv
 	url = https://github.com/TapamN/dcaconv.git
+[submodule "tools/converter/meshoptimizer"]
+	path = tools/converter/meshoptimizer
+	url = https://github.com/zeux/meshoptimizer.git

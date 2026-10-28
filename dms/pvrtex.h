@@ -32,8 +32,26 @@ typedef struct {
   uint16_t height;
   uint16_t pixel_w;   /* the picture's own size; width/height are the PVR's (a power of two) */
   uint16_t pixel_h;
-  pvr_ptr_t ptr;
+  pvr_ptr_t ptr;      /* where the PVR reads it; a VQ texture with a small codebook
+                       * starts before its allocation, as the PVR wants */
+  pvr_ptr_t base;     /* the allocation, freed by pvrtex_unload (NULL: ptr is) */
 } dttex_info_t;
+
+#include "dc_vram_tag.h"
+#ifdef DMS_HOST
+/* The PC build's VRAM map: the texture's size and format, from its header */
+static inline void pvrtex_host_tag(const dttex_info_t *t) {
+  static const char *pix[8] = { "ARGB1555", "RGB565", "ARGB4444", "YUV422", "BUMP", "PAL4", "PAL8", "?" };
+  char fmt[32];
+  snprintf(fmt, sizeof fmt, "%s%s%s%s%s", pix[fDtGetPixelFormat(&t->hdr)],
+           t->flags.compressed ? " VQ" : "", t->flags.twiddled ? " tw" : "",
+           t->flags.mipmapped ? " mip" : "", t->flags.strided ? " str" : "");
+  pvr_host_mem_tag_tex(NULL, t->width, t->height, fmt);
+}
+#define PVRTEX_HOST_TAG(t) pvrtex_host_tag(t)
+#else
+#define PVRTEX_HOST_TAG(t) ((void)0)
+#endif
 
 /**
  * @brief Load a texture from a file
@@ -72,6 +90,7 @@ static inline int pvrtex_load(const char *filename, dttex_info_t *texinfo) {
   size_t size;
   void *buf = dc_file_read(filename, &size);
   if (!buf) return 0;
+  DC_VRAM_TAG(filename);
   int ok = pvrtex_load_from_buffer(buf, size, texinfo);
   free(buf);
   return ok;
@@ -112,6 +131,7 @@ static inline int pvrtex_load_from_buffer(const void *data, size_t size, dttex_i
 
   texinfo->pvrformat = texinfo->hdr.pvr_type & 0xFFC00000;
 
+  PVRTEX_HOST_TAG(texinfo);
   texinfo->ptr = pvr_mem_malloc(tdatasize);
   if (texinfo->ptr == NULL) {
     printf("Error: pvr_mem_malloc failed (%zu bytes)\n", tdatasize);
@@ -119,6 +139,11 @@ static inline int pvrtex_load_from_buffer(const void *data, size_t size, dttex_i
   }
 
   pvr_txr_load(p, texinfo->ptr, tdatasize);
+  texinfo->base = texinfo->ptr;
+  /* The PVR reads a VQ codebook as if full: a smaller one starts later
+   * (fDtAdjustPVRPointer, which the PC build's file_dctex.h leaves out) */
+  if (texinfo->flags.compressed)
+    texinfo->ptr = (char *)texinfo->base - FDT_CODEBOOK_MAX_SIZE_BYTES + fDtGetCodebookSizeBytes(&texinfo->hdr);
   return 1;
 }
 
@@ -195,8 +220,8 @@ static inline int pvrtex_load_palette(const char *filename, int fmt, size_t offs
  */
 static inline int pvrtex_unload(dttex_info_t *texinfo) {
   if (texinfo->ptr != NULL) {
-    pvr_mem_free(texinfo->ptr);
-    texinfo->ptr = NULL;
+    pvr_mem_free(texinfo->base ? texinfo->base : texinfo->ptr);
+    texinfo->ptr = texinfo->base = NULL;
     return 1;
   }
   return 0;

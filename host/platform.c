@@ -28,6 +28,39 @@ static double now_s(void) {
     return t.tv_sec + t.tv_nsec * 1e-9;
 }
 
+/* The VRAM map, for the editor's VRAM tab */
+static void embed_vram(void) {
+    static pvr_host_vram_block map[DMS_EMBED_VRAM_MAX];
+    uint32_t total = 0, used = 0;
+    int n = pvr_host_vram_map(map, DMS_EMBED_VRAM_MAX, &total, &used);
+    if (n > DMS_EMBED_VRAM_MAX) n = DMS_EMBED_VRAM_MAX;
+    embed->vram_seq++;
+    __sync_synchronize();
+    for (int i = 0; i < n; i++) {
+        DMSEmbedVram* e = &embed->vram[i];
+        const pvr_host_vram_block* b = &map[i];
+        e->offset = b->offset;
+        e->size = b->size;
+        e->w = (uint16_t)b->w;
+        e->h = (uint16_t)b->h;
+        e->kind = (uint8_t)b->kind;
+        /* the start of the format, the end of the tag (a path's file name) */
+        size_t l = strnlen(b->fmt, sizeof e->fmt - 1);
+        memcpy(e->fmt, b->fmt, l);
+        e->fmt[l] = 0;
+        l = strlen(b->tag);
+        const char* t = l >= sizeof e->tag ? b->tag + l - (sizeof e->tag - 1) : b->tag;
+        l = strlen(t);
+        memcpy(e->tag, t, l);
+        e->tag[l] = 0;
+    }
+    embed->vram_count = n;
+    embed->vram_used = used;
+    embed->vram_total = total;
+    __sync_synchronize();
+    embed->vram_seq++;
+}
+
 /* Once a frame, inside the editor: the picture out, the pad in, at 60 a
  * second (no window to wait on vsync), and held while paused. */
 static void embed_frame(void) {
@@ -38,6 +71,7 @@ static void embed_frame(void) {
     DCSim_Info(&used, &free_bytes);
     embed->heap_used = used;
     embed->heap_free = free_bytes;
+    if (embed->frame % 10 == 0) embed_vram();
     embed->frame++;
     double t = now_s();
     if (!fps_from) fps_from = t;

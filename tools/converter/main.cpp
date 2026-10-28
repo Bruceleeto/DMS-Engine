@@ -12,6 +12,9 @@
 #include <omp.h>
 #include <set>
 #include <functional>
+#include <unistd.h>
+#include <sys/stat.h>
+#include "meshoptimizer/src/meshoptimizer.h"
 
 // Transform data
 typedef struct Transform {
@@ -137,7 +140,157 @@ std::vector<std::array<float, 9>> g_rtTriangles; // v0, v1, v2 packed
  * material colour, so those two are the key. */
 static std::map<int, std::array<float, 3>> g_texAverage;   /* textureId -> average colour */
 static bool g_textureVQ = true;
+static bool g_keepDt = false;  // -keep-dt: leave the .dt files beside the .dms (the editor's preview)
 static std::map<std::pair<int, uint32_t>, std::array<float, 3>> g_emissive;
+
+/* Import settings for one texture (-import file.json), by glb image index.
+ * Anything left unset keeps the default behaviour. */
+struct TexImport {
+  int size = 0;          // largest side, 0 = as is
+  std::string format;    // pvrtex -f, empty = AUTO
+  int vq = -1;           // 1/0, -1 = the -no-vq default
+  std::string codebook;  // pvrtex -c argument, empty = full
+  int mips = -1;         // 1/0, -1 = square textures only
+};
+static float g_decimate = 1.0f;  // fraction of triangles kept
+static std::map<int, TexImport> g_texImport;
+static std::string g_outDir;     // empty: next to the input
+/* Palettes of PAL4BPP/PAL8BPP textures (ARGB8888), by texture id. pvrtex
+ * writes them beside the .dt; they go into the .dms in a "PALS" chunk. */
+static std::map<int, std::vector<uint32_t>> g_palettes;
+
+/* A JSON value, just enough for the import settings */
+struct JVal {
+  enum { NUL, BOOL, NUM, STR, ARR, OBJ } type = NUL;
+  bool b = false;
+  double n = 0;
+  std::string s;
+  std::vector<JVal> arr;
+  std::vector<std::pair<std::string, JVal>> obj;
+  const JVal *get(const char *key) const {
+    for (const auto &kv : obj)
+      if (kv.first == key) return &kv.second;
+    return NULL;
+  }
+};
+
+static void JSkip(const char *&p) {
+  while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+}
+
+static bool JParse(const char *&p, JVal &out) {
+  JSkip(p);
+  if (*p == '{' || *p == '[') {
+    bool isObj = *p++ == '{';
+    out.type = isObj ? JVal::OBJ : JVal::ARR;
+    JSkip(p);
+    if (*p == (isObj ? '}' : ']')) { p++; return true; }
+    for (;;) {
+      std::string key;
+      if (isObj) {
+        JVal k;
+        if (!JParse(p, k) || k.type != JVal::STR) return false;
+        key = k.s;
+        JSkip(p);
+        if (*p++ != ':') return false;
+      }
+      JVal v;
+      if (!JParse(p, v)) return false;
+      if (isObj) out.obj.push_back({key, v});
+      else out.arr.push_back(v);
+      JSkip(p);
+      if (*p == ',') { p++; continue; }
+      if (*p++ == (isObj ? '}' : ']')) return true;
+      return false;
+    }
+  }
+  if (*p == '"') {
+    out.type = JVal::STR;
+    for (p++; *p && *p != '"'; p++) {
+      if (*p == '\\' && p[1]) {
+        p++;
+        char c = *p;
+        out.s += c == 'n' ? '\n' : c == 't' ? '\t' : c;
+        if (c == 'u') { out.s.back() = '?'; for (int i = 0; i < 4 && p[1]; i++) p++; }
+      } else out.s += *p;
+    }
+    if (*p != '"') return false;
+    p++;
+    return true;
+  }
+  if (!strncmp(p, "true", 4))  { out.type = JVal::BOOL; out.b = true;  p += 4; return true; }
+  if (!strncmp(p, "false", 5)) { out.type = JVal::BOOL; out.b = false; p += 5; return true; }
+  if (!strncmp(p, "null", 4))  { out.type = JVal::NUL; p += 4; return true; }
+  char *end;
+  out.n = strtod(p, &end);
+  if (end == p) return false;
+  out.type = JVal::NUM;
+  p = end;
+  return true;
+}
+
+static bool LoadImportSettings(const char *path) {
+  FILE *f = fopen(path, "rb");
+  if (!f) { fprintf(stderr, "Error: cannot open %s\n", path); return false; }
+  std::string text;
+  char buf[4096];
+  size_t got;
+  while ((got = fread(buf, 1, sizeof(buf), f)) > 0) text.append(buf, got);
+  fclose(f);
+
+  JVal root;
+  const char *p = text.c_str();
+  if (!JParse(p, root) || root.type != JVal::OBJ) {
+    fprintf(stderr, "Error: %s is not a JSON object\n", path);
+    return false;
+  }
+  if (const JVal *d = root.get("decimate")) {
+    if (d->type == JVal::NUM)
+      g_decimate = d->n < 0.01 ? 0.01f : d->n > 1.0 ? 1.0f : (float)d->n;
+  }
+  const JVal *texs = root.get("textures");
+  if (texs && texs->type == JVal::OBJ) {
+    for (const auto &kv : texs->obj) {
+      const JVal &t = kv.second;
+      if (t.type != JVal::OBJ) continue;
+      TexImport ti;
+      const JVal *v;
+      if ((v = t.get("size")) && v->type == JVal::NUM) ti.size = (int)v->n;
+      if ((v = t.get("format")) && v->type == JVal::STR) {
+        static const char *names[][2] = {
+          {"auto", ""}, {"565", "RGB565"}, {"1555", "ARGB1555"}, {"4444", "ARGB4444"},
+          {"yuv", "YUV422"}, {"pal8", "PAL8BPP"}, {"pal4", "PAL4BPP"}};
+        bool known = false;
+        for (auto &n : names)
+          if (!strcasecmp(v->s.c_str(), n[0])) { ti.format = n[1]; known = true; }
+        if (!known)
+          fprintf(stderr, "Warning: texture %s: unknown format \"%s\", using auto\n",
+                  kv.first.c_str(), v->s.c_str());
+      }
+      if ((v = t.get("vq")) && v->type == JVal::BOOL) ti.vq = v->b;
+      if ((v = t.get("codebook"))) {
+        if (v->type == JVal::NUM) {
+          int n = (int)v->n;
+          ti.codebook = std::to_string(n < 1 ? 1 : n > 256 ? 256 : n);
+        } else if (v->type == JVal::STR && v->s == "small") {
+          ti.codebook = "small";
+        }
+      }
+      if ((v = t.get("mips")) && v->type == JVal::BOOL) ti.mips = v->b;
+      g_texImport[atoi(kv.first.c_str())] = ti;
+    }
+  }
+  printf("Import settings %s: decimate %.2f, %zu textures set\n", path, g_decimate,
+         g_texImport.size());
+  return true;
+}
+
+/* The folder a path is in, "." if none */
+static std::string DirOf(const char *path) {
+  const char *sl = strrchr(path, '/');
+  if (!sl) sl = strrchr(path, '\\');
+  return sl ? std::string(path, sl - path) : std::string(".");
+}
 
 /* Blender empties: places marked in the scene rather than things drawn. The
  * code finds them by name (dc_model_entity). rot is where the empty's x, y and
@@ -540,21 +693,6 @@ static bool GetImageDimensions(const char *path, int *w, int *h) {
     return false;
 }
 
-/* Run pvrtex on an image file. Enables mipmaps only for square textures. */
-static int RunPvrtex(const char *inPath, const char *outPath) {
-    int w = 0, h = 0;
-    bool square = GetImageDimensions(inPath, &w, &h) && (w == h);
-
-    /* -r near: a size the PVR cannot use (not a power of two) is resized to
-     * the nearest one. UVs are 0 to 1, so nothing else changes. */
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd),
-        "/opt/toolchains/dc/kos/utils/pvrtex/pvrtex -i \"%s\" -o \"%s\" -f auto%s -r near%s",
-        inPath, outPath, g_textureVQ ? " -c" : "", square ? " -m" : "");
-    printf("  Running: %s\n", cmd);
-    return system(cmd);
-}
-
 /* Look at a cgltf image's alpha pixels, like pvrtex -f auto does:
  * 0 = fully opaque, 1 = on/off alpha (cutout), 2 = soft alpha (blend).
  * A few soft pixels on an otherwise on/off texture are just antialiased
@@ -684,23 +822,148 @@ static std::string ModelStem(const char *path) {
     return dot == std::string::npos ? stem : stem.substr(0, dot);
 }
 
-void ExtractAndConvertTextures(cgltf_data *data, const char *inputFilename) {
-    std::string stem = ModelStem(inputFilename);
-    if (data->images_count == 0) return;
+/* The power of two pvrtex -r near makes a side: 8 to 1024 */
+static int NearPow2(int n) {
+    int lo = 8;
+    while (lo * 2 <= n && lo < 1024) lo *= 2;
+    int hi = lo < 1024 && lo < n ? lo * 2 : lo;
+    return n - lo <= hi - n ? lo : hi;
+}
 
-    // Get directory of input file
-    char outputDir[256] = ".";
-    strncpy(outputDir, inputFilename, sizeof(outputDir) - 1);
-    char *lastSlash = strrchr(outputDir, '/');
-    if (!lastSlash) lastSlash = strrchr(outputDir, '\\');
-    if (lastSlash) *lastSlash = '\0';
-    else strcpy(outputDir, ".");
+/* Shrink RGBA pixels to w x h by averaging, colour weighted by alpha so the
+ * see-through parts of a cutout don't bleed into its edges */
+static std::vector<unsigned char> ShrinkPixels(const unsigned char *px, int sw, int sh,
+                                               int w, int h) {
+    std::vector<unsigned char> out((size_t)w * h * 4);
+    for (int y = 0; y < h; y++) {
+        int y0 = y * sh / h, y1 = std::max(y0 + 1, (y + 1) * sh / h);
+        for (int x = 0; x < w; x++) {
+            int x0 = x * sw / w, x1 = std::max(x0 + 1, (x + 1) * sw / w);
+            double c[3] = {0, 0, 0}, a = 0, n = 0;
+            for (int sy = y0; sy < y1; sy++)
+                for (int sx = x0; sx < x1; sx++) {
+                    const unsigned char *p = px + ((size_t)sy * sw + sx) * 4;
+                    double pa = p[3] / 255.0;
+                    c[0] += p[0] * pa; c[1] += p[1] * pa; c[2] += p[2] * pa;
+                    a += pa; n++;
+                }
+            unsigned char *o = &out[((size_t)y * w + x) * 4];
+            for (int k = 0; k < 3; k++)
+                o[k] = a > 0 ? (unsigned char)std::min(255.0, c[k] / a + 0.5) : 0;
+            o[3] = (unsigned char)(a / n * 255.0 + 0.5);
+        }
+    }
+    return out;
+}
 
-    printf("\n=== Texture Extraction ===\n");
-    printf("Found %zu images in GLB/GLTF\n", data->images_count);
+/* An uncompressed 32-bit TGA, top row first: pvrtex reads it */
+static bool WriteTGA(const char *path, const unsigned char *px, int w, int h) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+    unsigned char hdr[18] = {0};
+    hdr[2] = 2;
+    hdr[12] = w & 255; hdr[13] = w >> 8;
+    hdr[14] = h & 255; hdr[15] = h >> 8;
+    hdr[16] = 32;
+    hdr[17] = 0x28;  // 8 alpha bits, top-left origin
+    fwrite(hdr, 1, 18, f);
+    std::vector<unsigned char> bgra((size_t)w * h * 4);
+    for (size_t i = 0; i < (size_t)w * h; i++) {
+        bgra[i * 4] = px[i * 4 + 2]; bgra[i * 4 + 1] = px[i * 4 + 1];
+        bgra[i * 4 + 2] = px[i * 4];  bgra[i * 4 + 3] = px[i * 4 + 3];
+    }
+    fwrite(bgra.data(), 1, bgra.size(), f);
+    fclose(f);
+    return true;
+}
 
-    /* Only base colour images are drawn. Normal, roughness and occlusion maps
-     * would only fill VRAM. */
+/* Read a pvrtex .pal ("DPAL", count, ARGB8888 colours) */
+static bool ReadPalette(const char *path, std::vector<uint32_t> &out) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    char tag[4];
+    uint32_t count = 0;
+    bool ok = fread(tag, 1, 4, f) == 4 && !memcmp(tag, "DPAL", 4) &&
+              fread(&count, 4, 1, f) == 1 && count <= 256;
+    if (ok) {
+        out.resize(count);
+        ok = fread(out.data(), 4, count, f) == count;
+    }
+    fclose(f);
+    return ok;
+}
+
+/* Convert one image with pvrtex, as its import settings say. With none:
+ * AUTO format, VQ unless -no-vq, mipmaps only for square textures. */
+static int ConvertTexture(cgltf_image *img, int index, const char *inPath,
+                          const char *dtPath, const char *inputDir, const char *tmpDir,
+                          const std::string &stem) {
+    TexImport s;
+    auto it = g_texImport.find(index);
+    if (it != g_texImport.end()) s = it->second;
+
+    int w = 0, h = 0;
+    bool square = GetImageDimensions(inPath, &w, &h) && (w == h);
+
+    /* -r near: a size the PVR cannot use (not a power of two) is resized to
+     * the nearest one. UVs are 0 to 1, so nothing else changes. A smaller
+     * size is made here first, halving both sides, so the shape is kept. */
+    std::string src = inPath, shrunk;
+    if (s.size > 0) {
+        int pw, ph;
+        const unsigned char *px = CgltfImagePixels(img, inputDir, &pw, &ph);
+        if (px) {
+            int tw = NearPow2(pw), th = NearPow2(ph);
+            int limit = std::max(8, s.size);
+            while (std::max(tw, th) > limit && tw > 8 && th > 8) { tw /= 2; th /= 2; }
+            if (tw < NearPow2(pw) || th < NearPow2(ph)) {
+                char path[512];
+                snprintf(path, sizeof(path), "%s/_tmp_%s_texture_%d_small.tga", tmpDir,
+                         stem.c_str(), index);
+                std::vector<unsigned char> small = ShrinkPixels(px, pw, ph, tw, th);
+                if (WriteTGA(path, small.data(), tw, th)) {
+                    printf("  Texture %d: %dx%d -> %dx%d\n", index, pw, ph, tw, th);
+                    src = shrunk = path;
+                    square = tw == th;
+                }
+            }
+        }
+    }
+
+    bool vq = s.vq < 0 ? g_textureVQ : s.vq != 0;
+    std::string opts = " -f " + (s.format.empty() ? std::string("AUTO") : s.format);
+    if (vq) opts += " -c" + (s.codebook.empty() ? std::string() : " " + s.codebook);
+    opts += " -r near";
+    if (s.mips == 1) opts += " -m -R opt";  // the PVR mipmaps square textures only
+    else if (s.mips < 0 && square) opts += " -m";
+    // The editor's preview shows each texture as converted: pvrtex draws it
+    if (g_keepDt) opts += std::string(" -p \"") + dtPath + ".png\"";
+
+    char cmd[1536];
+    snprintf(cmd, sizeof(cmd), "/opt/toolchains/dc/kos/utils/pvrtex/pvrtex -i \"%s\" -o \"%s\"%s",
+             src.c_str(), dtPath, opts.c_str());
+    printf("  Running: %s\n", cmd);
+    fflush(stdout);
+    int ret = system(cmd);
+    if (!shrunk.empty()) remove(shrunk.c_str());
+
+    if (ret == 0 && s.format.compare(0, 3, "PAL") == 0) {
+        std::string pal = std::string(dtPath) + ".pal";
+        std::vector<uint32_t> colours;
+        if (ReadPalette(pal.c_str(), colours)) {
+            g_palettes[index] = colours;
+            printf("  Texture %d: %zu colour palette\n", index, colours.size());
+        } else {
+            printf("  WARNING: texture %d: no palette at %s\n", index, pal.c_str());
+        }
+        if (!g_keepDt) remove(pal.c_str());
+    }
+    return ret;
+}
+
+/* Only base colour images are drawn. Normal, roughness and occlusion maps
+ * would only fill VRAM. */
+static std::vector<bool> UsedImages(const cgltf_data *data) {
     std::vector<bool> used(data->images_count, false);
     for (size_t m = 0; m < data->materials_count; m++) {
         const cgltf_texture *t =
@@ -708,6 +971,21 @@ void ExtractAndConvertTextures(cgltf_data *data, const char *inputFilename) {
         if (data->materials[m].has_pbr_metallic_roughness && t && t->image)
             used[t->image - data->images] = true;
     }
+    return used;
+}
+
+void ExtractAndConvertTextures(cgltf_data *data, const char *inputFilename) {
+    std::string stem = ModelStem(inputFilename);
+    if (data->images_count == 0) return;
+
+    std::string inputDir = DirOf(inputFilename);
+    std::string outDir = g_outDir.empty() ? inputDir : g_outDir;
+    const char *outputDir = outDir.c_str();
+
+    printf("\n=== Texture Extraction ===\n");
+    printf("Found %zu images in GLB/GLTF\n", data->images_count);
+
+    std::vector<bool> used = UsedImages(data);
 
     for (size_t i = 0; i < data->images_count; i++) {
         cgltf_image *img = &data->images[i];
@@ -734,10 +1012,10 @@ void ExtractAndConvertTextures(cgltf_data *data, const char *inputFilename) {
             imageSize = img->buffer_view->size;
         } else if (img->uri && strncmp(img->uri, "data:", 5) != 0) {
             // External file - build path relative to input and pass directly to pvrtex
-            snprintf(tmpPath, sizeof(tmpPath), "%s/%s", outputDir, img->uri);
+            snprintf(tmpPath, sizeof(tmpPath), "%s/%s", inputDir.c_str(), img->uri);
             printf("  Texture %zu: external file %s\n", i, tmpPath);
 
-            int ret = RunPvrtex(tmpPath, dtPath);
+            int ret = ConvertTexture(img, (int)i, tmpPath, dtPath, inputDir.c_str(), outputDir, stem);
             if (ret != 0) printf("  WARNING: pvrtex failed for texture %zu\n", i);
             else printf("  Converted texture %zu -> %s\n", i, dtPath);
             continue;
@@ -759,7 +1037,7 @@ void ExtractAndConvertTextures(cgltf_data *data, const char *inputFilename) {
             fwrite(imageData, 1, imageSize, tmp);
             fclose(tmp);
 
-            int ret = RunPvrtex(tmpPath, dtPath);
+            int ret = ConvertTexture(img, (int)i, tmpPath, dtPath, inputDir.c_str(), outputDir, stem);
             if (ret != 0) printf("  WARNING: pvrtex failed for texture %zu\n", i);
             else printf("  Converted texture %zu -> %s\n", i, dtPath);
 
@@ -2230,6 +2508,135 @@ void WeldVertices(Mesh *mesh, float threshold = 0.001f) {
          mesh->vertexCount, (int)remapTable.size() - mesh->vertexCount);
 }
 
+/* Cut a mesh down to about ratio of its triangles (meshoptimizer). Only the
+ * indices change, so every vertex keeps its bone, weight and colour; UV and
+ * normal seams are weighed in so they survive. Small meshes are left alone.
+ * Returns the triangles left. */
+static int DecimateMesh(Mesh *mesh, float ratio) {
+  int tris = mesh->indexCount / 3;
+  if (ratio >= 1.0f || tris < 24 || mesh->vertexCount == 0)
+    return tris;
+
+  const int ATTRS = 8;
+  std::vector<float> attrs((size_t)mesh->vertexCount * ATTRS);
+  for (int i = 0; i < mesh->vertexCount; i++) {
+    const Vertex &v = mesh->vertices[i];
+    float *a = &attrs[(size_t)i * ATTRS];
+    a[0] = v.u; a[1] = v.v;
+    a[2] = v.nx / 127.0f; a[3] = v.ny / 127.0f; a[4] = v.nz / 127.0f;
+    a[5] = v.r / 255.0f; a[6] = v.g / 255.0f; a[7] = v.b / 255.0f;
+  }
+  const float weights[ATTRS] = {1.0f, 1.0f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
+
+  size_t target = (size_t)(tris * ratio) * 3;
+  if (target < 3) target = 3;
+  std::vector<unsigned int> out(mesh->indexCount);
+  size_t count = meshopt_simplifyWithAttributes(
+      out.data(), mesh->indices, mesh->indexCount, &mesh->vertices[0].x,
+      mesh->vertexCount, sizeof(Vertex), attrs.data(), ATTRS * sizeof(float),
+      weights, ATTRS, NULL, target, 1.0f, 0, NULL);
+  if (count == 0)
+    return tris;
+
+  // Drop the vertices no triangle uses any more
+  std::vector<int> remap(mesh->vertexCount, -1);
+  std::vector<Vertex> kept;
+  for (size_t i = 0; i < count; i++) {
+    unsigned int &idx = out[i];
+    if (remap[idx] < 0) {
+      remap[idx] = (int)kept.size();
+      kept.push_back(mesh->vertices[idx]);
+    }
+    idx = remap[idx];
+  }
+
+  free(mesh->vertices);
+  free(mesh->originalVertices);
+  free(mesh->animatedVertices);
+  mesh->vertexCount = (int)kept.size();
+  mesh->vertices = (Vertex *)calloc(mesh->vertexCount, sizeof(Vertex));
+  mesh->originalVertices = (Vertex *)calloc(mesh->vertexCount, sizeof(Vertex));
+  mesh->animatedVertices = (Vertex *)calloc(mesh->vertexCount, sizeof(Vertex));
+  memcpy(mesh->vertices, kept.data(), sizeof(Vertex) * mesh->vertexCount);
+  memcpy(mesh->originalVertices, kept.data(), sizeof(Vertex) * mesh->vertexCount);
+  memcpy(mesh->indices, out.data(), sizeof(unsigned int) * count);
+  mesh->indexCount = (int)count;
+  return (int)(count / 3);
+}
+
+/* -info: describe the model as one JSON object, for the editor. Converts
+ * nothing. */
+static void JsonString(FILE *f, const char *s) {
+  fputc('"', f);
+  for (; s && *s; s++) {
+    unsigned char c = (unsigned char)*s;
+    if (c == '"' || c == '\\') fprintf(f, "\\%c", c);
+    else if (c < 0x20) fprintf(f, "\\u%04x", c);
+    else fputc(c, f);
+  }
+  fputc('"', f);
+}
+
+static bool PrintInfo(const char *filename, FILE *out) {
+  cgltf_options options = {};
+  cgltf_data *data = NULL;
+  if (cgltf_parse_file(&options, filename, &data) != cgltf_result_success)
+    return false;
+  if (cgltf_load_buffers(&options, data, filename) != cgltf_result_success) {
+    cgltf_free(data);
+    return false;
+  }
+  std::string inputDir = DirOf(filename);
+
+  long meshes = 0, tris = 0, verts = 0;
+  for (const MeshInstance &inst : CollectMeshInstances(data)) {
+    for (size_t p = 0; p < inst.mesh->primitives_count; p++) {
+      const cgltf_primitive *prim = &inst.mesh->primitives[p];
+      size_t vc = 0;
+      for (size_t a = 0; a < prim->attributes_count; a++)
+        if (prim->attributes[a].type == cgltf_attribute_type_position)
+          vc = prim->attributes[a].data->count;
+      size_t ic = prim->indices ? prim->indices->count : vc;
+      meshes++;
+      verts += (long)vc;
+      if (prim->type == cgltf_primitive_type_triangles) tris += (long)(ic / 3);
+      else if (prim->type == cgltf_primitive_type_triangle_strip ||
+               prim->type == cgltf_primitive_type_triangle_fan)
+        tris += ic > 2 ? (long)(ic - 2) : 0;
+    }
+  }
+
+  std::vector<bool> used = UsedImages(data);
+  fprintf(out, "{\"meshes\":%ld,\"triangles\":%ld,\"vertices\":%ld,\"skinned\":%s,\"images\":[",
+          meshes, tris, verts, data->skins_count > 0 ? "true" : "false");
+  for (size_t i = 0; i < data->images_count; i++) {
+    cgltf_image *img = &data->images[i];
+    const char *name = img->name && *img->name ? img->name : NULL;
+    if (!name && img->uri && strncmp(img->uri, "data:", 5) != 0) name = img->uri;
+    for (size_t m = 0; !name && m < data->materials_count; m++) {
+      const cgltf_texture *t =
+          data->materials[m].pbr_metallic_roughness.base_color_texture.texture;
+      if (t && t->image == img) name = data->materials[m].name;
+    }
+    char fallback[32];
+    if (!name) { snprintf(fallback, sizeof(fallback), "image_%zu", i); name = fallback; }
+
+    int w = 0, h = 0;
+    const unsigned char *px = CgltfImagePixels(img, inputDir.c_str(), &w, &h);
+    static const char *alpha[] = {"none", "1bit", "full"};
+    int kind = px ? CgltfImageAlphaKind(img, inputDir.c_str()) : 0;
+
+    fprintf(out, "%s{\"index\":%zu,\"name\":", i ? "," : "", i);
+    JsonString(out, name);
+    fprintf(out, ",\"width\":%d,\"height\":%d,\"alpha\":\"%s\",\"used\":%s}", w, h,
+            alpha[kind], used[i] && (img->buffer_view || (img->uri && strncmp(img->uri, "data:", 5)))
+                ? "true" : "false");
+  }
+  fprintf(out, "]}\n");
+  cgltf_free(data);
+  return true;
+}
+
 // Static levels are cut into blocks by location, the way SA2 lays out its
 // levels: how the scene was split into objects doesn't matter. Each block
 // holds one mesh per material, and the runtime culls a whole block with one
@@ -2703,32 +3110,61 @@ void CreateTristrippedModel(const Model *sourceModel, Model *destModel) {
   printf("Tristripped model creation complete!\n");
 }
 
+static void Usage(const char *self) {
+  printf("Usage: %s [-bake] [-no-vq] [-import settings.json] [-out dir] [-keep-dt] <model_file>\n", self);
+  printf("       %s -info <model_file>\n", self);
+  printf("  -bake    Bake vertex lighting (AO, shadows, etc.)\n");
+  printf("  -no-vq   Disable VQ texture compression\n");
+  printf("  -import  Per-model settings: decimate, texture size/format/vq/mips\n");
+  printf("  -out     Write the .dms there instead of next to the model\n");
+  printf("  -info    Print the model's meshes and images as JSON, convert nothing\n");
+  printf("Supported formats: .gltf, .glb\n");
+}
+
 int main(int argc, char *argv[]) {
   if (argc < 2) {
-    printf("Usage: %s [-bake] [-no-vq] <model_file>\n", argv[0]);
-    printf("  -bake    Bake vertex lighting (AO, shadows, etc.)\n");
-    printf("  -no-vq   Disable VQ texture compression\n");
-    printf("Supported formats: .gltf, .glb\n");
+    Usage(argv[0]);
     return 1;
   }
 
   // Parse arguments
-  bool bakeLighting = false;
-  const char *inputFilename = NULL;
+  bool bakeLighting = false, info = false;
+  const char *inputFilename = NULL, *importPath = NULL;
 
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-bake") == 0) {
       bakeLighting = true;
     } else if (strcmp(argv[i], "-no-vq") == 0) {
       g_textureVQ = false;
+    } else if (strcmp(argv[i], "-keep-dt") == 0) {
+      g_keepDt = true;
+    } else if (strcmp(argv[i], "-info") == 0) {
+      info = true;
+    } else if (strcmp(argv[i], "-import") == 0 && i + 1 < argc) {
+      importPath = argv[++i];
+    } else if (strcmp(argv[i], "-out") == 0 && i + 1 < argc) {
+      g_outDir = argv[++i];
+      while (g_outDir.size() > 1 && g_outDir.back() == '/') g_outDir.pop_back();
     } else if (argv[i][0] != '-') {
       inputFilename = argv[i];
     }
   }
 
+  // -info: stdout carries the JSON and nothing else
+  if (info) {
+    FILE *json = fdopen(dup(1), "w");
+    dup2(2, 1);
+    if (!inputFilename || !json || !PrintInfo(inputFilename, json)) {
+      fprintf(stderr, "Error: cannot read %s\n", inputFilename ? inputFilename : "(none)");
+      return 1;
+    }
+    fclose(json);
+    return 0;
+  }
+
   if (!inputFilename) {
     printf("Error: No input file specified\n");
-    printf("Usage: %s [-bake] [-no-vq] <model_file>\n", argv[0]);
+    Usage(argv[0]);
     return 1;
   }
 
@@ -2745,6 +3181,20 @@ int main(int argc, char *argv[]) {
     printf("Unsupported file format: %s\n", extension);
     printf("Supported formats: .gltf, .glb\n");
     return 1;
+  }
+
+  if (importPath && !LoadImportSettings(importPath))
+    return 1;
+
+  if (!g_outDir.empty()) {
+    for (size_t i = 1; i <= g_outDir.size(); i++)
+      if (i == g_outDir.size() || g_outDir[i] == '/')
+        mkdir(g_outDir.substr(0, i).c_str(), 0755);
+    struct stat st;
+    if (stat(g_outDir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+      printf("Error: cannot make output folder %s\n", g_outDir.c_str());
+      return 1;
+    }
   }
 
   printf("Loading GLTF/GLB: %s\n", inputFilename);
@@ -2765,16 +3215,28 @@ int main(int argc, char *argv[]) {
   }
   printf("=== Vertex Welding Complete ===\n\n");
 
+  if (g_decimate < 1.0f) {
+    int before = 0, after = 0;
+    for (int i = 0; i < model.meshCount; i++) {
+      int tris = model.meshes[i].indexCount / 3;
+      int left = DecimateMesh(&model.meshes[i], g_decimate);
+      if (left != tris)
+        printf("Decimate: mesh %d %d -> %d triangles\n", i, tris, left);
+      before += tris;
+      after += left;
+    }
+    printf("Decimate %.2f: %d -> %d triangles\n\n", g_decimate, before, after);
+  }
+
   // Animated models are culled as a whole, so only static ones get blocks
   if (skeleton.boneCount == 0)
     BuildBlocks(&model);
 
   CreateTristrippedModel(&model, &tristrippedModel);
 
-  char outputFilename[256] = {0};
-  size_t baseNameLength = extension - inputFilename;
-  strncpy(outputFilename, inputFilename, baseNameLength);
-  strcat(outputFilename, ".dms");
+  std::string outName = (g_outDir.empty() ? DirOf(inputFilename) : g_outDir) + "/" +
+                        ModelStem(inputFilename) + ".dms";
+  const char *outputFilename = outName.c_str();
 
   if (tristrippedModel.meshCount > 0) {
     printf("Exporting to: %s\n", outputFilename);
@@ -4088,9 +4550,9 @@ void ExportTristrippedModel(const Model *model, const char *filename,
       remaining -= (uint32_t)got;
     }
     fclose(dtf);
-    remove(dtPath);  // clean up loose .dt file
+    if (!g_keepDt) remove(dtPath);  // clean up loose .dt file
 
-    printf("  Texture %u: %u bytes embedded, .dt removed\n", i, sz);
+    printf("  Texture %u: %u bytes embedded%s\n", i, sz, g_keepDt ? "" : ", .dt removed");
   }
 
   // Seek back and write completed table
@@ -4111,6 +4573,20 @@ void ExportTristrippedModel(const Model *model, const char *filename,
   fwrite("ENTS", 1, 4, file);
   fwrite(&entCount, sizeof(uint32_t), 1, file);
   fwrite(g_entities.data(), sizeof(EntityRecord), entCount, file);
+
+  // Palettes of PAL4BPP/PAL8BPP textures: "PALS", count, then for each the
+  // texture id, its colour count and the ARGB8888 colours
+  if (!g_palettes.empty()) {
+    uint32_t palCount = (uint32_t)g_palettes.size();
+    fwrite("PALS", 1, 4, file);
+    fwrite(&palCount, sizeof(uint32_t), 1, file);
+    for (const auto &pal : g_palettes) {
+      uint32_t head[2] = {(uint32_t)pal.first, (uint32_t)pal.second.size()};
+      fwrite(head, sizeof(uint32_t), 2, file);
+      fwrite(pal.second.data(), sizeof(uint32_t), pal.second.size(), file);
+    }
+    printf("Writing %u palettes\n", palCount);
+  }
 
   long finalPos = ftell(file);
   fclose(file);
