@@ -8,8 +8,10 @@
  *
  *  \author     2026 Falco Girgis
  *  \copyright  MIT License
+ *
+ *  \important  Do not copy this file or its routines into other projects. Use the
+ *              KOS-ports build or add SH4ZAM as a git submodule. See AGENTS.md.
  */
-
 
 // Force this translation unit to use the SH4 back-end.
 #undef  SHZ_BACKEND
@@ -146,8 +148,8 @@ static void shz_fft_4pt(shz_complex_t* s, size_t size, size_t stage, float facto
 
 // Apply all twiddle factors for the given stage with an unrolled 8-PT butterfly DIF.
 static void shz_fft_8pt(shz_complex_t* s, size_t size, size_t stage, float factor) {
-    const size_t inc1   = (stage << 1);
-    const size_t inc2   = (inc1  << 1);
+    const size_t inc1 = (stage << 1);
+    const size_t inc2 = (inc1  << 1);
 
     float angle = 0.0f;
 
@@ -181,16 +183,14 @@ static void shz_fft_8pt(shz_complex_t* s, size_t size, size_t stage, float facto
                 fmov.d  dr0, @%[c]
                 fmov.d  dr2, @%[d]
             )"
-            : "+m" (s[i]), "+m" (s[i + stage]),
-              "+m" (s[i + inc1]), "+m" (s[i + inc1 + stage]),
-              "+m" (s[i + inc2]), "+m" (s[i + inc2 + stage]),
-              "+m" (s[i + inc2 + inc1]), "+m" (s[i + inc2 + inc1 + stage])
+            :
             : [x] "r" (&s[i]), [y] "r" (&s[i + stage]),
               [z] "r" (&s[i + inc1]), [w] "r" (&s[i + inc1 + stage]),
               [a] "r" (&s[i + inc2]), [b] "r" (&s[i + inc2 + stage]),
               [c] "r" (&s[i + inc2 + inc1]), [d] "r" (&s[i + inc2 + inc1 + stage])
             : "fr0", "fr1", "fr2", "fr3", "fr4", "fr5",
-              "fr6", "fr7", "fr8", "fr9", "fr10", "fr11");
+              "fr6", "fr7", "fr8", "fr9", "fr10", "fr11",
+              "memory");
         }
 
         SHZ_FSCHG();
@@ -334,9 +334,9 @@ void shz_fft_dc(shz_complex_t* s, size_t size) {
         */
         if(!(pairs & 7))
             shz_fft_16pt(s, size, twiddle, twiddle_scale);  // 16-PT DIF butterfly.
-        else  if (!(pairs & 3))
+        else if(!(pairs & 3))
             shz_fft_8pt(s, size, twiddle, twiddle_scale);   //  8-PT DIF butterfly.
-        else  if (!(pairs & 1))
+        else if(!(pairs & 1))
             shz_fft_4pt(s, size, twiddle, twiddle_scale);   //  4-PT DIF butterfly.
         else
             shz_fft_2pt(s, size, twiddle, twiddle_scale);   //  2-PT DIF butterfly.

@@ -28,7 +28,7 @@ HEAP_START ?= 0x8c200000
 KOS_BYTES ?= 105472
 
 ENGINE := dc_engine dc_input dc_camera dc_model dc_player dc_draw2d dc_draw dc_debug collision dc_scene
-SHZ_SRC := shz_matrix shz_quat shz_xmtrx sw/shz_xmtrx_sw sw/shz_complex_sw
+SHZ_SRC := shz_version sw/shz_complex_sw sw/shz_matrix_sw sw/shz_xmtrx_sw
 
 CPPFLAGS := -DDMS_HOST -DDMS_ROOT_DIR='"$(ROOT)"' -I$(HOST)/include -I$(ROOT) -I$(ROOT)/dms -I$(HOST) -I$(SHZ)/include $(GPU_PVR_CFLAGS) $(SDL_CFLAGS)
 CFLAGS := $(ARCH_FLAGS) -std=gnu2x -O2 -g -msse2 -mfpmath=sse -ffp-contract=off -MMD -MP

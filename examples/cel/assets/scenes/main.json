@@ -1,0 +1,14 @@
+{
+  "dms_scene": 1,
+  "background": "#202838",
+  "camera": { "pos": [-21.915137, 34.20786, -70.845682], "yaw": 17.188734, "pitch": 8.594367, "fov": 60 },
+  "lights": [
+    { "name": "Lamp", "pos": [0, 45, 40], "sun": false,
+      "color": "#ffffff", "range": 150, "ambient": 0.4, "bands": 3 }
+  ],
+  "objects": [
+    { "name": "Model", "model": "cel/scene.dms",
+      "pos": [0, 0, 0], "rot": [0, 0, 0], "scale": [1, 1, 1],
+      "tint": "#ffffff", "add": false, "visible": true }
+  ]
+}

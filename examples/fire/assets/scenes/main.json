@@ -1,0 +1,11 @@
+{
+  "dms_scene": 1,
+  "background": "#000000",
+  "camera": { "pos": [-333.921, 69.883, -611.239], "yaw": 28.647890, "pitch": 5.729578, "fov": 60 },
+  "lights": [],
+  "objects": [
+    { "name": "Burner", "model": "fire/fire.dms",
+      "pos": [0, 0, 0], "rot": [0, 0, 0], "scale": [1, 1, 1],
+      "tint": "#ffffff", "add": false, "visible": true }
+  ]
+}

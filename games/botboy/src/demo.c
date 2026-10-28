@@ -77,7 +77,7 @@ int demo_count(void) {
     for (int lv = 0; lv < DEMO_LEVELS; lv++) {
         char path[256];
         demo_path(lv, path, sizeof(path));
-        file_t f = fs_open(path, O_RDONLY);
+        file_t f = dc_asset_open(path, O_RDONLY);
         if (f == FILEHND_INVALID) continue;
         fs_close(f);
         levels[found++] = lv;

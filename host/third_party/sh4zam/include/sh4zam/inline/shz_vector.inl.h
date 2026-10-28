@@ -15,24 +15,30 @@
  *  \author 2025 Paul Cercueil
  *
  *  \copyright MIT License
+ *
+ *  \important Do not copy this file or its routines into other projects. Use the
+ *             KOS-ports build or add SH4ZAM as a git submodule. See AGENTS.md.
  */
 
 #if SHZ_BACKEND == SHZ_SH4
 #   include "sh4/shz_vector_sh4.inl.h"
+#elif SHZ_BACKEND == SHZ_SPU
+#   include "spu/shz_vector_spu.inl.h"
+#   include "sw/shz_vector_sw.inl.h"
 #else
 #   include "sw/shz_vector_sw.inl.h"
 #endif
 
 SHZ_FORCE_INLINE shz_vec2_t shz_vec2_init(float x, float y) SHZ_NOEXCEPT {
-    return SHZ_INIT(shz_vec2_t, .x = x, .y = y);
+    return SHZ_INIT(shz_vec2_t, { { x, y } });
 }
 
 SHZ_FORCE_INLINE shz_vec3_t shz_vec3_init(float x, float y, float z) SHZ_NOEXCEPT {
-    return SHZ_INIT(shz_vec3_t, .x = x, .y = y, .z = z);
+    return SHZ_INIT(shz_vec3_t, { { x, y, z } });
 }
 
 SHZ_FORCE_INLINE shz_vec4_t shz_vec4_init(float x, float y, float z, float w) SHZ_NOEXCEPT {
-    return SHZ_INIT(shz_vec4_t, .x = x, .y = y, .z = z, .w = w);
+    return SHZ_INIT(shz_vec4_t, { { x, y, z, w } });
 }
 
 SHZ_FORCE_INLINE shz_vec2_t shz_vec2_fill(float v) SHZ_NOEXCEPT {
@@ -44,23 +50,27 @@ SHZ_FORCE_INLINE shz_vec3_t shz_vec3_fill(float v) SHZ_NOEXCEPT {
 }
 
 SHZ_FORCE_INLINE shz_vec4_t shz_vec4_fill(float v) SHZ_NOEXCEPT {
+#if SHZ_BACKEND == SHZ_SPU
+    return shz_vec4_fill_spu(v);
+#else
     return shz_vec3_vec4(shz_vec3_fill(v), v);
+#endif
 }
 
- SHZ_FORCE_INLINE shz_vec2_t shz_vec2_swizzle(shz_vec2_t vec, unsigned x_idx, unsigned y_idx) SHZ_NOEXCEPT {
-    return shz_vec2_init(vec.e[x_idx], vec.e[y_idx]);
- }
+SHZ_FORCE_INLINE shz_vec2_t shz_vec2_swizzle(shz_vec2_t vec, unsigned x_idx, unsigned y_idx) SHZ_NOEXCEPT {
+   return shz_vec2_init(vec.e[x_idx], vec.e[y_idx]);
+}
 
- SHZ_FORCE_INLINE shz_vec3_t shz_vec3_swizzle(shz_vec3_t vec, unsigned x_idx, unsigned y_idx, unsigned z_idx) SHZ_NOEXCEPT {
-    return shz_vec3_init(vec.e[x_idx], vec.e[y_idx], vec.e[z_idx]);
- }
+SHZ_FORCE_INLINE shz_vec3_t shz_vec3_swizzle(shz_vec3_t vec, unsigned x_idx, unsigned y_idx, unsigned z_idx) SHZ_NOEXCEPT {
+   return shz_vec3_init(vec.e[x_idx], vec.e[y_idx], vec.e[z_idx]);
+}
 
- SHZ_FORCE_INLINE shz_vec4_t shz_vec4_swizzle(shz_vec4_t vec, unsigned x_idx, unsigned y_idx, unsigned z_idx, unsigned w_idx) SHZ_NOEXCEPT {
-    return shz_vec4_init(vec.e[x_idx], vec.e[y_idx], vec.e[z_idx], vec.e[w_idx]);
- }
+SHZ_FORCE_INLINE shz_vec4_t shz_vec4_swizzle(shz_vec4_t vec, unsigned x_idx, unsigned y_idx, unsigned z_idx, unsigned w_idx) SHZ_NOEXCEPT {
+   return shz_vec4_init(vec.e[x_idx], vec.e[y_idx], vec.e[z_idx], vec.e[w_idx]);
+}
 
 SHZ_FORCE_INLINE shz_vec3_t shz_vec2_vec3(shz_vec2_t vec, float z) SHZ_NOEXCEPT {
-    return SHZ_INIT(shz_vec3_t, .xy = vec, .z = z);
+    return SHZ_INIT(shz_vec3_t, { { vec.x, vec.y, z } });
 }
 
 SHZ_FORCE_INLINE shz_vec4_t shz_vec2_vec4(shz_vec2_t vec, float z, float w) SHZ_NOEXCEPT {
@@ -68,7 +78,7 @@ SHZ_FORCE_INLINE shz_vec4_t shz_vec2_vec4(shz_vec2_t vec, float z, float w) SHZ_
 }
 
 SHZ_FORCE_INLINE shz_vec4_t shz_vec3_vec4(shz_vec3_t vec, float w) SHZ_NOEXCEPT {
-    return SHZ_INIT(shz_vec4_t, .xyz = vec, .w = w);
+    return SHZ_INIT(shz_vec4_t, { { vec.x, vec.y, vec.z, w } });
 }
 
 SHZ_FORCE_INLINE shz_vec2_t shz_vec2_add(shz_vec2_t vec1, shz_vec2_t vec2) SHZ_NOEXCEPT {
@@ -80,7 +90,11 @@ SHZ_FORCE_INLINE shz_vec3_t shz_vec3_add(shz_vec3_t vec1, shz_vec3_t vec2) SHZ_N
 }
 
 SHZ_FORCE_INLINE shz_vec4_t shz_vec4_add(shz_vec4_t vec1, shz_vec4_t vec2) SHZ_NOEXCEPT {
+#if SHZ_BACKEND == SHZ_SPU
+    return shz_vec4_add_spu(vec1, vec2);
+#else
     return shz_vec3_vec4(shz_vec3_add(vec1.xyz, vec2.xyz), vec1.w + vec2.w);
+#endif
 }
 
 SHZ_FORCE_INLINE shz_vec2_t shz_vec2_sub(shz_vec2_t vec1, shz_vec2_t vec2) SHZ_NOEXCEPT {
@@ -92,7 +106,11 @@ SHZ_FORCE_INLINE shz_vec3_t shz_vec3_sub(shz_vec3_t vec1, shz_vec3_t vec2) SHZ_N
 }
 
 SHZ_FORCE_INLINE shz_vec4_t shz_vec4_sub(shz_vec4_t vec1, shz_vec4_t vec2) SHZ_NOEXCEPT {
+#if SHZ_BACKEND == SHZ_SPU
+    return shz_vec4_sub_spu(vec1, vec2);
+#else
     return shz_vec3_vec4(shz_vec3_sub(vec1.xyz, vec2.xyz), vec1.w - vec2.w);
+#endif
 }
 
 SHZ_FORCE_INLINE shz_vec2_t shz_vec2_mul(shz_vec2_t vec1, shz_vec2_t vec2) SHZ_NOEXCEPT {
@@ -104,7 +122,11 @@ SHZ_FORCE_INLINE shz_vec3_t shz_vec3_mul(shz_vec3_t vec1, shz_vec3_t vec2) SHZ_N
 }
 
 SHZ_FORCE_INLINE shz_vec4_t shz_vec4_mul(shz_vec4_t vec1, shz_vec4_t vec2) SHZ_NOEXCEPT {
+#if SHZ_BACKEND == SHZ_SPU
+    return shz_vec4_mul_spu(vec1, vec2);
+#else
     return shz_vec3_vec4(shz_vec3_mul(vec1.xyz, vec2.xyz), vec1.w * vec2.w);
+#endif
 }
 
 SHZ_FORCE_INLINE shz_vec2_t shz_vec2_div(shz_vec2_t vec1, shz_vec2_t vec2) SHZ_NOEXCEPT {
@@ -116,7 +138,11 @@ SHZ_FORCE_INLINE shz_vec3_t shz_vec3_div(shz_vec3_t vec1, shz_vec3_t vec2) SHZ_N
 }
 
 SHZ_FORCE_INLINE shz_vec4_t shz_vec4_div(shz_vec4_t vec1, shz_vec4_t vec2) SHZ_NOEXCEPT {
+#if SHZ_BACKEND == SHZ_SPU
+    return shz_vec4_div_spu(vec1, vec2);
+#else
     return shz_vec3_vec4(shz_vec3_div(vec1.xyz, vec2.xyz), shz_divf(vec1.w, vec2.w));
+#endif
 }
 
 SHZ_FORCE_INLINE shz_vec2_t shz_vec2_scale(shz_vec2_t vec, float factor) SHZ_NOEXCEPT {
@@ -128,7 +154,12 @@ SHZ_FORCE_INLINE shz_vec3_t shz_vec3_scale(shz_vec3_t vec, float factor) SHZ_NOE
 }
 
 SHZ_FORCE_INLINE shz_vec4_t shz_vec4_scale(shz_vec4_t vec, float factor) SHZ_NOEXCEPT {
+    // SPUs don't like non quadwords
+#if SHZ_BACKEND == SHZ_SPU
+    return shz_vec4_mul(vec, shz_vec4_fill(factor));
+#else
     return shz_vec3_vec4(shz_vec3_scale(vec.xyz, factor), vec.w * factor);
+#endif
 }
 
 SHZ_FORCE_INLINE float shz_vec2_magnitude_sqr(shz_vec2_t vec) SHZ_NOEXCEPT {
@@ -144,60 +175,96 @@ SHZ_FORCE_INLINE float shz_vec4_magnitude_sqr(shz_vec4_t vec) SHZ_NOEXCEPT {
 }
 
 SHZ_FORCE_INLINE float shz_vec2_magnitude(shz_vec2_t vec) SHZ_NOEXCEPT {
-    return shz_sqrtf_fsrra(shz_vec2_magnitude_sqr(vec));
+    return shz_sqrtf(shz_vec2_magnitude_sqr(vec));
 }
 
 SHZ_FORCE_INLINE float shz_vec3_magnitude(shz_vec3_t vec) SHZ_NOEXCEPT {
-    return shz_sqrtf_fsrra(shz_vec3_magnitude_sqr(vec));
+    return shz_sqrtf(shz_vec3_magnitude_sqr(vec));
 }
 
 SHZ_FORCE_INLINE float shz_vec4_magnitude(shz_vec4_t vec) SHZ_NOEXCEPT {
+    return shz_sqrtf(shz_vec4_magnitude_sqr(vec));
+}
+
+SHZ_FORCE_INLINE float shz_vec2_magnitude_fsrra(shz_vec2_t vec) SHZ_NOEXCEPT {
+    return shz_sqrtf_fsrra(shz_vec2_magnitude_sqr(vec));
+}
+
+SHZ_FORCE_INLINE float shz_vec3_magnitude_fsrra(shz_vec3_t vec) SHZ_NOEXCEPT {
+    return shz_sqrtf_fsrra(shz_vec3_magnitude_sqr(vec));
+}
+
+SHZ_FORCE_INLINE float shz_vec4_magnitude_fsrra(shz_vec4_t vec) SHZ_NOEXCEPT {
     return shz_sqrtf_fsrra(shz_vec4_magnitude_sqr(vec));
 }
 
 SHZ_FORCE_INLINE float shz_vec2_magnitude_inv(shz_vec2_t vec) SHZ_NOEXCEPT {
-    return shz_inv_sqrtf_fsrra(shz_vec2_magnitude_sqr(vec));
+    return shz_inv_sqrtf(shz_vec2_magnitude_sqr(vec));
 }
 
 SHZ_FORCE_INLINE float shz_vec3_magnitude_inv(shz_vec3_t vec) SHZ_NOEXCEPT {
-    return shz_inv_sqrtf_fsrra(shz_vec3_magnitude_sqr(vec));
+    return shz_inv_sqrtf(shz_vec3_magnitude_sqr(vec));
 }
 
 SHZ_FORCE_INLINE float shz_vec4_magnitude_inv(shz_vec4_t vec) SHZ_NOEXCEPT {
+    return shz_inv_sqrtf(shz_vec4_magnitude_sqr(vec));
+}
+
+SHZ_FORCE_INLINE float shz_vec2_magnitude_inv_fsrra(shz_vec2_t vec) SHZ_NOEXCEPT {
+    return shz_inv_sqrtf_fsrra(shz_vec2_magnitude_sqr(vec));
+}
+
+SHZ_FORCE_INLINE float shz_vec3_magnitude_inv_fsrra(shz_vec3_t vec) SHZ_NOEXCEPT {
+    return shz_inv_sqrtf_fsrra(shz_vec3_magnitude_sqr(vec));
+}
+
+SHZ_FORCE_INLINE float shz_vec4_magnitude_inv_fsrra(shz_vec4_t vec) SHZ_NOEXCEPT {
     return shz_inv_sqrtf_fsrra(shz_vec4_magnitude_sqr(vec));
 }
 
 SHZ_FORCE_INLINE shz_vec2_t shz_vec2_normalize(shz_vec2_t vec) SHZ_NOEXCEPT {
-    return shz_vec2_scale(vec, shz_vec2_magnitude_inv(vec));
+    return shz_vec2_scale(vec, shz_vec2_magnitude_inv_fsrra(vec));
 }
 
 SHZ_FORCE_INLINE shz_vec3_t shz_vec3_normalize(shz_vec3_t vec) SHZ_NOEXCEPT {
-    return shz_vec3_scale(vec, shz_vec3_magnitude_inv(vec));
+    return shz_vec3_scale(vec, shz_vec3_magnitude_inv_fsrra(vec));
 }
 
 SHZ_FORCE_INLINE shz_vec4_t shz_vec4_normalize(shz_vec4_t vec) SHZ_NOEXCEPT {
-    return shz_vec4_scale(vec, shz_vec4_magnitude_inv(vec));
+    return shz_vec4_scale(vec, shz_vec4_magnitude_inv_fsrra(vec));
+}
+
+SHZ_FORCE_INLINE shz_vec2_t shz_vec2_normalize_or(shz_vec2_t vec, shz_vec2_t alt) SHZ_NOEXCEPT {
+    const float sqr_mag = shz_vec2_magnitude_sqr(vec);
+
+    return (sqr_mag == 0.0f)?
+        alt : shz_vec2_scale(vec, shz_inv_sqrtf_fsrra(sqr_mag));
+}
+
+SHZ_FORCE_INLINE shz_vec3_t shz_vec3_normalize_or(shz_vec3_t vec, shz_vec3_t alt) SHZ_NOEXCEPT {
+    const float sqr_mag = shz_vec3_magnitude_sqr(vec);
+
+    return (sqr_mag == 0.0f)?
+        alt : shz_vec3_scale(vec, shz_inv_sqrtf_fsrra(sqr_mag));
+}
+
+SHZ_FORCE_INLINE shz_vec4_t shz_vec4_normalize_or(shz_vec4_t vec, shz_vec4_t alt) SHZ_NOEXCEPT {
+    const float sqr_mag = shz_vec4_magnitude_sqr(vec);
+
+    return (sqr_mag == 0.0f)?
+        alt : shz_vec4_scale(vec, shz_inv_sqrtf_fsrra(sqr_mag));
 }
 
 SHZ_FORCE_INLINE shz_vec2_t shz_vec2_normalize_safe(shz_vec2_t vec) SHZ_NOEXCEPT {
-    float mag = shz_vec2_magnitude_sqr(vec);
-
-    return (mag > 0.0f)? shz_vec2_scale(vec, shz_inv_sqrtf_fsrra(mag)) :
-                         shz_vec2_fill(0.0f);
+    return shz_vec2_normalize_or(vec, shz_vec2_fill(0.0f));
 }
 
 SHZ_FORCE_INLINE shz_vec3_t shz_vec3_normalize_safe(shz_vec3_t vec) SHZ_NOEXCEPT {
-    float mag = shz_vec3_magnitude_sqr(vec);
-
-    return (mag > 0.0f)? shz_vec3_scale(vec, shz_inv_sqrtf_fsrra(mag)) :
-                         shz_vec3_fill(0.0f);
+    return shz_vec3_normalize_or(vec, shz_vec3_fill(0.0f));
 }
 
 SHZ_FORCE_INLINE shz_vec4_t shz_vec4_normalize_safe(shz_vec4_t vec) SHZ_NOEXCEPT {
-    float mag = shz_vec4_magnitude_sqr(vec);
-
-    return (mag > 0.0f)? shz_vec4_scale(vec, shz_inv_sqrtf_fsrra(mag)) :
-                         shz_vec4_fill(0.0f);
+    return shz_vec4_normalize_or(vec, shz_vec4_fill(0.0f));
 }
 
 SHZ_FORCE_INLINE shz_vec2_t shz_vec2_abs(shz_vec2_t vec) SHZ_NOEXCEPT {
@@ -221,7 +288,11 @@ SHZ_FORCE_INLINE shz_vec3_t shz_vec3_neg(shz_vec3_t vec) SHZ_NOEXCEPT {
 }
 
 SHZ_FORCE_INLINE shz_vec4_t shz_vec4_neg(shz_vec4_t vec) SHZ_NOEXCEPT {
+#if SHZ_BACKEND == SHZ_SPU
+    return shz_vec4_mul(vec, shz_vec4_fill(-1.0f));
+#else
     return shz_vec3_vec4(shz_vec3_neg(vec.xyz), -vec.w);
+#endif
 }
 
 SHZ_FORCE_INLINE shz_vec2_t shz_vec2_inv(shz_vec2_t vec) SHZ_NOEXCEPT {
@@ -230,10 +301,14 @@ SHZ_FORCE_INLINE shz_vec2_t shz_vec2_inv(shz_vec2_t vec) SHZ_NOEXCEPT {
 
 SHZ_FORCE_INLINE shz_vec3_t shz_vec3_inv(shz_vec3_t vec) SHZ_NOEXCEPT {
     return shz_vec2_vec3(shz_vec2_inv(vec.xy), shz_invf(vec.z));
-}
+}   
 
 SHZ_FORCE_INLINE shz_vec4_t shz_vec4_inv(shz_vec4_t vec) SHZ_NOEXCEPT {
+#if SHZ_BACKEND == SHZ_SPU
+    return shz_vec4_div(shz_vec4_fill(1.0f), vec);
+#else
     return shz_vec3_vec4(shz_vec3_inv(vec.xyz), shz_invf(vec.w));
+#endif
 }
 
 SHZ_FORCE_INLINE float shz_vec2_max(shz_vec2_t vec) SHZ_NOEXCEPT {
@@ -563,8 +638,8 @@ SHZ_FORCE_INLINE shz_vec3_t shz_vec3_barycenter(shz_vec3_t p,
 
 SHZ_INLINE shz_vec3_t shz_vec3_perp(shz_vec3_t vec) SHZ_NOEXCEPT {
     shz_vec3_t cardinal_axis = shz_vec3_init(1.0f, 0.0f, 0.0f);
-    float min = shz_fabsf(vec.x);
-    float maybe_min;
+    float      min           = shz_fabsf(vec.x);
+    float      maybe_min;
 
     if ((maybe_min = shz_fabsf(vec.y)) < min) {
         min = maybe_min;
@@ -852,6 +927,38 @@ SHZ_FORCE_INLINE shz_vec3_t shz_vec3_maxv(shz_vec3_t a, shz_vec3_t b) SHZ_NOEXCE
 
 SHZ_FORCE_INLINE shz_vec4_t shz_vec4_maxv(shz_vec4_t a, shz_vec4_t b) SHZ_NOEXCEPT {
     return shz_vec3_vec4(shz_vec3_maxv(a.xyz, b.xyz), shz_fmaxf(a.w, b.w));
+}
+
+SHZ_INLINE shz_vec2_t shz_vec2_inv_sqrtf(shz_vec2_t vec) SHZ_NOEXCEPT {
+    return shz_vec2_init(shz_inv_sqrtf(vec.x), shz_inv_sqrtf(vec.y));
+}
+
+SHZ_INLINE shz_vec3_t shz_vec3_inv_sqrtf(shz_vec3_t vec) SHZ_NOEXCEPT {
+    return shz_vec2_vec3(shz_vec2_inv_sqrtf(vec.xy), shz_inv_sqrtf(vec.z));
+}
+
+SHZ_INLINE shz_vec4_t shz_vec4_inv_sqrtf(shz_vec4_t vec) SHZ_NOEXCEPT {
+#if SHZ_BACKEND == SHZ_SPU
+    return shz_vec4_inv_sqrtf_spu(vec);
+#else
+    return shz_vec3_vec4(shz_vec3_inv_sqrtf(vec.xyz), shz_inv_sqrtf(vec.w));
+#endif
+}
+
+SHZ_INLINE shz_vec2_t shz_vec2_sqrtf(shz_vec2_t vec) SHZ_NOEXCEPT {
+    return shz_vec2_init(shz_sqrtf(vec.x), shz_sqrtf(vec.y));
+}
+
+SHZ_INLINE shz_vec3_t shz_vec3_sqrtf(shz_vec3_t vec) SHZ_NOEXCEPT {
+    return shz_vec2_vec3(shz_vec2_sqrtf(vec.xy), shz_sqrtf(vec.z));
+}
+
+SHZ_INLINE shz_vec4_t shz_vec4_sqrtf(shz_vec4_t vec) SHZ_NOEXCEPT {
+#if SHZ_BACKEND == SHZ_SPU
+    return shz_vec4_mul(vec, shz_vec4_inv_sqrtf(vec));
+#else
+    return shz_vec3_vec4(shz_vec3_sqrtf(vec.xyz), shz_sqrtf(vec.w));
+#endif
 }
 
  //! \endcond

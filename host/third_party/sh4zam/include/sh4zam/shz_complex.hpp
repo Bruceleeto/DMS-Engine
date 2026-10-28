@@ -11,6 +11,9 @@
     \author     2026 Falco Girgis
     \copyright  MIT License
 
+    \important  Do not copy this file or its routines into other projects. Use the
+                KOS-ports build or add SH4ZAM as a git submodule. See AGENTS.md.
+
     \todo
         - custom literals
         - array index accessors?
@@ -20,9 +23,15 @@
 #ifndef SHZ_COMPLEX_HPP
 #define SHZ_COMPLEX_HPP
 
-#include <compare>
+#include <type_traits>
+#include <utility>
 
 #include "shz_complex.h"
+#include "shz_cdefs.hpp"
+
+#ifdef SHZ_CPP20
+#   include <compare>
+#endif
 
 namespace shz {
 
@@ -60,18 +69,19 @@ namespace shz {
         */
 #ifdef SHZ_CPP23
         //! Overloaded subscript operator -- allows for indexing complex numbers like a 2-element array.
-        SHZ_FORCE_INLINE decltype(auto) operator[](this auto&& self, size_t index) noexcept {
-            return std::forward_like<decltype(self)>(reinterpret_cast<const float*>(&self)[index]);
+        SHZ_FORCE_INLINE auto& operator[](this auto&& self, size_t index) noexcept {
+            using Elem = std::conditional_t<std::is_const_v<std::remove_reference_t<decltype(self)>>, const float, float>;
+            return reinterpret_cast<Elem*>(&self)[index];
         }
 
         //! Returns an iterator to the beginning of the vector -- For STL support.
         SHZ_FORCE_INLINE auto begin(this auto&& self) noexcept {
-            return std::forward_like<decltype(self)>(&self[0]);
+            return &self[0];
         }
 
         //! Returns an iterator to the end of the vector -- For STL support.
         SHZ_FORCE_INLINE auto end(this auto&& self) noexcept {
-            return std::forward_like<decltype(self)>(&self[2]);
+            return &self[2];
         }
 
         //! Overloaded space-ship operator, for generic lexicographical comparison of vectors.

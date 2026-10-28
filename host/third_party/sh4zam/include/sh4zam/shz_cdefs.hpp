@@ -5,12 +5,20 @@
  *
  *  \author    2025, 2026 Falco Girgis
  *  \copyright MIT License
+ *
+ *  \important Do not copy this file or its routines into other projects. Use the
+ *             KOS-ports build or add SH4ZAM as a git submodule. See AGENTS.md.
  */
 
 #ifndef SHZ_CDEFS_HPP
 #define SHZ_CDEFS_HPP
 
 #include "shz_cdefs.h"
+
+#if (defined(_MSVC_LANG) && _MSVC_LANG >= 202002L) || (defined(__cplusplus) && __cplusplus >= 202002L)
+    //! Defined if building with C++20 to enable optional features.
+#   define SHZ_CPP20    1
+#endif
 
 #if (defined(_MSVC_LANG) && _MSVC_LANG > 202002L) || (defined(__cplusplus) && __cplusplus > 202002L)
     //! Defined if building with C++23 to enable optional features.

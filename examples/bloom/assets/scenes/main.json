@@ -1,0 +1,14 @@
+{
+  "dms_scene": 1,
+  "background": "#05060a",
+  "camera": { "pos": [0, 101.562286, 217.423508], "yaw": -176.547546, "pitch": 24.249407, "fov": 60 },
+  "lights": [],
+  "objects": [
+    { "name": "Arena", "model": "bloom/arena.dms",
+      "pos": [0, 0, 0], "rot": [0, 0, 0], "scale": [1, 1, 1],
+      "tint": "#ffffff", "add": false, "visible": true },
+    { "name": "Middle", "model": "",
+      "pos": [-19.5, -44.3, -105.8], "rot": [0, 0, 0], "scale": [1, 1, 1],
+      "tint": "#ffffff", "add": false, "visible": true }
+  ]
+}

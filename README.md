@@ -26,7 +26,7 @@ the repo root:
 |---|---|
 | `make teapot` | Converts `examples/teapot/assets/` into `examples/teapot/pc/` and builds `build/teapot/teapot.elf` |
 | `make teapot/run` | Sends the ELF with `dc-tool`, serving `pc/` as `/pc/` |
-| `make teapot/disc` | Builds `build/teapot/teapot.cdi`, reading from `/cd/` with `pc/` as the disc root (needs `mkdcdisc`) |
+| `make teapot/disc` | Packs the same ELF as `run` into `build/teapot/teapot.cdi` with `pc/` as the disc root (needs `mkdcdisc`); assets under `/pc/` are found at `/cd/`, so nothing is recompiled |
 | `make teapot/flycast` | Builds the disc image and opens it in Flycast (`FLYCAST=...` if it is not on the PATH) |
 | `make teapot/assets` | Converts assets only |
 | `make teapot/clean`, `make teapot/assets-clean` | Removes `build/teapot/` or `pc/` |

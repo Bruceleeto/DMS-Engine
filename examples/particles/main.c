@@ -10,8 +10,9 @@
 #include "dms/dc_draw2d.h"
 #include "dms/dc_particles.h"
 #include "dms/dc_debug.h"
+#include "dms/dc_scene.h"
 
-/* Where assets are read from: /pc/ over dcload, /cd/ when built with make disc */
+/* Where assets are read from: /pc/ over dcload; on a disc the engine finds them at /cd/ */
 #ifndef ASSETS
 #define ASSETS "/pc/"
 #endif
@@ -19,13 +20,15 @@
 #define LOOK_SPEED  1.5f
 #define ZOOM_SPEED  12.0f
 
-#define FLOOR_Y     0.0f
 #define MOST        600         /* alive at once, as in the PowerVR demo */
 #define BURST       200         /* the A button */
 
+/* scenes/main.json holds the Floor, the Fountain marker the fire comes up
+ * from and the camera's start; the stick then turns it about the fountain. */
+
 /* ---- App state ---- */
 static DCCamera camera;
-static DMSModel* floor_model = NULL;
+static DCScene* scene = NULL;
 static DCParticles* fire = NULL;
 
 static float distance = 26.0f;
@@ -43,17 +46,21 @@ int main(int argc, char* argv[]) {
     dc_draw2d_init();
     dc_debug_init();
 
-    dc_camera_init(&camera);
-    camera.yaw = 0.5f;
-    camera.pitch = 0.35f;
+    scene = dc_scene_play(ASSETS, "scenes/main.json");
+    if (!scene) return 1;
+    dc_scene_apply(scene);
+    dc_scene_camera(scene, &camera);
 
-    floor_model = dc_model_load(ASSETS "world/floor.dms");
+    DCSceneObject* floor = dc_scene_find(scene, "Floor");
+    DCSceneObject* fountain = dc_scene_find(scene, "Fountain");
+    float floor_y = floor ? floor->pos.y : 0.0f;
+    shz_vec3_t at = fountain ? fountain->pos : shz_vec3_init(0.0f, floor_y, 0.0f);
 
     /* A fountain of fire: thrown up from a small spot on the floor, pulled
      * back down, bouncing when it lands. Grey-pink as it is born, red at its
      * height, going out as it dies. */
     fire = dc_particles_create(MOST, &(DCParticleOpts){
-        .pos          = shz_vec3_init(0.0f, FLOOR_Y + 0.5f, 0.0f),
+        .pos          = shz_vec3_init(at.x, at.y + 0.5f, at.z),
         .spread       = shz_vec3_init(0.5f, 0.0f, 0.5f),
         .speed        = shz_vec3_init(0.0f, 14.0f, 0.0f),
         .speed_spread = shz_vec3_init(2.5f, 6.0f, 2.5f),
@@ -64,14 +71,13 @@ int main(int argc, char* argv[]) {
         .middle       = 0xFF2000,
         .end          = 0x000000,
         .rate         = (float)MOST / 4.0f,     /* enough to keep MOST alive */
-        .floor_y      = FLOOR_Y,
+        .floor_y      = floor_y,
         .bounce       = true,
     });
 
     printf("VRAM free after loading: %luKB\n", (unsigned long)(pvr_mem_available() / 1024));
 
-    shz_vec3_t origin = shz_vec3_init(0.0f, 0.0f, 0.0f);
-    shz_vec3_t middle = shz_vec3_init(0.0f, 6.0f, 0.0f);
+    shz_vec3_t middle = shz_vec3_init(at.x, at.y + 6.0f, at.z);
 
     while (!check_exit()) {
         dc_frame_begin();
@@ -92,14 +98,14 @@ int main(int argc, char* argv[]) {
 
         /* ---- Rendering ---- */
         dc_set_camera(&camera);
-        dc_draw(floor_model, origin);
+        dc_scene_draw(scene);
         dc_particles_draw(fire);
         dc_debug_stats();
         dc_frame_end();
     }
 
     dc_particles_free(fire);
-    dc_model_free(floor_model);
+    dc_scene_free(scene);
     dc_shutdown();
 
     return 0;

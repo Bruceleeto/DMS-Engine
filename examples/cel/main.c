@@ -8,14 +8,19 @@
 #include "dms/dc_draw.h"
 #include "dms/dc_draw2d.h"
 #include "dms/dc_debug.h"
+#include "dms/dc_scene.h"
 
-/* Where assets are read from: /pc/ over dcload, /cd/ when built with make disc */
+/* Where assets are read from: /pc/ over dcload; on a disc the engine finds them at /cd/ */
 #ifndef ASSETS
 #define ASSETS "/pc/"
 #endif
 
 /* A light going around a cel shaded model. .bands on the light is all it
- * takes. */
+ * takes.
+ *
+ * The model, the camera's start and the light (its colour, reach, ambient,
+ * bands, and where it starts: the code takes it around the model at that
+ * height and that far out) are scenes/main.json. */
 
 #define LOOK_SPEED   1.5f
 #define ZOOM_SPEED   40.0f
@@ -24,8 +29,6 @@
 #define LOOK_Y       23.0f   /* half the model's height */
 
 #define LIGHT_SPEED  0.8f    /* radians a second */
-#define LIGHT_REACH  40.0f   /* how far out it goes around */
-#define LIGHT_HEIGHT 45.0f
 
 static const int bands_steps[] = { 3, 4, 0, 2 };   /* A steps through them. 0 is smooth */
 
@@ -38,22 +41,32 @@ int main(int argc, char* argv[]) {
     dc_init((DCInitParams){ .vram_size = 1024 * 1024 });
     dc_draw2d_init();
     dc_debug_init();
-    dc_set_clear_color(0xFF202838);
 
-    DCCamera camera;
-    dc_camera_init(&camera);
-    camera.yaw = 0.3f;
-    camera.pitch = 0.15f;
-
-    DMSModel* model = dc_model_load(ASSETS "cel/scene.dms");
+    DCScene* scene = dc_scene_play(ASSETS, "scenes/main.json");
+    if (!scene) return 1;
+    dc_scene_apply(scene);
+    const DCSceneObject* model = dc_scene_find(scene, "Model");
+    if (!model || !scene->light_count) { printf("CEL: the scene needs an object called Model and a light\n"); return 1; }
 
     printf("CEL: A bands, B stops the light, triggers zoom, stick turns, Start exits\n");
 
-    shz_vec3_t look = shz_vec3_init(0.0f, LOOK_Y, 0.0f);
-    float distance = 75.0f;
-    float around = 0.0f;
+    /* The camera turns about the model from where the scene's is */
+    DCCamera camera;
+    dc_scene_camera(scene, &camera);
+    shz_vec3_t look = shz_vec3_add(model->pos, shz_vec3_init(0.0f, LOOK_Y, 0.0f));
+    float vx = camera.pos.x - look.x, vy = camera.pos.y - look.y, vz = camera.pos.z - look.z;
+    float distance = sqrtf(vx * vx + vy * vy + vz * vz);
+    camera.pitch = asinf(vy / distance);
+    camera.yaw   = atan2f(-vx, -vz);
+
+    /* The light goes around the model's middle at its height and distance */
+    DCLight light = scene->lights[0].light;
+    float lx = light.pos.x - model->pos.x, lz = light.pos.z - model->pos.z;
+    float reach = sqrtf(lx * lx + lz * lz);
+    float around = atan2f(lx, lz);
     bool moving = true;
     int step = 0;
+    while (step < 3 && bands_steps[step] != light.bands) step++;
 
     while (!check_exit()) {
         dc_frame_begin();
@@ -74,15 +87,12 @@ int main(int argc, char* argv[]) {
 
         shz_sincos_t sc = shz_sincosf(around);
         int bands = bands_steps[step];
-        dc_set_light(&(DCLight){
-            .pos     = shz_vec3_init(LIGHT_REACH * sc.sin, LIGHT_HEIGHT, LIGHT_REACH * sc.cos),
-            .range   = 150.0f,
-            .ambient = 0.4f,
-            .bands   = bands,
-        });
+        light.pos   = shz_vec3_init(model->pos.x + reach * sc.sin, light.pos.y, model->pos.z + reach * sc.cos);
+        light.bands = bands;
+        dc_set_light(&light);
 
         dc_set_camera(&camera);
-        dc_draw(model, shz_vec3_init(0.0f, 0.0f, 0.0f));
+        dc_scene_draw(scene);
 
         char line[32];
         if (bands) snprintf(line, sizeof(line), "%d bands", bands);
@@ -94,7 +104,7 @@ int main(int argc, char* argv[]) {
     }
 
     dc_set_light(NULL);
-    dc_model_free(model);
+    dc_scene_free(scene);
     dc_shutdown();
     return 0;
 }

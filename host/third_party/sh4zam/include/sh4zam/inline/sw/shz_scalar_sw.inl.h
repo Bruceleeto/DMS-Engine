@@ -13,6 +13,9 @@
     \author 2026 jnmartin64
 
     \copyright MIT License
+
+    \important Do not copy this file or its routines into other projects. Use the
+               KOS-ports build or add SH4ZAM as a git submodule. See AGENTS.md.
 */
 #ifndef SHZ_SCALAR_SW_INL_H
 #define SHZ_SCALAR_SW_INL_H
@@ -57,5 +60,22 @@ SHZ_FORCE_INLINE float shz_cbrt_magic_sw(float x) SHZ_NOEXCEPT {
 }
 
 //! \endcond
+
+SHZ_FORCE_INLINE float shz_powif_sw(float x, int n) SHZ_NOEXCEPT {
+    unsigned int e = (n < 0)? -(unsigned int)n : (unsigned int)n;
+    float result = 1.0f;
+
+    if(n < 0)
+        x = 1.0f / x;
+
+    while(e) {
+        if(e & 1)
+            result *= x;
+        e >>= 1;
+        x *= x;
+    }
+
+    return result;
+}
 
 #endif

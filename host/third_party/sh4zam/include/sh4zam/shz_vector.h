@@ -9,6 +9,9 @@
  *  \author 2025 Paul Cercueil
  *
  *  \copyright MIT License
+ *
+ *  \important Do not copy this file or its routines into other projects. Use the
+ *             KOS-ports build or add SH4ZAM as a git submodule. See AGENTS.md.
  */
 
 #ifndef SHZ_VECTOR_H
@@ -81,7 +84,7 @@ typedef shz_vec3_t shz_vec3;
  */
 typedef struct shz_vec4 {
     union {
-        float e[4];                 //!< <X, Y, Z, W> coordinates as an array.
+        float e SHZ_SIMD(16);                 //!< <X, Y, Z, W> coordinates as an array.
         struct {
             union {
                 struct {
@@ -323,6 +326,24 @@ SHZ_INLINE shz_vec3_t shz_vec3_smoothstepv_safe(shz_vec3_t vec, shz_vec3_t edge0
 //! For each component i: returns 0.0f at/below edge0[i], 1.0f at/above edge1[i], smoothly varying in-between. Accepts inverse edges.
 SHZ_INLINE shz_vec4_t shz_vec4_smoothstepv_safe(shz_vec4_t vec, shz_vec4_t edge0, shz_vec4_t edge1) SHZ_NOEXCEPT;
 
+//! Returns a 2D vector whose components are the inverse square root of the given vector's components.
+SHZ_INLINE shz_vec2_t shz_vec2_inv_sqrtf(shz_vec2_t vec) SHZ_NOEXCEPT;
+
+//! Returns a 3D vector whose components are the inverse square root of the given vector's components.
+SHZ_INLINE shz_vec3_t shz_vec3_inv_sqrtf(shz_vec3_t vec) SHZ_NOEXCEPT;
+
+//! Returns a 4D vector whose components are the inverse square root of the given vector's components.
+SHZ_INLINE shz_vec4_t shz_vec4_inv_sqrtf(shz_vec4_t vec) SHZ_NOEXCEPT;
+
+//! Returns a 2D vector whose components are the square root of the given vector's components.
+SHZ_INLINE shz_vec2_t shz_vec2_sqrtf(shz_vec2_t vec) SHZ_NOEXCEPT;
+
+//! Returns a 3D vector whose components are the square root of the given vector's components.
+SHZ_INLINE shz_vec3_t shz_vec3_sqrtf(shz_vec3_t vec) SHZ_NOEXCEPT;
+
+//! Returns a 4D vector whose components are the square root of the given vector's components.
+SHZ_INLINE shz_vec4_t shz_vec4_sqrtf(shz_vec4_t vec) SHZ_NOEXCEPT;
+
 
 //! @}
 
@@ -392,48 +413,267 @@ SHZ_INLINE float shz_vec4_magnitude_sqr(shz_vec4_t vec) SHZ_NOEXCEPT;
 //! Returns the squared magnitude of the given 3D vector.
 SHZ_INLINE float shz_vec3_magnitude_sqr(shz_vec3_t vec) SHZ_NOEXCEPT;
 
-//! Returns the magnitude of the given 2D vector.
+/*! Returns the magnitude of the given 2D vector.
+
+    Safely returns `0.0f` when \p vec has a magnitude of `0.0f`.
+
+    \param  vec     The vector whose magnitude is returned.
+    \returns        The magnitude of \p vec.
+
+    \sa shz_vec2_magnitude_fsrra(), shz_vec2_magnitude_sqr(), shz_vec2_magnitude_inv()
+*/
 SHZ_INLINE float shz_vec2_magnitude(shz_vec2_t vec) SHZ_NOEXCEPT;
 
-//! Returns the magnitude of the given 3D vector.
+/*! Returns the magnitude of the given 3D vector.
+
+    Safely returns `0.0f` when \p vec has a magnitude of `0.0f`.
+
+    \param  vec     The vector whose magnitude is returned.
+    \returns        The magnitude of \p vec.
+
+    \sa shz_vec3_magnitude_fsrra(), shz_vec3_magnitude_sqr(), shz_vec3_magnitude_inv()
+*/
 SHZ_INLINE float shz_vec3_magnitude(shz_vec3_t vec) SHZ_NOEXCEPT;
 
-//! Returns the magnitude of the given 4D vector.
+/*! Returns the magnitude of the given 4D vector.
+
+    Safely returns `0.0f` when \p vec has a magnitude of `0.0f`.
+
+    \param  vec     The vector whose magnitude is returned.
+    \returns        The magnitude of \p vec.
+
+    \sa shz_vec4_magnitude_fsrra(), shz_vec4_magnitude_sqr(), shz_vec4_magnitude_inv()
+*/
 SHZ_INLINE float shz_vec4_magnitude(shz_vec4_t vec) SHZ_NOEXCEPT;
 
-//! Returns the inverse magnitude of the given 2D vector.
+/*! Returns the magnitude of the given 2D vector, unsafely, using FSRRA.
+
+    Faster alternative to shz_vec2_magnitude() which does not check for a
+    zero-length vector.
+
+    \warning Results in a division-by-zero when \p vec has a magnitude of `0.0f`.
+
+    \param  vec     The vector whose magnitude is returned.
+    \returns        The magnitude of \p vec.
+
+    \sa shz_vec2_magnitude()
+*/
+SHZ_INLINE float shz_vec2_magnitude_fsrra(shz_vec2_t vec) SHZ_NOEXCEPT;
+
+/*! Returns the magnitude of the given 3D vector, unsafely, using FSRRA.
+
+    Faster alternative to shz_vec3_magnitude() which does not check for a
+    zero-length vector.
+
+    \warning Results in a division-by-zero when \p vec has a magnitude of `0.0f`.
+
+    \param  vec     The vector whose magnitude is returned.
+    \returns        The magnitude of \p vec.
+
+    \sa shz_vec3_magnitude()
+*/
+SHZ_INLINE float shz_vec3_magnitude_fsrra(shz_vec3_t vec) SHZ_NOEXCEPT;
+
+/*! Returns the magnitude of the given 4D vector, unsafely, using FSRRA.
+
+    Faster alternative to shz_vec4_magnitude() which does not check for a
+    zero-length vector.
+
+    \warning Results in a division-by-zero when \p vec has a magnitude of `0.0f`.
+
+    \param  vec     The vector whose magnitude is returned.
+    \returns        The magnitude of \p vec.
+
+    \sa shz_vec4_magnitude()
+*/
+SHZ_INLINE float shz_vec4_magnitude_fsrra(shz_vec4_t vec) SHZ_NOEXCEPT;
+
+/*! Returns the inverse magnitude of the given 2D vector.
+
+    Safely returns `0.0f` when \p vec has a magnitude of `0.0f`.
+
+    \param  vec     The vector whose inverse magnitude is returned.
+    \returns        `1.0f` divided by the magnitude of \p vec.
+
+    \sa shz_vec2_magnitude_inv_fsrra(), shz_vec2_magnitude()
+*/
 SHZ_INLINE float shz_vec2_magnitude_inv(shz_vec2_t vec) SHZ_NOEXCEPT;
 
-//! Returns the inverse magnitude of the given 3D vector.
+/*! Returns the inverse magnitude of the given 3D vector.
+
+    Safely returns `0.0f` when \p vec has a magnitude of `0.0f`.
+
+    \param  vec     The vector whose inverse magnitude is returned.
+    \returns        `1.0f` divided by the magnitude of \p vec.
+
+    \sa shz_vec3_magnitude_inv_fsrra(), shz_vec3_magnitude()
+*/
 SHZ_INLINE float shz_vec3_magnitude_inv(shz_vec3_t vec) SHZ_NOEXCEPT;
 
-//! Returns the inverse magnitude of the given 4D vector.
+/*! Returns the inverse magnitude of the given 4D vector.
+
+    Safely returns `0.0f` when \p vec has a magnitude of `0.0f`.
+
+    \param  vec     The vector whose inverse magnitude is returned.
+    \returns        `1.0f` divided by the magnitude of \p vec.
+
+    \sa shz_vec4_magnitude_inv_fsrra(), shz_vec4_magnitude()
+*/
 SHZ_INLINE float shz_vec4_magnitude_inv(shz_vec4_t vec) SHZ_NOEXCEPT;
 
-//! Returns a normalized unit vector from the given 2D vector.
+/*! Returns the inverse magnitude of the given 2D vector, unsafely, using FSRRA.
+
+    Faster alternative to shz_vec2_magnitude_inv() which does not check for a
+    zero-length vector.
+
+    \warning Results in a division-by-zero when \p vec has a magnitude of `0.0f`.
+
+    \param  vec     The vector whose inverse magnitude is returned.
+    \returns        `1.0f` divided by the magnitude of \p vec.
+
+    \sa shz_vec2_magnitude_inv()
+*/
+SHZ_INLINE float shz_vec2_magnitude_inv_fsrra(shz_vec2_t vec) SHZ_NOEXCEPT;
+
+/*! Returns the inverse magnitude of the given 3D vector, unsafely, using FSRRA.
+
+    Faster alternative to shz_vec3_magnitude_inv() which does not check for a
+    zero-length vector.
+
+    \warning Results in a division-by-zero when \p vec has a magnitude of `0.0f`.
+
+    \param  vec     The vector whose inverse magnitude is returned.
+    \returns        `1.0f` divided by the magnitude of \p vec.
+
+    \sa shz_vec3_magnitude_inv()
+*/
+SHZ_INLINE float shz_vec3_magnitude_inv_fsrra(shz_vec3_t vec) SHZ_NOEXCEPT;
+
+/*! Returns the inverse magnitude of the given 4D vector, unsafely, using FSRRA.
+
+    Faster alternative to shz_vec4_magnitude_inv() which does not check for a
+    zero-length vector.
+
+    \warning Results in a division-by-zero when \p vec has a magnitude of `0.0f`.
+
+    \param  vec     The vector whose inverse magnitude is returned.
+    \returns        `1.0f` divided by the magnitude of \p vec.
+
+    \sa shz_vec4_magnitude_inv()
+*/
+SHZ_INLINE float shz_vec4_magnitude_inv_fsrra(shz_vec4_t vec) SHZ_NOEXCEPT;
+
+/*! Returns a normalized unit vector from the given 2D vector.
+
+    This is the fastest normalization routine, which does not check for a
+    zero-length vector.
+
+    \warning Results in a division-by-zero when \p vec has a magnitude of `0.0f`.
+
+    \param  vec     The vector to normalize.
+    \returns        The unit vector pointing in the same direction as \p vec.
+
+    \sa shz_vec2_normalize_or(), shz_vec2_normalize_safe()
+*/
 SHZ_INLINE shz_vec2_t shz_vec2_normalize(shz_vec2_t vec) SHZ_NOEXCEPT;
 
-//! Returns a normalized unit vector from the given 3D vector.
+/*! Returns a normalized unit vector from the given 3D vector.
+
+    This is the fastest normalization routine, which does not check for a
+    zero-length vector.
+
+    \warning Results in a division-by-zero when \p vec has a magnitude of `0.0f`.
+
+    \param  vec     The vector to normalize.
+    \returns        The unit vector pointing in the same direction as \p vec.
+
+    \sa shz_vec3_normalize_or(), shz_vec3_normalize_safe()
+*/
 SHZ_INLINE shz_vec3_t shz_vec3_normalize(shz_vec3_t vec) SHZ_NOEXCEPT;
 
-//! Returns a normalized unit vector from the given 4D vector.
+/*! Returns a normalized unit vector from the given 4D vector.
+
+    This is the fastest normalization routine, which does not check for a
+    zero-length vector.
+
+    \warning Results in a division-by-zero when \p vec has a magnitude of `0.0f`.
+
+    \param  vec     The vector to normalize.
+    \returns        The unit vector pointing in the same direction as \p vec.
+
+    \sa shz_vec4_normalize_or(), shz_vec4_normalize_safe()
+*/
 SHZ_INLINE shz_vec4_t shz_vec4_normalize(shz_vec4_t vec) SHZ_NOEXCEPT;
+
+/*! Returns a normalized unit vector from the given 2D vector, or an alternate value.
+
+    Safely returns \p alt when \p vec has a magnitude of `0.0f` and cannot be normalized.
+
+    \param  vec     The vector to normalize.
+    \param  alt     The vector to return when \p vec cannot be normalized.
+    \returns        The unit vector pointing in the same direction as \p vec, or \p alt.
+
+    \sa shz_vec2_normalize(), shz_vec2_normalize_safe()
+*/
+SHZ_INLINE shz_vec2_t shz_vec2_normalize_or(shz_vec2_t vec, shz_vec2_t alt) SHZ_NOEXCEPT;
+
+/*! Returns a normalized unit vector from the given 3D vector, or an alternate value.
+
+    Safely returns \p alt when \p vec has a magnitude of `0.0f` and cannot be normalized.
+
+    \param  vec     The vector to normalize.
+    \param  alt     The vector to return when \p vec cannot be normalized.
+    \returns        The unit vector pointing in the same direction as \p vec, or \p alt.
+
+    \sa shz_vec3_normalize(), shz_vec3_normalize_safe()
+*/
+SHZ_INLINE shz_vec3_t shz_vec3_normalize_or(shz_vec3_t vec, shz_vec3_t alt) SHZ_NOEXCEPT;
+
+/*! Returns a normalized unit vector from the given 4D vector, or an alternate value.
+
+    Safely returns \p alt when \p vec has a magnitude of `0.0f` and cannot be normalized.
+
+    \param  vec     The vector to normalize.
+    \param  alt     The vector to return when \p vec cannot be normalized.
+    \returns        The unit vector pointing in the same direction as \p vec, or \p alt.
+
+    \sa shz_vec4_normalize(), shz_vec4_normalize_safe()
+*/
+SHZ_INLINE shz_vec4_t shz_vec4_normalize_or(shz_vec4_t vec, shz_vec4_t alt) SHZ_NOEXCEPT;
 
 /*! SAFELY returns a normalized unit vector from the given 2D vector.
 
-    If the vector's magnitude is not `> 0.0f`, safely returns a zero vector.
+    Safely returns a zero vector when \p vec has a magnitude of `0.0f` and
+    cannot be normalized.
+
+    \param  vec     The vector to normalize.
+    \returns        The unit vector pointing in the same direction as \p vec, or a zero vector.
+
+    \sa shz_vec2_normalize(), shz_vec2_normalize_or()
 */
 SHZ_INLINE shz_vec2_t shz_vec2_normalize_safe(shz_vec2_t vec) SHZ_NOEXCEPT;
 
 /*! SAFELY returns a normalized unit vector from the given 3D vector.
 
-    If the vector's magnitude is not `> 0.0f`, safely returns a zero vector.
+    Safely returns a zero vector when \p vec has a magnitude of `0.0f` and
+    cannot be normalized.
+
+    \param  vec     The vector to normalize.
+    \returns        The unit vector pointing in the same direction as \p vec, or a zero vector.
+
+    \sa shz_vec3_normalize(), shz_vec3_normalize_or()
 */
 SHZ_INLINE shz_vec3_t shz_vec3_normalize_safe(shz_vec3_t vec) SHZ_NOEXCEPT;
 
 /*! SAFELY returns a normalized unit vector from the given 4D vector.
 
-    If the vector's magnitude is not `> 0.0f`, safely returns a zero vector.
+    Safely returns a zero vector when \p vec has a magnitude of `0.0f` and
+    cannot be normalized.
+
+    \param  vec     The vector to normalize.
+    \returns        The unit vector pointing in the same direction as \p vec, or a zero vector.
+
+    \sa shz_vec4_normalize(), shz_vec4_normalize_or()
 */
 SHZ_INLINE shz_vec4_t shz_vec4_normalize_safe(shz_vec4_t vec) SHZ_NOEXCEPT;
 
@@ -638,7 +878,7 @@ SHZ_INLINE shz_vec2_t shz_vec2_rotate(shz_vec2_t vec, float radians) SHZ_NOEXCEP
     This routine should only be used for one-off rotations of a single vector.
     To rotate multiple vectors in a batch, use the XMTRX API.
 
-    \sa shz_xmtrx_apply_rotation_x()
+    \sa shz_xmtrx_rotate_x()
 */
 SHZ_INLINE shz_vec3_t shz_vec3_rotate_x(shz_vec3_t vec, float radians) SHZ_NOEXCEPT;
 
@@ -648,7 +888,7 @@ SHZ_INLINE shz_vec3_t shz_vec3_rotate_x(shz_vec3_t vec, float radians) SHZ_NOEXC
     This routine should only be used for one-off rotations of a single vector.
     To rotate multiple vectors in a batch, use the XMTRX API.
 
-    \sa shz_xmtrx_apply_rotation_y()
+    \sa shz_xmtrx_rotate_y()
 */
 SHZ_INLINE shz_vec3_t shz_vec3_rotate_y(shz_vec3_t vec, float radians) SHZ_NOEXCEPT;
 
@@ -658,7 +898,7 @@ SHZ_INLINE shz_vec3_t shz_vec3_rotate_y(shz_vec3_t vec, float radians) SHZ_NOEXC
     This routine should only be used for one-off rotations of a single vector.
     To rotate multiple vectors in a batch, use the XMTRX API.
 
-    \sa shz_xmtrx_apply_rotation_z()
+    \sa shz_xmtrx_rotate_z()
 */
 SHZ_INLINE shz_vec3_t shz_vec3_rotate_z(shz_vec3_t vec, float radians) SHZ_NOEXCEPT;
 
@@ -858,12 +1098,26 @@ SHZ_DECLS_END
                  shz_vec3_t: shz_vec3_magnitude, \
                  shz_vec4_t: shz_vec4_magnitude)(vec)
 
+    //! C type-generic unsafe vector magnitude using FSRRA.
+#   define shz_vec_magnitude_fsrra(vec) \
+        _Generic((vec), \
+                 shz_vec2_t: shz_vec2_magnitude_fsrra, \
+                 shz_vec3_t: shz_vec3_magnitude_fsrra, \
+                 shz_vec4_t: shz_vec4_magnitude_fsrra)(vec)
+
     //! C type-generic vector inverse magnitude.
 #   define shz_vec_magnitude_inv(vec) \
         _Generic((vec), \
                  shz_vec2_t: shz_vec2_magnitude_inv, \
                  shz_vec3_t: shz_vec3_magnitude_inv, \
                  shz_vec4_t: shz_vec4_magnitude_inv)(vec)
+
+    //! C type-generic unsafe vector inverse magnitude using FSRRA.
+#   define shz_vec_magnitude_inv_fsrra(vec) \
+        _Generic((vec), \
+                 shz_vec2_t: shz_vec2_magnitude_inv_fsrra, \
+                 shz_vec3_t: shz_vec3_magnitude_inv_fsrra, \
+                 shz_vec4_t: shz_vec4_magnitude_inv_fsrra)(vec)
 
     //! C type-generic vector normalization.
 #   define shz_vec_normalize(vec) \
@@ -878,6 +1132,13 @@ SHZ_DECLS_END
                  shz_vec2_t: shz_vec2_normalize_safe, \
                  shz_vec3_t: shz_vec3_normalize_safe, \
                  shz_vec4_t: shz_vec4_normalize_safe)(vec)
+
+    //! C type-generic vector normalization, returning an alternate value upon failure.
+#   define shz_vec_normalize_or(vec, alt) \
+        _Generic((vec), \
+                 shz_vec2_t: shz_vec2_normalize_or, \
+                 shz_vec3_t: shz_vec3_normalize_or, \
+                 shz_vec4_t: shz_vec4_normalize_or)(vec, alt)
 
     //! C type-generic vector distance.
 #   define shz_vec_distance(vec1, vec2) \
@@ -1016,6 +1277,20 @@ SHZ_DECLS_END
                  shz_vec3_t: shz_vec3_maxv, \
                  shz_vec4_t: shz_vec4_maxv)(a, b)
 
+    //! C type-generic inv_sqrtf
+#   define shz_vec_inv_sqrtf(vec) \
+        _Generic((vec), \
+                 shz_vec2_t: shz_vec2_inv_sqrtf, \
+                 shz_vec3_t: shz_vec3_inv_sqrtf, \
+                 shz_vec4_t: shz_vec4_inv_sqrtf)(vec)
+
+    //! C type-generic sqrtf
+#   define shz_vec_sqrtf(vec) \
+        _Generic((vec), \
+                 shz_vec2_t: shz_vec2_sqrtf, \
+                 shz_vec3_t: shz_vec3_sqrtf, \
+                 shz_vec4_t: shz_vec4_sqrtf)(vec)
+
     //! C type-generic component-wise step
 #   define shz_vec_stepv(vec, edge) \
         _Generic((vec), \
@@ -1145,10 +1420,20 @@ SHZ_DECLS_END
     SHZ_INLINE float shz_vec_magnitude(shz_vec3_t vec) SHZ_NOEXCEPT { return shz_vec3_magnitude(vec); }
     SHZ_INLINE float shz_vec_magnitude(shz_vec4_t vec) SHZ_NOEXCEPT { return shz_vec4_magnitude(vec); }
 
+    //! C++ type-generic unsafe magnitude using FSRRA.
+    SHZ_INLINE float shz_vec_magnitude_fsrra(shz_vec2_t vec) SHZ_NOEXCEPT { return shz_vec2_magnitude_fsrra(vec); }
+    SHZ_INLINE float shz_vec_magnitude_fsrra(shz_vec3_t vec) SHZ_NOEXCEPT { return shz_vec3_magnitude_fsrra(vec); }
+    SHZ_INLINE float shz_vec_magnitude_fsrra(shz_vec4_t vec) SHZ_NOEXCEPT { return shz_vec4_magnitude_fsrra(vec); }
+
     //! C++ type-generic inverse magnitude.
     SHZ_INLINE float shz_vec_magnitude_inv(shz_vec2_t vec) SHZ_NOEXCEPT { return shz_vec2_magnitude_inv(vec); }
     SHZ_INLINE float shz_vec_magnitude_inv(shz_vec3_t vec) SHZ_NOEXCEPT { return shz_vec3_magnitude_inv(vec); }
     SHZ_INLINE float shz_vec_magnitude_inv(shz_vec4_t vec) SHZ_NOEXCEPT { return shz_vec4_magnitude_inv(vec); }
+
+    //! C++ type-generic unsafe inverse magnitude using FSRRA.
+    SHZ_INLINE float shz_vec_magnitude_inv_fsrra(shz_vec2_t vec) SHZ_NOEXCEPT { return shz_vec2_magnitude_inv_fsrra(vec); }
+    SHZ_INLINE float shz_vec_magnitude_inv_fsrra(shz_vec3_t vec) SHZ_NOEXCEPT { return shz_vec3_magnitude_inv_fsrra(vec); }
+    SHZ_INLINE float shz_vec_magnitude_inv_fsrra(shz_vec4_t vec) SHZ_NOEXCEPT { return shz_vec4_magnitude_inv_fsrra(vec); }
 
     //! C++ type-generic vector normalization.
     SHZ_INLINE shz_vec2_t shz_vec_normalize(shz_vec2_t vec) SHZ_NOEXCEPT { return shz_vec2_normalize(vec); }
@@ -1159,6 +1444,11 @@ SHZ_DECLS_END
     SHZ_INLINE shz_vec2_t shz_vec_normalize_safe(shz_vec2_t vec) SHZ_NOEXCEPT { return shz_vec2_normalize_safe(vec); }
     SHZ_INLINE shz_vec3_t shz_vec_normalize_safe(shz_vec3_t vec) SHZ_NOEXCEPT { return shz_vec3_normalize_safe(vec); }
     SHZ_INLINE shz_vec4_t shz_vec_normalize_safe(shz_vec4_t vec) SHZ_NOEXCEPT { return shz_vec4_normalize_safe(vec); }
+
+    //! C++ type-generic vector normalization, returning an alternate value upon failure.
+    SHZ_INLINE shz_vec2_t shz_vec_normalize_or(shz_vec2_t vec, shz_vec2_t alt) SHZ_NOEXCEPT { return shz_vec2_normalize_or(vec, alt); }
+    SHZ_INLINE shz_vec3_t shz_vec_normalize_or(shz_vec3_t vec, shz_vec3_t alt) SHZ_NOEXCEPT { return shz_vec3_normalize_or(vec, alt); }
+    SHZ_INLINE shz_vec4_t shz_vec_normalize_or(shz_vec4_t vec, shz_vec4_t alt) SHZ_NOEXCEPT { return shz_vec4_normalize_or(vec, alt); }
 
     //! C++ type-generic distance between two points.
     SHZ_INLINE float shz_vec_distance(shz_vec2_t vec1, shz_vec2_t vec2) SHZ_NOEXCEPT { return shz_vec2_distance(vec1, vec2); }
@@ -1262,6 +1552,16 @@ SHZ_DECLS_END
     SHZ_INLINE shz_vec2_t shz_vec_maxv(shz_vec2_t a, shz_vec2_t b) SHZ_NOEXCEPT { return shz_vec2_maxv(a, b); }
     SHZ_INLINE shz_vec3_t shz_vec_maxv(shz_vec3_t a, shz_vec3_t b) SHZ_NOEXCEPT { return shz_vec3_maxv(a, b); }
     SHZ_INLINE shz_vec4_t shz_vec_maxv(shz_vec4_t a, shz_vec4_t b) SHZ_NOEXCEPT { return shz_vec4_maxv(a, b); }
+
+    //! C++ type-generic vector inverse square root.
+    SHZ_INLINE shz_vec2_t shz_vec_inv_sqrtf(shz_vec2_t vec) SHZ_NOEXCEPT { return shz_vec2_inv_sqrtf(vec); }
+    SHZ_INLINE shz_vec3_t shz_vec_inv_sqrtf(shz_vec3_t vec) SHZ_NOEXCEPT { return shz_vec3_inv_sqrtf(vec); }
+    SHZ_INLINE shz_vec4_t shz_vec_inv_sqrtf(shz_vec4_t vec) SHZ_NOEXCEPT { return shz_vec4_inv_sqrtf(vec); }
+
+    //! C++ type-generic vector square root.
+    SHZ_INLINE shz_vec2_t shz_vec_sqrtf(shz_vec2_t vec) SHZ_NOEXCEPT { return shz_vec2_sqrtf(vec); }
+    SHZ_INLINE shz_vec3_t shz_vec_sqrtf(shz_vec3_t vec) SHZ_NOEXCEPT { return shz_vec3_sqrtf(vec); }
+    SHZ_INLINE shz_vec4_t shz_vec_sqrtf(shz_vec4_t vec) SHZ_NOEXCEPT { return shz_vec4_sqrtf(vec); }
 
     //! C++ type-generic step: 0 per component if vec[i] < edge, else 1.
     SHZ_INLINE shz_vec2_t shz_vec_step(shz_vec2_t vec, float       edge) SHZ_NOEXCEPT { return shz_vec2_step (vec, edge); }

@@ -8,6 +8,9 @@
  *  \author    2025 Falco Girgis
  *  \copyright MIT License
  *
+ *  \important Do not copy this file or its routines into other projects. Use the
+ *             KOS-ports build or add SH4ZAM as a git submodule. See AGENTS.md.
+ *
  *  \todo
  *      - C++ proxy class equivalent for shz_vecN_deref().
  *      - C++ better swizzling mechanism
@@ -16,12 +19,16 @@
 #ifndef SHZ_VECTOR_HPP
 #define SHZ_VECTOR_HPP
 
-#include <compare>
-#include <concepts>
+#include <type_traits>
+#include <utility>
 
 #include "shz_vector.h"
 #include "shz_scalar.hpp"
 #include "shz_trig.hpp"
+
+#ifdef SHZ_CPP20
+#   include <compare>
+#endif
 
 namespace shz {
 
@@ -62,7 +69,8 @@ struct vecN: C {
         CType(const_cast<const CType&>(other)) {}
 
     //! Conversion operator for going from a layout-compatible vector type to a SH4ZAM vector type.
-    SHZ_FORCE_INLINE static CppType from(const auto& raw) noexcept {
+    template<typename T>
+    SHZ_FORCE_INLINE static CppType from(const T& raw) noexcept {
         return *reinterpret_cast<const CppType*>(&raw);
     }
 
@@ -73,7 +81,8 @@ struct vecN: C {
     }
 
     //! Conversion operator for accessing an existing pointer type as though it were a refrence to a SH4ZAM type.
-    SHZ_FORCE_INLINE CppType& deref(const auto* raw) noexcept {
+    template<typename T>
+    SHZ_FORCE_INLINE CppType& deref(const T* raw) noexcept {
         return *const_cast<CppType*>(reinterpret_cast<const CppType*>(raw));
     }
 
@@ -102,18 +111,19 @@ struct vecN: C {
 
 #ifdef SHZ_CPP23
     //! Overloaded subscript operator -- allows for indexing vectors like an array.
-    SHZ_FORCE_INLINE decltype(auto) operator[](this auto&& self, size_t index) noexcept {
-        return std::forward_like<decltype(self)>(self.e[index]);
+    SHZ_FORCE_INLINE auto& operator[](this auto&& self, size_t index) noexcept {
+        using Elem = std::conditional_t<std::is_const_v<std::remove_reference_t<decltype(self)>>, const float, float>;
+        return reinterpret_cast<Elem*>(&self.e)[index];
     }
 
     //! Returns an iterator to the beginning of the vector -- For STL support.
     SHZ_FORCE_INLINE auto begin(this auto&& self) noexcept {
-        return std::forward_like<decltype(self)>(&self[0]);
+        return &self[0];
     }
 
     //! Returns an iterator to the end of the vector -- For STL support.
     SHZ_FORCE_INLINE auto end(this auto&& self) noexcept {
-        return std::forward_like<decltype(self)>(&self[Rows]);
+        return &self[Rows];
     }
 
     //! Overloaded space-ship operator, for generic lexicographical comparison of vectors.
@@ -251,6 +261,16 @@ struct vecN: C {
         return shz_vec_maxv(*static_cast<const CppType*>(this), other);
     }
 
+    //! Returns a new vector whose components are the inverse square root of the given vector.
+    SHZ_FORCE_INLINE CppType inv_sqrtf() const noexcept {
+        return shz_vec_inv_sqrtf(*static_cast<const CppType*>(this));
+    }
+
+    //! Returns a new vector whose components are the square root of the given vector.
+    SHZ_FORCE_INLINE CppType sqrtf() const noexcept {
+        return shz_vec_sqrtf(*static_cast<const CppType*>(this));
+    }
+
     //! Returns the dot product of the given vector and another.
     SHZ_FORCE_INLINE float dot(const CppType& other) const noexcept {
         return shz_vec_dot(*static_cast<const CppType*>(this), other);
@@ -262,9 +282,14 @@ struct vecN: C {
     //! Returns the dot product of the given vector against three others.
     SHZ_FORCE_INLINE vec3 dot(const CppType& v1, const CppType& v2, const CppType& v3) const noexcept;
 
-    //! Returns the magnitude of the given vector.
+    //! Returns the magnitude of the given vector, safely returning 0.0f for a zero-length vector.
     SHZ_FORCE_INLINE float magnitude() const noexcept {
         return shz_vec_magnitude(*static_cast<const CppType*>(this));
+    }
+
+    //! Returns the magnitude of the given vector, unsafely, using FSRRA. Divides by zero for a zero-length vector.
+    SHZ_FORCE_INLINE float magnitude_fsrra() const noexcept {
+        return shz_vec_magnitude_fsrra(*static_cast<const CppType*>(this));
     }
 
     //! Returns the squared magnitude of the given vector.
@@ -272,9 +297,14 @@ struct vecN: C {
         return shz_vec_magnitude_sqr(*static_cast<const CppType*>(this));
     }
 
-    //! Returns the inverse magnitude of the given vector.
+    //! Returns the inverse magnitude of the given vector, safely returning 0.0f for a zero-length vector.
     SHZ_FORCE_INLINE float magnitude_inv() const noexcept {
         return shz_vec_magnitude_inv(*static_cast<const CppType*>(this));
+    }
+
+    //! Returns the inverse magnitude of the given vector, unsafely, using FSRRA. Divides by zero for a zero-length vector.
+    SHZ_FORCE_INLINE float magnitude_inv_fsrra() const noexcept {
+        return shz_vec_magnitude_inv_fsrra(*static_cast<const CppType*>(this));
     }
 
     //! Returns the direction vector resulting from normalizing the given vector.
@@ -287,14 +317,24 @@ struct vecN: C {
         return shz_vec_normalize_safe(*static_cast<const CppType*>(this));
     }
 
+    //! Returns the direction vector of a given vector, or \p alt if it has a magnitude of 0.0f.
+    SHZ_FORCE_INLINE CppType direction_or(const CppType& alt) const noexcept {
+        return shz_vec_normalize_or(*static_cast<const CppType*>(this), alt);
+    }
+
     //! Normalizes the given vector.
     SHZ_FORCE_INLINE void normalize() noexcept {
-        *static_cast<CppType*>(this) = shz_vec_normalize(*static_cast<const CppType*>(this));
+        *static_cast<CppType*>(this) = CppType(shz_vec_normalize(*static_cast<const CppType*>(this)));
     }
 
     //! Normalizes the given vector, safely protecting against division-by-zero.
     SHZ_FORCE_INLINE void normalize_safe() noexcept {
-        *static_cast<CppType*>(this) = shz_vec_normalize_safe(*static_cast<const CppType*>(this));
+        *static_cast<CppType*>(this) = CppType(shz_vec_normalize_safe(*static_cast<const CppType*>(this)));
+    }
+
+    //! Normalizes the given vector, or sets it to \p alt if it has a magnitude of 0.0f.
+    SHZ_FORCE_INLINE void normalize_or(const CppType& alt) noexcept {
+        *static_cast<CppType*>(this) = CppType(shz_vec_normalize_or(*static_cast<const CppType*>(this), alt));
     }
 
     //! Return the normalized vector.
@@ -305,6 +345,11 @@ struct vecN: C {
     //! Return the normalized vector, safely protecting against division-by-zero.
     SHZ_FORCE_INLINE CppType normalized_safe() const noexcept {
         return shz_vec_normalize_safe(*static_cast<const CppType*>(this));
+    }
+
+    //! Return the normalized vector, or \p alt if it has a magnitude of 0.0f.
+    SHZ_FORCE_INLINE CppType normalized_or(const CppType& alt) const noexcept {
+        return shz_vec_normalize_or(*static_cast<const CppType*>(this), alt);
     }
 
     //! Returns the magnitude of the difference between two vectors as their distance.
@@ -510,7 +555,7 @@ struct vec3: vecN<vec3, shz_vec3_t, 3> {
 */
     /*! Rotates a 3D vector about the X axis by the given number of radians.
 
-        \sa shz::xmtrx::apply_rotation_x()
+        \sa shz::xmtrx::rotate_x()
     */
     SHZ_FORCE_INLINE vec3 rotate_x(float angle) const noexcept {
         return shz_vec3_rotate_x(*this, angle);
@@ -518,7 +563,7 @@ struct vec3: vecN<vec3, shz_vec3_t, 3> {
 
     /*! Rotates a 3D vector about the Y axis by the given number of radians.
 
-        \sa shz::xmtrx::apply_rotation_y()
+        \sa shz::xmtrx::rotate_y()
     */
     SHZ_FORCE_INLINE vec3 rotate_y(float angle) const noexcept {
         return shz_vec3_rotate_y(*this, angle);
@@ -526,7 +571,7 @@ struct vec3: vecN<vec3, shz_vec3_t, 3> {
 
     /*! Rotates a 3D vector about the Z axis by the given number of radians.
 
-        \sa shz::xmtrx::apply_rotation_z()
+        \sa shz::xmtrx::rotate_z()
     */
     SHZ_FORCE_INLINE vec3 rotate_z(float angle) const noexcept {
         return shz_vec3_rotate_z(*this, angle);

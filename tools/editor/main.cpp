@@ -19,6 +19,7 @@
 #include "pvr_host.h"
 #include <SDL3/SDL.h>
 #include <dirent.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -97,7 +98,7 @@ void ed_job_stop() {
 
 void ed_run(const std::string& what, std::function<void(bool ok)> then) {
     if (job_running) { ed_log("A job is running already (%s)", job_what.c_str()); return; }
-    std::string cmd = "make -C '" + ed.project + "' " + what;
+    std::string cmd = "make -j8 -C '" + ed.project + "' " + what;
     ed_log("$ %s", cmd.c_str());
     cmd = kos_env() + cmd + " 2>&1";
     int out[2];
@@ -177,6 +178,46 @@ static void scan(const std::string& dir, const std::string& rel, const char* ext
     closedir(d);
 }
 
+/* The game's own files, round its assets and what is built */
+static void scan_code(const std::string& dir, const std::string& rel, std::vector<std::string>& out) {
+    DIR* d = opendir(dir.c_str());
+    if (!d) return;
+    while (dirent* e = readdir(d)) {
+        std::string name = e->d_name, path = dir + "/" + name;
+        if (name[0] == '.' || (rel.empty() && (name == "assets" || name == "pc" || name == "build"))) continue;
+        struct stat st;
+        if (stat(path.c_str(), &st)) continue;
+        if (S_ISDIR(st.st_mode)) { scan_code(path, rel + name + "/", out); continue; }
+        size_t dot = name.find_last_of('.');
+        std::string ext = dot == std::string::npos ? "" : name.substr(dot);
+        if (ext == ".c" || ext == ".h" || ext == ".cpp" || ext == ".hpp" || ext == ".mk" || name == "Makefile")
+            out.push_back(rel + name);
+    }
+    closedir(d);
+}
+
+/* VS Code on the project, at the file; another editor if DMS_CODE_EDITOR
+ * names one (it is given the file). Forked twice, so nothing waits for it. */
+void ed_open_code(const std::string& rel) {
+    std::string root = ed.project, file = ed.project + rel;
+    const char* other = getenv("DMS_CODE_EDITOR");
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (fork() == 0) {
+            setsid();
+            int null = open("/dev/null", O_RDWR);
+            dup2(null, 0); dup2(null, 1); dup2(null, 2);
+            if (other && *other) execlp(other, other, file.c_str(), (char*)nullptr);
+            else if (rel.empty()) execlp("code", "code", root.c_str(), (char*)nullptr);
+            else execlp("code", "code", root.c_str(), "-g", file.c_str(), (char*)nullptr);
+            _exit(127);
+        }
+        _exit(0);
+    }
+    if (pid > 0) waitpid(pid, nullptr, 0);
+    ed_log("Opened %s in %s", rel.empty() ? "the project" : rel.c_str(), other && *other ? other : "VS Code");
+}
+
 void ed_scan_assets() {
     ed.models.clear();
     ed.sources.clear();
@@ -191,6 +232,9 @@ void ed_scan_assets() {
     std::sort(ed.models.begin(), ed.models.end());
     std::sort(ed.sources.begin(), ed.sources.end());
     std::sort(ed.scenes.begin(), ed.scenes.end());
+    ed.code.clear();
+    scan_code(ed.project, "", ed.code);
+    std::sort(ed.code.begin(), ed.code.end());
     ed.asset_gen++;
 }
 
@@ -411,7 +455,7 @@ std::string ed_unique_name(const char* base) {
     for (int n = 1;; n++) {
         char name[32];
         if (n == 1) snprintf(name, sizeof(name), "%s", base);
-        else snprintf(name, sizeof(name), "%.24s %d", base, n);
+        else snprintf(name, sizeof(name), "%.20s %d", base, n);   /* 20 + space + up to 10 digits fits 32 */
         bool used = false;
         for (int i = 0; i < ed.scene->object_count && !used; i++) used = !strcmp(ed.scene->objects[i].name, name);
         for (int i = 0; i < ed.scene->light_count && !used; i++) used = !strcmp(ed.scene->lights[i].name, name);
@@ -560,8 +604,8 @@ static void default_layout(ImGuiID dock) {
     bottom = ImGui::DockBuilderSplitNode(mid, ImGuiDir_Down, 0.3f, nullptr, &mid);
     ImGui::DockBuilderDockWindow(WIN_HIERARCHY, left);
     ImGui::DockBuilderDockWindow(WIN_INSPECTOR, right);
-    ImGui::DockBuilderDockWindow(WIN_PROJECT, bottom);
     ImGui::DockBuilderDockWindow(WIN_CONSOLE, bottom);
+    ImGui::DockBuilderDockWindow(WIN_PROJECT, bottom);
     ImGui::DockBuilderDockWindow(WIN_SCENE, mid);
     ImGui::DockBuilderDockWindow(WIN_GAME, mid);
     ImGui::DockBuilderFinish(dock);

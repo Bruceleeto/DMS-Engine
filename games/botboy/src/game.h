@@ -9,7 +9,7 @@
 #include "dms/dc_draw.h"
 #include "dms/dc_draw2d.h"
 
-/* Where assets are read from: /pc/ over dcload, /cd/ when built with make disc */
+/* Where assets are read from: /pc/ over dcload; on a disc the engine finds them at /cd/ */
 #ifndef ASSETS
 #define ASSETS "/pc/"
 #endif

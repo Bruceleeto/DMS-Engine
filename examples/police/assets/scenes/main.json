@@ -1,0 +1,15 @@
+{
+  "dms_scene": 1,
+  "background": "#303848",
+  "camera": { "pos": [-4.5, 2.74, -8.39], "yaw": 45.8366, "pitch": 17.1887, "fov": 60 },
+  "lights": [ { "name": "Sun", "pos": [-0.4, -1, -0.3], "sun": true,
+                "color": "#ffffff", "range": 500, "ambient": 0.35, "bands": 0 } ],
+  "objects": [
+    { "name": "Floor", "model": "floor/floor.dms",
+      "pos": [0, 0, 0], "rot": [0, 0, 0], "scale": [1, 1, 1],
+      "tint": "#ffffff", "add": false, "visible": true },
+    { "name": "Car", "model": "police/police2.dms",
+      "pos": [0, 0, 0], "rot": [0, 0, 0], "scale": [1, 1, 1],
+      "tint": "#ffffff", "add": false, "visible": true }
+  ]
+}

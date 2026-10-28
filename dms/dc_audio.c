@@ -326,7 +326,7 @@ bool dc_music_play(const char* path, bool loop) {
     if (g_music.playing && strcmp(g_music.path, path) == 0) return true;
     dc_music_stop();
 
-    FILE* f = fopen(path, "rb");
+    FILE* f = dc_asset_fopen(path, "rb");
     if (!f) {
         printf("dc_audio: cannot open %s\n", path);
         return false;

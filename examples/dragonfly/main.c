@@ -9,11 +9,15 @@
 #include "dms/dc_draw.h"
 #include "dms/dc_draw2d.h"
 #include "dms/dc_debug.h"
+#include "dms/dc_scene.h"
 
-/* Where assets are read from: /pc/ over dcload, /cd/ when built with make disc */
+/* Where assets are read from: /pc/ over dcload; on a disc the engine finds them at /cd/ */
 #ifndef ASSETS
 #define ASSETS "/pc/"
 #endif
+
+/* scenes/main.json holds the Dragonfly and where the camera starts; the code
+ * animates it, and the shots, the trail and the photo behind are made here. */
 
 /* Animation indices, in the order they are in dragonfly.glb */
 #define ANIM_FIRE 0
@@ -40,12 +44,13 @@ static const float shot_times[3] = { 0.267f, 0.467f, 0.667f };   /* into Fire */
 typedef struct {
     bool  active;
     float age;
-    shz_vec3_t pos;     /* how far it has gone from where the flash sits in the model */
+    shz_vec3_t pos;     /* how far it has gone from where the flash sits in the model, and where the dragonfly is */
 } Shot;
 
 /* ---- App state ---- */
 static DCCamera camera;
-static DMSModel* dragonfly = NULL;
+static DCScene*  scene = NULL;
+static DCSceneObject* dragonfly = NULL;
 static DMSModel* flash = NULL;
 static DCImage*  background = NULL;
 static DCTarget* trail = NULL;
@@ -57,7 +62,7 @@ static void shot_create(void) {
         if (shots[i].active) continue;
         shots[i].active = true;
         shots[i].age = 0.0f;
-        shots[i].pos = shz_vec3_init(0.0f, 0.0f, 0.0f);
+        shots[i].pos = dragonfly->pos;      /* its turn does not turn the shots */
         return;
     }
 }
@@ -97,7 +102,7 @@ static void shots_draw(void) {
     }
 }
 
-/* The middle of the dragonfly (it is about 200 wide and 215 long) */
+/* The middle of the dragonfly from where it is (it is about 200 wide and 215 long) */
 static const shz_vec3_t centre = { .x = 0.0f, .y = 0.0f, .z = 60.0f };
 static float distance = 330.0f;
 
@@ -116,11 +121,12 @@ int main(int argc, char* argv[]) {
     dc_draw2d_init();
     dc_debug_init();
 
-    dc_camera_init(&camera);
-    camera.yaw = F_PI * 0.75f;
-    camera.pitch = 0.3f;
-
-    dragonfly = dc_model_load(ASSETS "dragonfly/dragonfly.dms");
+    scene = dc_scene_play(ASSETS, "scenes/main.json");
+    if (!scene) return 1;
+    dc_scene_apply(scene);
+    dc_scene_camera(scene, &camera);
+    dragonfly = dc_scene_find(scene, "Dragonfly");
+    if (!dragonfly || !dragonfly->m) { printf("DRAGONFLY: the scene has no Dragonfly\n"); return 1; }
     flash = dc_model_load(ASSETS "flash/flash.dms");
     background = dc_image_load(ASSETS "background/background.dt");
     trail = dc_target_create(TRAIL_SIZE, TRAIL_SIZE);
@@ -139,7 +145,8 @@ int main(int argc, char* argv[]) {
             if (distance < 150.0f) distance = 150.0f;
             if (distance > 800.0f) distance = 800.0f;
         }
-        dc_camera_orbit(&camera, centre, distance, inp, LOOK_SPEED, dt);
+        shz_vec3_t middle = shz_vec3_init(dragonfly->pos.x + centre.x, dragonfly->pos.y + centre.y, dragonfly->pos.z + centre.z);
+        dc_camera_orbit(&camera, middle, distance, inp, LOOK_SPEED, dt);
         dc_camera_update(&camera);
 
         if (fire_time < 0.0f && inp && dc_input_pressed(inp, CONT_X))
@@ -153,21 +160,19 @@ int main(int argc, char* argv[]) {
         }
         shots_update(dt);
 
-        if (dragonfly) {
+        {
             int anim = fire_time >= 0.0f ? ANIM_FIRE : ANIM_IDLE;
-            if (dc_model_get_anim(dragonfly) != anim)
-                dc_model_set_anim(dragonfly, anim);
-            dc_model_animate(dragonfly, dt);
+            if (dc_model_get_anim(dragonfly->m) != anim)
+                dc_model_set_anim(dragonfly->m, anim);
+            dc_model_animate(dragonfly->m, dt);
         }
 
         /* ---- Rendering ---- */
-        shz_vec3_t origin = shz_vec3_init(0.0f, 0.0f, 0.0f);
-
         /* The trail: the dragonfly on black, then last frame's trail over it,
          * a little see-through, so what moves leaves a smear that fades */
         dc_set_target(trail);
         dc_set_camera(&camera);
-        dc_draw(dragonfly, origin);
+        dc_scene_draw(scene);
         shots_draw();
         dc_draw_target_ex(trail, &(DCTargetOpts){ .alpha = TRAIL_KEEP });
 
@@ -175,7 +180,7 @@ int main(int argc, char* argv[]) {
         dc_set_target(NULL);
         dc_set_camera(&camera);
         dc_draw_background(background);
-        dc_draw(dragonfly, origin);
+        dc_scene_draw(scene);
         shots_draw();
         dc_draw_target_ex(trail, &(DCTargetOpts){ .add = true });
         dc_debug_stats();
@@ -184,7 +189,7 @@ int main(int argc, char* argv[]) {
 
     dc_target_free(trail);
     dc_model_free(flash);
-    dc_model_free(dragonfly);
+    dc_scene_free(scene);
     dc_image_free(background);
     dc_shutdown();
 

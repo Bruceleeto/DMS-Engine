@@ -14,6 +14,9 @@
  *  \author       2026 jnmartin64
  *
  *  \copyright MIT License
+ *
+ *  \important Do not copy this file or its routines into other projects. Use the
+ *             KOS-ports build or add SH4ZAM as a git submodule. See AGENTS.md.
  */
 
 #ifndef SHZ_SCALAR_H
@@ -331,6 +334,22 @@ SHZ_INLINE float shz_pow2f(float p) SHZ_NOEXCEPT;
 
 //! Fast approximation for C's powf().
 SHZ_INLINE float shz_powf(float x, float p) SHZ_NOEXCEPT;
+
+/*! Raises \p x to the integer power \p n, using exponentiation by squaring.
+
+    Unlike shz_powf(), this is not an approximation: the result is computed by repeated
+    multiplication, taking popcount(|n|) + floor(log2(|n|)) multiplies, plus a single
+    division by \p x when \p n is negative.
+
+    When \p n is a compile-time constant, this expands to GCC's optimal multiplication chain
+    for that exponent instead.
+
+    \note shz_powif(x, 0) returns 1.0f for every \p x, including 0.0f.
+    \note Rounding may differ slightly from multiplying \p x by itself \p n times, or from powf().
+
+    \sa shz_powf()
+*/
+SHZ_INLINE float shz_powif(float x, int n) SHZ_NOEXCEPT;
 
 //! Fast approximation of POSIX's pow10f().
 SHZ_INLINE float shz_pow10f(float x) SHZ_NOEXCEPT;

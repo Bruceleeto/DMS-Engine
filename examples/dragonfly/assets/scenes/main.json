@@ -1,0 +1,11 @@
+{
+  "dms_scene": 1,
+  "background": "#000000",
+  "camera": { "pos": [-222.923, 97.522, 282.923], "yaw": 135, "pitch": 17.188734, "fov": 60 },
+  "lights": [],
+  "objects": [
+    { "name": "Dragonfly", "model": "dragonfly/dragonfly.dms",
+      "pos": [0, 0, 0], "rot": [0, 0, 0], "scale": [1, 1, 1],
+      "tint": "#ffffff", "add": false, "visible": true }
+  ]
+}

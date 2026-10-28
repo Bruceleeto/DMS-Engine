@@ -7,16 +7,22 @@
 
     \author    2025, 2026 Falco Girgis
     \copyright MIT License
+
+    \important Do not copy this file or its routines into other projects. Use the
+               KOS-ports build or add SH4ZAM as a git submodule. See AGENTS.md.
 */
 
 #ifndef SHZ_QUAT_HPP
 #define SHZ_QUAT_HPP
 
-#include <compare>
 #include <tuple>
 
 #include "shz_quat.h"
 #include "shz_vector.hpp"
+
+#ifdef SHZ_CPP20
+#   include <compare>
+#endif
 
 namespace shz {
 
@@ -65,9 +71,44 @@ namespace shz {
             return shz_quat_identity();
         }
         
-        //! C++ convenience wrapper for shz_quat_from_angles_xyz().
-        SHZ_FORCE_INLINE static quat from_angles_xyz(float x, float y, float z) noexcept {
-            return shz_quat_from_angles_xyz(x, y, z);
+        //! C++ convenience wrapper for shz_quat_from_rotation_xyz().
+        SHZ_FORCE_INLINE static quat from_rotation_xyz(float x, float y, float z) noexcept {
+            return shz_quat_from_rotation_xyz(x, y, z);
+        }
+
+        //! C++ convenience wrapper for shz_quat_from_rotation_zyx().
+        SHZ_FORCE_INLINE static quat from_rotation_zyx(float z, float y, float x) noexcept {
+            return shz_quat_from_rotation_zyx(z, y, x);
+        }
+
+        //! C++ convenience wrapper for shz_quat_from_rotation_zxy().
+        SHZ_FORCE_INLINE static quat from_rotation_zxy(float z, float x, float y) noexcept {
+            return shz_quat_from_rotation_zxy(z, x, y);
+        }
+
+        //! C++ convenience wrapper for shz_quat_from_rotation_yxz().
+        SHZ_FORCE_INLINE static quat from_rotation_yxz(float y, float x, float z) noexcept {
+            return shz_quat_from_rotation_yxz(y, x, z);
+        }
+
+        //! C++ convenience wrapper for shz_quat_from_rotation_xyz_u16().
+        SHZ_FORCE_INLINE static quat from_rotation_xyz_u16(uint16_t x, uint16_t y, uint16_t z) noexcept {
+            return shz_quat_from_rotation_xyz_u16(x, y, z);
+        }
+
+        //! C++ convenience wrapper for shz_quat_from_rotation_zyx_u16().
+        SHZ_FORCE_INLINE static quat from_rotation_zyx_u16(uint16_t z, uint16_t y, uint16_t x) noexcept {
+            return shz_quat_from_rotation_zyx_u16(z, y, x);
+        }
+
+        //! C++ convenience wrapper for shz_quat_from_rotation_zxy_u16().
+        SHZ_FORCE_INLINE static quat from_rotation_zxy_u16(uint16_t z, uint16_t x, uint16_t y) noexcept {
+            return shz_quat_from_rotation_zxy_u16(z, x, y);
+        }
+
+        //! C++ convenience wrapper for shz_quat_from_rotation_yxz_u16().
+        SHZ_FORCE_INLINE static quat from_rotation_yxz_u16(uint16_t y, uint16_t x, uint16_t z) noexcept {
+            return shz_quat_from_rotation_yxz_u16(y, x, z);
         }
 
         //! Initializes a quaternion which is a rotation in \p angle radians about the given \p axis.
@@ -191,14 +232,24 @@ namespace shz {
             return shz_quat_magnitude_sqr(*this);
         }
 
-        //! Returns the magnitude of the quaternion.
+        //! Returns the magnitude of the quaternion, safely returning 0.0f for a zero-length quaternion.
         SHZ_FORCE_INLINE float magnitude() const noexcept {
             return shz_quat_magnitude(*this);
         }
 
-        //! Returns the inverse of the magnitude of the quaternion.
+        //! Returns the magnitude of the quaternion, unsafely, using FSRRA. Divides by zero for a zero-length quaternion.
+        SHZ_FORCE_INLINE float magnitude_fsrra() const noexcept {
+            return shz_quat_magnitude_fsrra(*this);
+        }
+
+        //! Returns the inverse of the magnitude of the quaternion, safely returning 0.0f for a zero-length quaternion.
         SHZ_FORCE_INLINE float magnitude_inv() const noexcept {
             return shz_quat_magnitude_inv(*this);
+        }
+
+        //! Returns the inverse of the magnitude of the quaternion, unsafely, using FSRRA. Divides by zero for a zero-length quaternion.
+        SHZ_FORCE_INLINE float magnitude_inv_fsrra() const noexcept {
+            return shz_quat_magnitude_inv_fsrra(*this);
         }
 
         //! @}
@@ -211,6 +262,21 @@ namespace shz {
         //! Returns the tait-bryan rotation angles about the X, Y, then Z axes which are represented by the given quaternion.
         SHZ_FORCE_INLINE vec3 to_angles_xyz() const noexcept {
             return shz_quat_to_angles_xyz(*this);
+        }
+
+        //! Returns the tait-bryan rotation angles about the Z, Y, then X axes which are represented by the given quaternion.
+        SHZ_FORCE_INLINE vec3 to_angles_zyx() const noexcept {
+            return shz_quat_to_angles_zyx(*this);
+        }
+
+        //! Returns the tait-bryan rotation angles about the Z, X, then Y axes which are represented by the given quaternion.
+        SHZ_FORCE_INLINE vec3 to_angles_zxy() const noexcept {
+            return shz_quat_to_angles_zxy(*this);
+        }
+
+        //! Returns the tait-bryan rotation angles about the Y, X, then Z axes which are represented by the given quaternion.
+        SHZ_FORCE_INLINE vec3 to_angles_yxz() const noexcept {
+            return shz_quat_to_angles_yxz(*this);
         }
 
         //! Returns both the axis and angle of rotation through the pointer arguments.
@@ -240,6 +306,16 @@ namespace shz {
         //! Normalizes the given quaternion.
         SHZ_FORCE_INLINE void normalize() noexcept {
             *this = normalized();
+        }
+
+        //! Returns the given quaternion as a unit quaternion, or \p alt if it has a magnitude of 0.0f.
+        SHZ_FORCE_INLINE quat normalized_or(const quat& alt) const noexcept {
+            return shz_quat_normalize_or(*this, alt);
+        }
+
+        //! Normalizes the given quaternion, or sets it to \p alt if it has a magnitude of 0.0f.
+        SHZ_FORCE_INLINE void normalize_or(const quat& alt) noexcept {
+            *this = normalized_or(alt);
         }
 
         //! Returns a safely normalized quaternion from the given quaternion, protecting against division-by-zero.
@@ -401,6 +477,19 @@ namespace shz {
             scale(shz_invf(rhs));
             return *this;
         }
+
+        /*! \name  Deprecated
+            \brief Deprecated routines, kept only for backwards compatibility.
+            @{
+        */
+
+        //! C++ convenience wrapper for shz_quat_from_angles_xyz().
+        SHZ_DEPRECATED("Redundant. Use from_rotation_xyz().")
+        SHZ_FORCE_INLINE static quat from_angles_xyz(float x, float y, float z) noexcept {
+            return shz_quat_from_rotation_xyz(x, y, z);
+        }
+
+        //! @}
     };
 
     //! Alternate C++ alias for quat, for those who like POSIX style.

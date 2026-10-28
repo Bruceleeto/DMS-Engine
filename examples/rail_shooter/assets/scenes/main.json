@@ -1,0 +1,13 @@
+{
+  "dms_scene": 1,
+  "background": "#102035",
+  "fog": { "color": "#203149", "near": 140, "far": 310 },
+  "camera": { "pos": [0, 13.25, 15], "yaw": 174.075, "pitch": 5.857, "fov": 60 },
+  "lights": [ { "name": "Moon", "pos": [-0.4, -1, -0.3], "sun": true,
+                "color": "#bfdeff", "range": 500, "ambient": 0.6, "bands": 0 } ],
+  "objects": [
+    { "name": "Jet", "model": "jet/jet.dms",
+      "pos": [0.001328, 7.999964, 0], "rot": [0, 0, 0], "scale": [2.400701, 2.400701, 2.400701],
+      "tint": "#ffffff", "add": false, "visible": true }
+  ]
+}

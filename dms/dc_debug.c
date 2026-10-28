@@ -72,7 +72,7 @@ void dc_debug_sphere(shz_vec3_t center, float radius,
 
     shz_xmtrx_load_4x4((shz_mat4x4_t*)pv);
     shz_xmtrx_translate(ox, oy, -oz);
-    shz_xmtrx_apply_scale(radius, radius, radius);
+    shz_xmtrx_scale_3x3(radius, radius, radius);
 
     int ring_verts = (DBG_RING_SEGS + 1) * 2;
 

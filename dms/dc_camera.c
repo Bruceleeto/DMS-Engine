@@ -36,8 +36,8 @@ static void build_frustum(DCCamera* cam, float fov_rad, float aspect) {
 
     /* Rotate planes from view-space to world-space */
     shz_xmtrx_init_identity();
-    shz_xmtrx_apply_rotation_y(-cam->yaw);
-    shz_xmtrx_apply_rotation_x(-cam->pitch);
+    shz_xmtrx_rotate_y(-cam->yaw);
+    shz_xmtrx_rotate_x(-cam->pitch);
 
     shz_vec4_t world_left   = shz_xmtrx_transform_vec4(view_left);
     shz_vec4_t world_right  = shz_xmtrx_transform_vec4(view_right);
@@ -99,16 +99,16 @@ void dc_camera_update(DCCamera* cam) {
      * "zeroes" fr2 with fmul by 0, so leftover Inf/NaN in fr2 poisons the
      * screen-y row with NaN and everything drawn vanishes. */
     shz_xmtrx_init_permutation_wxyz();
-    shz_xmtrx_apply_screen(vw, vh);
-    shz_xmtrx_apply_perspective(fov_rad, aspect, NEAR_Z);
-    shz_xmtrx_apply_rotation_x(cam->pitch);
+    shz_xmtrx_screen(vw, vh);
+    shz_xmtrx_perspective(fov_rad, aspect, NEAR_Z);
+    shz_xmtrx_rotate_x(cam->pitch);
     /* The vertex loop negates z to get from Blender's right-handed world
      * into the PVR's. On its own that is a mirror: x came out the wrong way
      * round, and every model drew as its own reflection. Reflecting x here
      * too makes it a half turn instead, which is what looking along +z
      * from a right-handed world is. */
-    shz_xmtrx_apply_scale(-1.0f, 1.0f, 1.0f);
-    shz_xmtrx_apply_rotation_y(cam->yaw);
+    shz_xmtrx_scale_3x3(-1.0f, 1.0f, 1.0f);
+    shz_xmtrx_rotate_y(cam->yaw);
     shz_xmtrx_store_4x4(&cam->_pv_matrix);
     /* Into a part of the screen: shifted by its corner. Screen x and y are
      * rows 1 and 2 of the matrix, w is row 0, so x += corner.x * w */

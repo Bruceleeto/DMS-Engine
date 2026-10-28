@@ -280,6 +280,18 @@ DCScene* dc_scene_parse(const char* json, const char* root) {
     return s;
 }
 
+DCScene* dc_scene_play(const char* root, const char* scene) {
+    const char* open = getenv("DMS_SCENE");
+    char path[256];
+    snprintf(path, sizeof(path), "%s%s", root, open && *open ? open : scene);
+    return dc_scene_load(path, root);
+}
+
+DMSModel* dc_scene_model(DCScene* scene, const char* name) {
+    DCSceneObject* o = scene ? dc_scene_find(scene, name) : NULL;
+    return o ? o->m : NULL;
+}
+
 DCScene* dc_scene_load(const char* path, const char* root) {
     size_t size;
     char* file = dc_file_read(path, &size);
@@ -317,6 +329,9 @@ void dc_scene_load_models(DCScene* s) {
             snprintf(m->path, sizeof(m->path), "%s", o->model);
             m->model = strcmp(o->model, "@cube") ? dc_model_load(full) : dc_model_cube();
             if (!m->model) printf("dc_scene: %s: cannot load %s\n", o->name, full);
+            /* a skinned model has no pose (nor bounds) until it is first animated:
+             * posed now at its first frame, so it shows before the game runs it */
+            else if (m->model->skeleton) dc_model_animate(m->model, 0.0f);
         }
         o->m = s->models[k].model;
     }

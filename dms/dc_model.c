@@ -747,8 +747,8 @@ static float g_half_x, g_half_y, g_half_z;   /* sun_half_set(), below */
 
 static void env_axes(const DCCamera* cam, const float* cols) {
     shz_xmtrx_init_identity();
-    shz_xmtrx_apply_rotation_y(-cam->yaw);
-    shz_xmtrx_apply_rotation_x(-cam->pitch);
+    shz_xmtrx_rotate_y(-cam->yaw);
+    shz_xmtrx_rotate_x(-cam->pitch);
     shz_vec4_t wr = shz_xmtrx_transform_vec4(shz_vec4_init(-1.0f, 0.0f, 0.0f, 0.0f));
     shz_vec4_t wu = shz_xmtrx_transform_vec4(shz_vec4_init(0.0f, 1.0f, 0.0f, 0.0f));
     wr.z = -wr.z;
@@ -1081,7 +1081,7 @@ static bool render_packed_lights(pvr_dr_state_t* dr, const DMSMesh* mesh,
         dc_sq_copy32(pvr_dr_target(*dr), h);
     }
 
-    alignas(8) shz_vec4_t row[4];
+    alignas(16) shz_vec4_t row[4];
     alignas(4) float k[12 + 10 + 11 + 12 + 3 + 4];
     const float* m = mvp->elem;
     float* p = k;
@@ -1505,7 +1505,7 @@ static void render_fast_sun_packed(const DMSMesh* mesh, int power, bool env) {
     if (!env) { k[11] = g_uv_u; k[12] = g_uv_v; }
     loop_consts(&k[19]);
     /* The loop takes z as it is; the unpacked ones negate it going in */
-    shz_xmtrx_apply_scale(1.0f, 1.0f, -1.0f);
+    shz_xmtrx_scale_3x3(1.0f, 1.0f, -1.0f);
     uint64_t t0 = perf_cntr_timer_ns();
     pvr_dr_addr = sun_c((const DMSPacked*)mesh->vertices, (int)mesh->vertex_count, k,
                         pvr_dr_addr, power, env);
@@ -1538,7 +1538,7 @@ void dc_model_bench_sun(const DMSModel* model) {
             if (power > 8) power = 8;
             if (pass) { verts += count; pv += power * count; hist[power] += count; }
             shz_xmtrx_init_identity();
-            shz_xmtrx_apply_scale(0.5f, 0.5f, -0.5f);
+            shz_xmtrx_scale_3x3(0.5f, 0.5f, -0.5f);
             uint64_t t;
 
             /* read: the vertex data alone */
@@ -2015,8 +2015,8 @@ static int draw_skinned_mesh(DMSMesh* mesh, DMSModel* model,
     /* Build MVP with Z negation baked into scale */
     shz_xmtrx_load_4x4((shz_mat4x4_t*)dc_camera_get_pv(cam));
     shz_xmtrx_translate(pos.x - cam->pos.x, pos.y - cam->pos.y, -(pos.z - cam->pos.z));
-    if (yaw != 0.0f) shz_xmtrx_apply_rotation_y(yaw);
-    shz_xmtrx_apply_scale(scale * stretch.x, scale * stretch.y, -scale * stretch.z);
+    if (yaw != 0.0f) shz_xmtrx_rotate_y(yaw);
+    shz_xmtrx_scale_3x3(scale * stretch.x, scale * stretch.y, -scale * stretch.z);
 
     alignas(32) shz_mat4x4_t mvp;
     shz_xmtrx_store_4x4(&mvp);
@@ -2120,9 +2120,9 @@ static void draw_blocks_list(DMSModel* model, shz_vec3_t pos, float scale,
         rm.elem2D[3][0] = 0.0f;    rm.elem2D[3][1] = 0.0f;    rm.elem2D[3][2] = 0.0f;    rm.elem2D[3][3] = 1.0f;
         shz_xmtrx_apply_4x4(&rm);
     } else if (yaw != 0.0f) {
-        shz_xmtrx_apply_rotation_y(yaw);
+        shz_xmtrx_rotate_y(yaw);
     }
-    shz_xmtrx_apply_scale(scale, scale, scale);
+    shz_xmtrx_scale_3x3(scale, scale, scale);
     shz_xmtrx_store_4x4(&mvp);
     int xm = XM_MVP;
 
@@ -2551,7 +2551,7 @@ static void render_env_packed(const DMSPacked* src, int count, pvr_dr_state_t* d
     memcpy(&k[8], w, sizeof w);
     loop_consts(&k[11]);
     /* The loop takes z as it is; the C ones negate it going in */
-    shz_xmtrx_apply_scale(1.0f, 1.0f, -1.0f);
+    shz_xmtrx_scale_3x3(1.0f, 1.0f, -1.0f);
     pvr_dr_addr = refl_loop(src, count, k, pvr_dr_addr);
 }
 
@@ -2617,9 +2617,9 @@ static void draw_reflections(DMSModel* model, shz_vec3_t pos, float scale, float
         rm.elem2D[3][0] = 0.0f;    rm.elem2D[3][1] = 0.0f;    rm.elem2D[3][2] = 0.0f;    rm.elem2D[3][3] = 1.0f;
         shz_xmtrx_apply_4x4(&rm);
     } else if (yaw != 0.0f) {
-        shz_xmtrx_apply_rotation_y(yaw);
+        shz_xmtrx_rotate_y(yaw);
     }
-    shz_xmtrx_apply_scale(scale, scale, scale);
+    shz_xmtrx_scale_3x3(scale, scale, scale);
     shz_xmtrx_store_4x4(&mvp);
 
     pvr_dr_state_t* dr = NULL;
@@ -2794,9 +2794,9 @@ static void draw_cel(DMSModel* model, shz_vec3_t pos, float scale, float yaw,
         rm.elem2D[3][0] = 0.0f;    rm.elem2D[3][1] = 0.0f;    rm.elem2D[3][2] = 0.0f;    rm.elem2D[3][3] = 1.0f;
         shz_xmtrx_apply_4x4(&rm);
     } else if (yaw != 0.0f) {
-        shz_xmtrx_apply_rotation_y(yaw);
+        shz_xmtrx_rotate_y(yaw);
     }
-    shz_xmtrx_apply_scale(scale, scale, scale);
+    shz_xmtrx_scale_3x3(scale, scale, scale);
     shz_xmtrx_store_4x4(&mvp);
 
     uint32_t skip = DMS_MAT_COLLISION_ONLY | DMS_MAT_MARKER |
@@ -2881,7 +2881,7 @@ static void update_skeleton(DMSSkeleton* sk, float delta_time) {
         shz_xmtrx_init_scale(bone->localPose.scale.x,
                              bone->localPose.scale.y,
                              bone->localPose.scale.z);
-        shz_xmtrx_apply_rotation_quat(bone->localPose.rotation);
+        shz_xmtrx_rotate_quat(bone->localPose.rotation);
         shz_xmtrx_set_translation(bone->localPose.translation.x,
                                   bone->localPose.translation.y,
                                   bone->localPose.translation.z);
@@ -3190,8 +3190,8 @@ DMSModel* dc_model_load(const char* filename) {
 
     int is_animated = (bone_count > 0);
 
-    DMSModel* model = malloc(sizeof(DMSModel));
-    memset(model, 0, sizeof(DMSModel));
+    DMSModel* model = calloc(1, sizeof(DMSModel));
+    if (!model) { printf("DMS: %s: out of memory\n", filename); mf_close(f); return NULL; }
     model->mesh_count = mesh_count;
 
     mf_read(&model->opaque_count, 4, 1, f);
@@ -3231,8 +3231,8 @@ DMSModel* dc_model_load(const char* filename) {
             shz_xmtrx_init_scale(bone->bindPose.scale.x,
                                  bone->bindPose.scale.y,
                                  bone->bindPose.scale.z);
-            shz_xmtrx_apply_rotation_quat(bone->bindPose.rotation);
-            shz_xmtrx_apply_translation(bone->bindPose.translation.x,
+            shz_xmtrx_rotate_quat(bone->bindPose.rotation);
+            shz_xmtrx_add_translation(bone->bindPose.translation.x,
                                         bone->bindPose.translation.y,
                                         bone->bindPose.translation.z);
 
@@ -3875,10 +3875,10 @@ void dc_model_draw_shadow(DMSModel* model, shz_vec3_t pos, float scale, float ya
         rm.elem2D[3][0] = 0.0f;    rm.elem2D[3][1] = 0.0f;    rm.elem2D[3][2] = 0.0f;    rm.elem2D[3][3] = 1.0f;
         shz_xmtrx_apply_4x4(&rm);
     } else if (yaw != 0.0f) {
-        shz_xmtrx_apply_rotation_y(yaw);
+        shz_xmtrx_rotate_y(yaw);
     }
     /* Skinned vertices go in as they are, so z is negated here */
-    shz_xmtrx_apply_scale(scale, scale, model->skeleton ? -scale : scale);
+    shz_xmtrx_scale_3x3(scale, scale, model->skeleton ? -scale : scale);
     alignas(32) shz_mat4x4_t mvp;
     shz_xmtrx_store_4x4(&mvp);
     for (int i = 0; i < 16; i++) mvp.elem[i] *= 1.0f - 2.0f * SHADOW_SORT_GAP;
@@ -4110,8 +4110,8 @@ void dc_model_draw_modified(DMSModel* model, shz_vec3_t pos, float scale, float 
     alignas(32) shz_mat4x4_t mvp;
     shz_xmtrx_load_4x4((shz_mat4x4_t*)dc_camera_get_pv(cam));
     shz_xmtrx_translate(pos.x - cam->pos.x, pos.y - cam->pos.y, -(pos.z - cam->pos.z));
-    if (yaw != 0.0f) shz_xmtrx_apply_rotation_y(yaw);
-    shz_xmtrx_apply_scale(scale, scale, zs);
+    if (yaw != 0.0f) shz_xmtrx_rotate_y(yaw);
+    shz_xmtrx_scale_3x3(scale, scale, zs);
     shz_xmtrx_store_4x4(&mvp);
 
     /* Two words a vertex, so twice the room of a normal mesh */
@@ -4225,8 +4225,8 @@ void dc_model_draw_volume(DMSModel* model, shz_vec3_t pos, float scale, float ya
     alignas(32) shz_mat4x4_t mvp;
     shz_xmtrx_load_4x4((shz_mat4x4_t*)dc_camera_get_pv(cam));
     shz_xmtrx_translate(pos.x - cam->pos.x, pos.y - cam->pos.y, -(pos.z - cam->pos.z));
-    if (yaw != 0.0f) shz_xmtrx_apply_rotation_y(yaw);
-    shz_xmtrx_apply_scale(scale, scale, sk ? -scale : scale);
+    if (yaw != 0.0f) shz_xmtrx_rotate_y(yaw);
+    shz_xmtrx_scale_3x3(scale, scale, sk ? -scale : scale);
     shz_xmtrx_store_4x4(&mvp);
 
     if (g_vtx_left < (int32_t)(mesh->tri_count * 64)) { vtxbuf_warn(); return; }

@@ -1,0 +1,20 @@
+{
+  "dms_scene": 1,
+  "background": "#000000",
+  "camera": { "pos": [-18, 4.67158, -40], "yaw": 0, "pitch": 0, "fov": 60 },
+  "lights": [],
+  "objects": [
+    { "name": "World", "model": "world/test.dms",
+      "pos": [0, 0, 0], "rot": [0, 0, 0], "scale": [1, 1, 1],
+      "tint": "#ffffff", "add": false, "visible": true },
+    { "name": "Crate", "model": "crate/crate.dms",
+      "pos": [-18.4424, 8.42665, -16.51154], "rot": [0, 0, 0], "scale": [1, 1, 1],
+      "tint": "#ffffff", "add": false, "visible": true },
+    { "name": "Ball", "model": "ball/ball.dms",
+      "pos": [-17.01194, 20.9095, -15], "rot": [0, 0, 0], "scale": [1, 1, 1],
+      "tint": "#ffffff", "add": false, "visible": true },
+    { "name": "Chain", "model": "",
+      "pos": [-10, 13.43384, -21], "rot": [0, 0, 0], "scale": [1, 1, 1],
+      "tint": "#ffffff", "add": false, "visible": true }
+  ]
+}

@@ -48,10 +48,8 @@ CFLAGS += -std=gnu2x -O3 -I$(DMS_ROOT) -I$(CURDIR) \
 LIBS = -lsh4zam -lkosutils -lm -Wl,--gc-sections
 
 # Each project builds its own engine objects, so per-project flags never clash.
-# Only the project's own sources bake in ASSETS, so disc builds recompile just those.
 ENGINE_OBJS = $(addprefix $(OUT)/dms/,$(addsuffix .o,$(ENGINE)))
 OBJS        = $(addprefix $(OUT)/dc/,$(SRCS:.c=.o))
-DISC_OBJS   = $(addprefix $(OUT)/disc/,$(SRCS:.c=.o))
 
 .PHONY: all assets assets-clean clean run disc flycast dist host host-run shot check
 all: assets $(ELF)
@@ -62,20 +60,16 @@ $(OUT)/dms/%.o: $(DMS_ROOT)/dms/%.c
 $(OUT)/dc/%.o: %.c
 	@mkdir -p $(@D)
 	$(DC_CC) $(CFLAGS) -c $< -o $@
-$(OUT)/disc/%.o: %.c
-	@mkdir -p $(@D)
-	$(DC_CC) $(CFLAGS) -DASSETS='"/cd/"' -c $< -o $@
 
 $(ELF): $(OBJS) $(ENGINE_OBJS)
-	$(DC_CC) -o $@ $^ $(LIBS)
-$(OUT)/$(NAME)-disc.elf: $(DISC_OBJS) $(ENGINE_OBJS)
 	$(DC_CC) -o $@ $^ $(LIBS)
 
 run: all
 	$(KOS_LOADER) $(ELF) -m $(CURDIR)/$(PC)
 
-disc: assets $(OUT)/$(NAME)-disc.elf
-	mkdcdisc -e $(OUT)/$(NAME)-disc.elf -D $(PC) -o $(CDI) -N
+# The same ELF as make run: assets under /pc/ are found on the disc at /cd/ (dms/dc_file.h)
+disc: all
+	mkdcdisc -e $(ELF) -D $(PC) -o $(CDI) -N
 
 # The disc image in the Flycast emulator (FLYCAST=/path/to/flycast if it isn't on the PATH)
 FLYCAST ?= flycast
@@ -161,7 +155,7 @@ $(PC)/%.json: assets/%.json
 	@mkdir -p $(@D)
 	cp $< $@
 
--include $(OBJS:.o=.d) $(DISC_OBJS:.o=.d) $(ENGINE_OBJS:.o=.d)
+-include $(OBJS:.o=.d) $(ENGINE_OBJS:.o=.d)
 
 # The scene editor on this project (tools/editor), and its scene drawn by the
 # engine to a PNG without a window: make scene-shot SCENE=scenes/main.json

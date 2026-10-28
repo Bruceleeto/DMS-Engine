@@ -45,7 +45,7 @@ CPPFLAGS := -DDMS_HOST -I$(CURDIR)/include -I$(ROOT) -I$(SHZ)/include $(GPU_PVR_
 CFLAGS := $(ARCH_FLAGS) -std=gnu2x -O2 -g -msse2 -mfpmath=sse -ffp-contract=off -MMD -MP
 # Engine and game allocations go to the Dreamcast heap.
 DCSIM := -include $(CURDIR)/dcsim/dcsim.h
-SHZ_SRC := shz_matrix shz_quat shz_xmtrx sw/shz_xmtrx_sw sw/shz_complex_sw
+SHZ_SRC := shz_version sw/shz_complex_sw sw/shz_matrix_sw sw/shz_xmtrx_sw
 
 ENGINE_OBJS := $(addprefix $(SHARED)/dms/,$(addsuffix .o,$(ENGINE)))
 GAME_OBJS := $(addprefix $(OUT)/,$(SRCS:.c=.o))

@@ -4082,9 +4082,10 @@ void ExportTristrippedModel(const Model *model, const char *filename,
     uint32_t remaining = sz;
     while (remaining > 0) {
       size_t chunk = remaining < 4096 ? remaining : 4096;
-      fread(buf, 1, chunk, dtf);
-      fwrite(buf, 1, chunk, file);
-      remaining -= chunk;
+      size_t got = fread(buf, 1, chunk, dtf);
+      if (got == 0) break;  // short file: stop rather than loop
+      fwrite(buf, 1, got, file);
+      remaining -= (uint32_t)got;
     }
     fclose(dtf);
     remove(dtPath);  // clean up loose .dt file

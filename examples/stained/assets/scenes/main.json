@@ -1,0 +1,11 @@
+{
+  "dms_scene": 1,
+  "background": "#101018",
+  "camera": { "pos": [-119.07, 133.09, 245.24], "yaw": 148.969, "pitch": 25.7831, "fov": 60 },
+  "lights": [],
+  "objects": [
+    { "name": "Room", "model": "stained/staind.dms",
+      "pos": [0, 0, 0], "rot": [0, 0, 0], "scale": [1, 1, 1],
+      "tint": "#ffffff", "add": false, "visible": true }
+  ]
+}

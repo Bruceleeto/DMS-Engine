@@ -1,0 +1,11 @@
+{
+  "dms_scene": 1,
+  "background": "#000000",
+  "camera": { "pos": [0, 0, 0], "yaw": 0, "pitch": 0, "fov": 60 },
+  "lights": [],
+  "objects": [
+    { "name": "Vase", "model": "vase/vase.dms",
+      "pos": [0, 0, 5], "rot": [0, 0, 0], "scale": [1.6, 1.6, 1.6],
+      "tint": "#ffffff", "add": false, "visible": true }
+  ]
+}

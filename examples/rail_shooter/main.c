@@ -10,12 +10,17 @@
 #include "dms/dc_draw.h"
 #include "dms/dc_draw2d.h"
 #include "dms/dc_corona.h"
+#include "dms/dc_scene.h"
 
 #ifndef ASSETS
 #define ASSETS "/pc/"
 #endif
 
-/* Fixed pools: no allocation while flying. The world moves towards +Z,
+/* The jet (Jet: where it starts and its size), its moonlight (the only thing
+ * lit), the sky colour, fog and start camera are scenes/main.json. The city
+ * is made as it flies, so it stays in code.
+ *
+ * Fixed pools: no allocation while flying. The world moves towards +Z,
  * keeping the ship at Z=0 and coordinates small for arbitrarily long runs. */
 #define SECTIONS 16
 #define SPACING 28.0f
@@ -36,11 +41,11 @@ typedef struct { float x, y, z; bool active; } Shot;
 static Section sections[SECTIONS];
 static Shot shots[SHOTS];
 static DMSModel* cube;
-static DMSModel* jet;
+static DCScene* scene;
+static DCSceneObject* jet;
 static DMSModel* towers[TOWER_TYPES];
 static DMSModel* street;
-static float jet_scale;
-static shz_vec3_t jet_centre;
+static shz_vec3_t jet_centre, ship_start;
 static DCCamera camera;
 static uint32_t seed, rng;
 static float ship_x, ship_y, distance, cooldown, hurt;
@@ -88,7 +93,7 @@ static void generate(Section* s, float z) {
 static void reset(void) {
     rng = seed ? seed : 1;
     memset(shots, 0, sizeof(shots));
-    ship_x = 0; ship_y = 8;
+    ship_x = ship_start.x; ship_y = ship_start.y;
     distance = cooldown = hurt = 0;
     velocity_x = velocity_y = bank = pitch = camera_x = 0;
     camera_y = ship_y + CHASE_HEIGHT;
@@ -257,8 +262,8 @@ static void draw(void) {
      * Start at identity so neutral input cannot introduce pitch or shear. */
     shz_mat4x4_t attitude __attribute__((aligned(32)));
     shz_xmtrx_init_identity();
-    shz_xmtrx_apply_rotation_z(bank);
-    shz_xmtrx_apply_rotation_x(pitch);
+    shz_xmtrx_rotate_z(bank);
+    shz_xmtrx_rotate_x(pitch);
     shz_xmtrx_store_4x4(&attitude);
     float rotation[9];
     for (int column = 0; column < 3; ++column)
@@ -268,18 +273,18 @@ static void draw(void) {
      * Apply only the flight rotation; no asset-axis correction is needed. */
     /* Keep the model centred on the flight position as it banks. */
     shz_vec3_t centre = jet_centre;
-    DCLight moon = { .pos = { .x = -0.4f, .y = -1, .z = -0.3f },
-                    .sun = true, .r = 0.75f, .g = 0.87f, .b = 1, .ambient = 0.6f };
-    dc_set_light(&moon);
-    dc_draw_ex(jet, &(DCDrawOpts){
-        .pos = {
-            .x = world_ship_x() - jet_scale * (rotation[0]*centre.x + rotation[3]*centre.y + rotation[6]*centre.z),
-            .y = ship_y - jet_scale * (rotation[1]*centre.x + rotation[4]*centre.y + rotation[7]*centre.z),
-            .z = -jet_scale * (rotation[2]*centre.x + rotation[5]*centre.y + rotation[8]*centre.z)
-        },
-        .scale = jet_scale,
-        .rot = rotation, .tint = hurt > 0 ? 0xFF7090 : 0xFFFFFF
-    });
+    float jet_scale = jet->scale.x;
+    jet->pos = shz_vec3_init(
+        world_ship_x() - jet_scale * (rotation[0]*centre.x + rotation[3]*centre.y + rotation[6]*centre.z),
+        ship_y - jet_scale * (rotation[1]*centre.x + rotation[4]*centre.y + rotation[7]*centre.z),
+        -jet_scale * (rotation[2]*centre.x + rotation[5]*centre.y + rotation[8]*centre.z));
+    jet->rot = dc_scene_rot_degrees(rotation);
+    jet->tint = hurt > 0 ? 0xFF7090 : 0xFFFFFF;
+    /* Only the jet is lit, by the scene's lights */
+    DCLight lights[DC_MAX_LIGHTS];
+    for (int i = 0; i < scene->light_count; ++i) lights[i] = scene->lights[i].light;
+    if (scene->light_count) dc_set_lights(lights, scene->light_count);
+    dc_scene_draw(scene);
     dc_set_light(NULL);
     for (int side = 0; side < 2; ++side) {
         float x = (side ? 0.16f : -0.16f) - centre.x;
@@ -338,24 +343,29 @@ int main(int argc, char** argv) {
     /* Double-buffered vertex storage, with room for the visual effects. */
     dc_init((DCInitParams){ .vram_size = 1700 * 1024 });
     dc_draw2d_init();
-    dc_camera_init(&camera);
-    dc_set_clear_color(0xFF102035);
-    dc_set_fog(0x203149, 140, 310);
     cube = dc_model_cube();
     if (!cube) { dc_shutdown(); return 1; }
-    jet = dc_model_load(ASSETS "jet/jet.dms");
-    if (!jet) {
-        printf("Cannot load " ASSETS "jet/jet.dms; run make assets and mount pc/ with dc-tool -c pc.\n");
+    scene = dc_scene_play(ASSETS, "scenes/main.json");
+    jet = scene ? dc_scene_find(scene, "Jet") : NULL;
+    if (!jet || !jet->m) {
+        printf("Cannot load the scene's Jet; run make assets and mount pc/ with dc-tool -c pc.\n");
+        dc_scene_free(scene);
         dc_model_free(cube);
         dc_shutdown();
         return 1;
     }
-    DCBounds bounds = dc_model_bounds(jet, NULL);
+    /* The lights are put on for the jet alone (in draw) */
+    dc_scene_apply(scene);
+    dc_set_light(NULL);
+    dc_scene_camera(scene, &camera);
+    DCBounds bounds = dc_model_bounds(jet->m, NULL);
     jet_centre = shz_vec3_init((bounds.min.x + bounds.max.x) * 0.5f,
         (bounds.min.y + bounds.max.y) * 0.5f, (bounds.min.z + bounds.max.z) * 0.5f);
-    jet_scale = 4.0f / fmaxf(bounds.max.x - bounds.min.x, 0.001f);
-    for (uint32_t i = 0; i < jet->mesh_count; ++i)
-        jet->meshes[i].rim_color = 0x152C40;
+    /* The ship flies where the scene puts the middle of the jet (x from the rail) */
+    ship_start = shz_vec3_init(jet->pos.x + jet->scale.x * jet_centre.x,
+                               jet->pos.y + jet->scale.x * jet_centre.y, 0);
+    for (uint32_t i = 0; i < jet->m->mesh_count; ++i)
+        jet->m->meshes[i].rim_color = 0x152C40;
     street = dc_model_load(ASSETS "city/street.dms");
     bool city_loaded = street != NULL;
     for (int i = 0; i < TOWER_TYPES; ++i) {
@@ -368,7 +378,7 @@ int main(int argc, char** argv) {
         printf("Cannot load city models; run make assets.\n");
         for (int i = 0; i < TOWER_TYPES; ++i) dc_model_free(towers[i]);
         dc_model_free(street);
-        dc_model_free(jet);
+        dc_scene_free(scene);
         dc_model_free(cube);
         dc_shutdown();
         return 1;
@@ -389,7 +399,7 @@ int main(int argc, char** argv) {
     }
     dc_model_free(cube);
     dc_set_bloom(NULL);
-    dc_model_free(jet);
+    dc_scene_free(scene);
     dc_model_free(street);
     for (int i = 0; i < TOWER_TYPES; ++i) dc_model_free(towers[i]);
     dc_shutdown();

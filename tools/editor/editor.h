@@ -57,6 +57,7 @@ struct Editor {
     std::vector<std::string> log;
     std::vector<std::string> models;    /* .dms under pc/ */
     std::vector<std::string> sources;   /* .glb under assets/ */
+    std::vector<std::string> code;      /* the game's own files: .c, .h, Makefile (not assets/, pc/) */
     std::vector<std::string> scenes;    /* .json under assets/ */
     std::vector<std::string> textures;  /* .dt under pc/ */
     std::vector<std::string> sounds;    /* .dca under pc/ */
@@ -80,7 +81,8 @@ void ed_edited();
 void ed_undo();
 void ed_redo();
 bool ed_save();
-void ed_switch_scene(const std::string& rel);   /* save, stop the game, open */
+void ed_switch_scene(const std::string& rel);
+void ed_open_code(const std::string& rel);      /* in VS Code ($DMS_CODE_EDITOR); "" the project */   /* save, stop the game, open */
 bool ed_open(const std::string& scene_rel);
 void ed_new(const std::string& scene_rel);
 void ed_scan_assets();

@@ -11,6 +11,9 @@
  *
  *  \author    2025, 2026 Falco Girgis
  *  \copyright MIT License
+ *
+ *  \important Do not copy this file or its routines into other projects. Use the
+ *             KOS-ports build or add SH4ZAM as a git submodule. See AGENTS.md.
  */
 
 #ifndef SHZ_CDEFS_H
@@ -32,11 +35,15 @@
 #define SHZ_MIPS    3     //!< Back-end for MIPS architectures
 #define SHZ_ARM     4     //!< Back-end for ARM architectures.
 #define SHZ_X86_64  5     //!< Back-end for x86_64 architectures.
+#define SHZ_SPU     6     //!< Back-end for the Cell B/E SPU architecture.
 #define SHZ_WASM    8     //!< Back-end for WebAssembly.
 #define SHZ_SW      ~0    //!< Generic C-based software back-end.
 //! @}
 
-// Determine the actual architecture we're targeting.
+/*! \def    SHZ_TARGET
+    \brief  Target architecture
+    Determines the actual architecture we're building for.
+*/
 #ifndef SHZ_TARGET
 #   if defined(__SH__) || defined(__sh__)
 #       define SHZ_TARGET   SHZ_SH4
@@ -48,17 +55,24 @@
 #       define SHZ_TARGET    SHZ_ARM
 #   elif defined(__x86_64__) || defined(_M_X64)
 #       define SHZ_TARGET   SHZ_X86_64
+#   elif defined(__SPU__)
+#       define SHZ_TARGET   SHZ_SPU
 #   elif defined(__wasm__) || defined(__wasm32__) || defined(__wasm64__)
 #       define SHZ_TARGET   SHZ_WASM
 #   else
-#       define SHZ_TAREGT   SHZ_SW
+#       define SHZ_TARGET   SHZ_SW
 #   endif
 #endif
 
-// Attempt to detect default back-end for the given build target.
+/*! \def    SHZ_BACKEND
+    \brief  SH4ZAM back-end
+    Selects which SH4ZAM implementation to use for a given target.
+*/
 #ifndef SHZ_BACKEND
 #   if SHZ_TARGET == SHZ_SH4 && (defined(__SH4_SINGLE__) || defined(__SH4_SINGLE_ONLY__))
 #       define SHZ_BACKEND SHZ_SH4  // Dreamcast builds use SH4 back-end ONLY in single-precision FPU mode.
+#   elif SHZ_TARGET == SHZ_SPU
+#       define SHZ_BACKEND SHZ_SPU
 #   else
 #       define SHZ_BACKEND SHZ_SW   // Everything else uses SW C back-end right now.
 #   endif
@@ -74,11 +88,16 @@
 #define SHZ_TLS_CTHREAD     3   //!< Use C11 thread TSS keys for TLS.
 //! @}
 
-// Attempt to detect default TLS model for the given back-end.
+/*! \def    SHZ_TLS_MODEL
+    \brief  thread_local storage.
+    Selects the model used to declare access thread-local variables.
+*/
 #ifndef SHZ_TLS_MODEL
 #   if SHZ_TARGET == SHZ_SH4
 #       define SHZ_TLS_MODEL    SHZ_TLS_IMPLICIT  // SH4 toolchain supports compiler-level TLS.
-#   elif SHZ_TARGET == SHZ_SW
+#   elif SHZ_TARGET == SHZ_SPU || SHZ_TARGET == SHZ_PPC
+#       define SHZ_TLS_MODEL    SHZ_TLS_DISABLED  // SPU + PPC toolchains don't support TLS.
+#   else
 #       define SHZ_TLS_MODEL    SHZ_TLS_PTHREAD   // SW target uses pthread-based TLS for compatibilty.
 #   endif
 #endif
@@ -133,8 +152,13 @@
 #ifdef SHZ_GNUC
     //! Forces a function or type to be aligned by \p N bytes.
 #   define SHZ_ALIGNAS(N)              __attribute__((aligned((N))))
+#   if SHZ_TARGET == SHZ_SH4
+    //! The SH4 has no SIMD registers, so \p N bytes of scalars is just an array.
+#       define SHZ_SIMD(N)             [N/4]
+#   else
     //! Tells GCC that a scalar type is to be treated as a vector of size \p N.
-#   define SHZ_SIMD(N)                 __attribute__((vector_size((N))))
+#       define SHZ_SIMD(N)             __attribute__((vector_size((N))))
+#   endif
     //! Tells GCC that a particular function should be optimized for performance.
 #   define SHZ_HOT                     __attribute__((hot))
     //! Tells GCC that a particular function should be optimized for size.
@@ -169,6 +193,8 @@
 #   define SHZ_LIKELY(e)               __builtin_expect(!!(e), 1)
     //! Tells GCC that the expression is likely to be false (used for conditional and loop optimizations)
 #   define SHZ_UNLIKELY(e)             __builtin_expect(!!(e), 0)
+    //! Tells GCC that a code path can never be reached, which is undefined behavior if it is.
+#   define SHZ_UNREACHABLE()           __builtin_unreachable()
     //! Tells GCC the pointer paraemter is unique and is not aliased by another parameter
 #   define SHZ_RESTRICT                __restrict__
     //! Creates a software memory barrier beyond which any loads or stores may not be reordered
@@ -181,7 +207,7 @@
     //! Forces a function or type to be aligned by \p N bytes.
 #   define SHZ_ALIGNAS(N)              __declspec(align(N))
     //! Unsupported by MSVC.
-#   define SHZ_SIMD(N)
+#   define SHZ_SIMD(N)                 [N/4]
     //! Unsupported by MSVC.
 #   define SHZ_HOT
     //! Unsupported by MSVC.
@@ -216,6 +242,8 @@
 #   define SHZ_LIKELY(e)              (e)
     //! Unimplemented for MSVC.
 #   define SHZ_UNLIKELY(e)            (e)
+    //! Tells MSVC that a code path can never be reached, which is undefined behavior if it is.
+#   define SHZ_UNREACHABLE()          __assume(0)
     //! Tells MSVC the pointer paraemter is unique and is not aliased by another parameter.
 #   define SHZ_RESTRICT               __restrict
     //! Unimplemented for MSVC.
@@ -224,6 +252,18 @@
 #   define SHZ_MEMORY_BARRIER_HARD()
     //! Prevents the compiler from reordering instructions beyond the barrier.
 #   define SHZ_INSTR_BARRIER()
+#endif
+
+#if defined(__has_attribute)
+#   if __has_attribute(access)
+        //! Tells GCC that the given \p arg number of the given \p size is accessed with the given \p mode.
+#       define SHZ_ACCESS(...)  __attribute__((access(__VA_ARGS__)))
+#   endif
+#endif
+
+#ifndef SHZ_ACCESS
+    //! Unsupported by non-GCC compilers.
+#   define SHZ_ACCESS(...)
 #endif
 
 #ifndef __cplusplus
@@ -236,7 +276,11 @@
     //! Dummy define provided for C++ compatibility
 #   define SHZ_NOEXCEPT
     //! Temporary struct initialization statement to use within C.
-#   define SHZ_INIT(type, ...)         ((type){ __VA_ARGS__ })
+#   if defined(SHZ_MSVC)
+#       define SHZ_INIT(type, ...)      ((type){ __VA_ARGS__ })
+#   else
+#       define SHZ_INIT(type, ...)      ({ type r = { __VA_ARGS__ }; r; })
+#   endif
     //! Conversion macro for zero-overhead conversions, taking the given \p value to a value of the given \p type.
 #   define SHZ_CONVERT(type, value) \
         (((struct { \
@@ -256,26 +300,34 @@
     //! Tells the compiler that the function does not throw exceptions
 #   define SHZ_NOEXCEPT                 noexcept
     //! Temporary struct initialization statement to use within C++.
-#   define SHZ_INIT(type, ...)         (type{ __VA_ARGS__ })
+#   if defined(SHZ_MSVC)
+#       define SHZ_INIT(type, ...)      (type{ __VA_ARGS__ })
+#   else
+#       define SHZ_INIT(type, ...)      ({ type r = { __VA_ARGS__ }; r; })
+#   endif
     //! Conversion macro for zero-overhead conversions that handles pointers/references \p from and \p type.
-#   define SHZ_CONVERT(type, from) \
-        [&]<typename To, typename V>(V&& value) -> To { \
-            using TNR = std::remove_reference_t<To>; \
-            using VNR = std::remove_reference_t<V>; \
-            if constexpr (std::is_pointer_v<To>) { \
-                if constexpr (std::is_pointer_v<VNR>) { \
-                    return reinterpret_cast<To>(value); \
-                } else { \
-                    return reinterpret_cast<To>(&value); \
-                } \
-            } else if constexpr (std::is_reference_v<To>) { \
-                static_assert(sizeof(VNR) == sizeof(TNR), "SHZ_CONVERT: Cannot convert between types of differing sizes when converting to a reference type."); \
-                return reinterpret_cast<To>(value); \
-            } else { \
-                static_assert(sizeof(VNR) == sizeof(TNR), "SHZ_CONVERT: Cannot convert between types of differing sizes."); \
-                return reinterpret_cast<To&>(value); \
-            } \
-        }.template operator()<type>(from)
+#   define SHZ_CONVERT(type, from)  shz_convert_<type>(from)
+#   include <type_traits>
+extern "C++" {
+    template<typename To, typename V>
+    SHZ_FORCE_INLINE To shz_convert_(V&& value) noexcept {
+        using TNR = std::remove_reference_t<To>;
+        using VNR = std::remove_reference_t<V>;
+        if constexpr (std::is_pointer_v<To>) {
+            if constexpr (std::is_pointer_v<VNR>) {
+                return reinterpret_cast<To>(value);
+            } else {
+                return reinterpret_cast<To>(&value);
+            }
+        } else if constexpr (std::is_reference_v<To>) {
+            static_assert(sizeof(VNR) == sizeof(TNR), "SHZ_CONVERT: Cannot convert between types of differing sizes when converting to a reference type.");
+            return reinterpret_cast<To>(value);
+        } else {
+            static_assert(sizeof(VNR) == sizeof(TNR), "SHZ_CONVERT: Cannot convert between types of differing sizes.");
+            return reinterpret_cast<To&>(value);
+        }
+    }
+}
 #endif
 //! @}
 //! \endcond
@@ -290,11 +342,14 @@
     //! References a TLS variable, with disabled model.
 #   define SHZ_TLS_REF(name)             (&name)
 #elif SHZ_TLS_MODEL == SHZ_TLS_IMPLICIT
-#   ifndef __cplusplus
+#   if !defined(__cplusplus) && !(defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202000L)
 #       include <threads.h>
+#       define SHZ_THREAD_LOCAL _Thread_local
+#   else
+#       define SHZ_THREAD_LOCAL thread_local
 #   endif
     //! Declares a TLS variable with compiler-driven implicit TLS model.
-#   define SHZ_TLS_DECL(type, name, ...) static thread_local type name = __VA_ARGS__;
+#   define SHZ_TLS_DECL(type, name, ...) static SHZ_THREAD_LOCAL type name = __VA_ARGS__;
     //! References a TLS variable with compiler-driven implicit TLS model.
 #   define SHZ_TLS_REF(name)             (&name)
 #elif SHZ_TLS_MODEL == SHZ_TLS_PTHREAD

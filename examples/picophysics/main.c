@@ -12,8 +12,9 @@
 #include "dms/dc_draw2d.h"
 #include "dms/dc_debug.h"
 #include "dms/collision.h"
+#include "dms/dc_scene.h"
 
-/* Where assets are read from: /pc/ over dcload, /cd/ when built with make disc */
+/* Where assets are read from: /pc/ over dcload; on a disc the engine finds them at /cd/ */
 #ifndef ASSETS
 #define ASSETS "/pc/"
 #endif
@@ -23,13 +24,14 @@
 #define PICOPHYSICS_IMPLEMENTATION
 #include "dms/picophysics.h"
 
+/* The level (World), the crate and ball dropped at the start (Crate, Ball:
+ * physics then moves them), the wrecking ball's pivot (marker Chain) and the
+ * start view are scenes/main.json. Thrown props and the chain stay in code. */
+
 /* ---- App state ---- */
 static DCCamera camera;
 static DCPlayer player;
-
-
-/* Level */
-static DMSModel* world_model = NULL;
+static DCScene* scene = NULL;
 static ColWorld* col_world = NULL;
 
 /* A prop is a model driven by a picophysics body. Models are not always built
@@ -38,13 +40,14 @@ static ColWorld* col_world = NULL;
 typedef struct {
     DMSModel*  model;
     PPBody*    body;
+    DCSceneObject* obj;     /* the scene's, which the body moves; NULL: drawn here */
     shz_vec3_t centre;      /* middle of the model's box, model space */
     shz_vec3_t half;        /* half size of the box */
     shz_vec3_t start;       /* where the body is dropped from */
+    PPQuaternion start_rot;
     float      radius;      /* above 0: the body is a sphere, otherwise a box */
 } Prop;
 
-#define DROP_HEIGHT 10.0f   /* above the ground */
 static Prop ball, crate;
 
 /* Every throw adds a body; when the pool is full the oldest one goes */
@@ -63,7 +66,6 @@ static int    thrown_count, thrown_next;
 #define CHAIN_BODIES  (CHAIN_LINKS + 1)     /* links, then the bob */
 #define CHAIN_PITCH   0.8364f               /* centre to centre */
 #define CHAIN_BOB_GAP 1.05f                 /* last link centre to bob centre */
-#define CHAIN_TOP     15.0f                 /* pivot height above the ground */
 #define CHAIN_SWING   0.7f                  /* starting angle, radians */
 static Prop         link_prop, bob_prop;
 static PPBody*      chain_body[CHAIN_BODIES];
@@ -97,10 +99,8 @@ static int phys_tri_query(const PPVec3* centre, float reach, PPTriangle* out, in
     return n;
 }
 
-/* Load a prop's model and measure its box */
-static void prop_load(Prop* p, const char* path) {
-    memset(p, 0, sizeof(*p));
-    p->model = dc_model_load(path);
+/* Measure a prop's model's box */
+static void prop_measure(Prop* p, const char* path) {
     if (!p->model) return;
 
     shz_vec3_t lo = shz_vec3_init( 1e9f,  1e9f,  1e9f);
@@ -124,20 +124,51 @@ static void prop_load(Prop* p, const char* path) {
            p->centre.x, p->centre.y, p->centre.z);
 }
 
-/* Drop point: `height` above the ground at (x, z) */
-static shz_vec3_t drop_point(float x, float z, float height) {
-    float ground = 0.0f;
-    ColGroundHit hit = col_ground(col_world, shz_vec3_init(x, 1000.0f, z), 2000.0f);
-    if (hit.hit) ground = hit.y;
-    printf("Drop at %.1f %.1f: ground %.2f\n", x, z, ground);
-    return shz_vec3_init(x, ground + height, z);
+/* Load a prop's model and measure its box */
+static void prop_load(Prop* p, const char* path) {
+    memset(p, 0, sizeof(*p));
+    p->model = dc_model_load(path);
+    prop_measure(p, path);
+}
+
+/* A prop placed in the scene: its model, and its body's start where the scene
+ * puts the middle of its box, turned as it is there */
+static void prop_from_scene(Prop* p, const char* name) {
+    memset(p, 0, sizeof(*p));
+    p->obj = dc_scene_find(scene, name);
+    if (!p->obj || !p->obj->m) { printf("%s: not in the scene\n", name); p->obj = NULL; return; }
+    p->model = p->obj->m;
+    prop_measure(p, name);
+
+    float r[9];
+    dc_scene_object_rot(p->obj, r);
+    shz_vec3_t c = p->centre;
+    p->start = shz_vec3_init(p->obj->pos.x + r[0] * c.x + r[3] * c.y + r[6] * c.z,
+                             p->obj->pos.y + r[1] * c.x + r[4] * c.y + r[7] * c.z,
+                             p->obj->pos.z + r[2] * c.x + r[5] * c.y + r[8] * c.z);
+    /* the turn's columns as a quaternion */
+    PPQuaternion* q = &p->start_rot;
+    float t = r[0] + r[4] + r[8];
+    if (t > 0.0f) {
+        float k = 0.5f / sqrtf(t + 1.0f);
+        q->w = 0.25f / k; q->x = (r[5] - r[7]) * k; q->y = (r[6] - r[2]) * k; q->z = (r[1] - r[3]) * k;
+    } else if (r[0] > r[4] && r[0] > r[8]) {
+        float k = 2.0f * sqrtf(1.0f + r[0] - r[4] - r[8]);
+        q->w = (r[5] - r[7]) / k; q->x = 0.25f * k; q->y = (r[3] + r[1]) / k; q->z = (r[6] + r[2]) / k;
+    } else if (r[4] > r[8]) {
+        float k = 2.0f * sqrtf(1.0f + r[4] - r[0] - r[8]);
+        q->w = (r[6] - r[2]) / k; q->x = (r[3] + r[1]) / k; q->y = 0.25f * k; q->z = (r[7] + r[5]) / k;
+    } else {
+        float k = 2.0f * sqrtf(1.0f + r[8] - r[0] - r[4]);
+        q->w = (r[1] - r[3]) / k; q->x = (r[6] + r[2]) / k; q->y = (r[7] + r[5]) / k; q->z = 0.25f * k;
+    }
 }
 
 /* Put a prop back at its start, at rest */
 static void prop_reset(Prop* p) {
     if (!p->body) return;
     pp_body_set_position(p->body, p->start.x, p->start.y, p->start.z);
-    pp_body_set_rotation(p->body, 0.0f, 0.0f, 0.0f, 1.0f);
+    pp_body_set_rotation(p->body, p->start_rot.x, p->start_rot.y, p->start_rot.z, p->start_rot.w);
     pp_body_set_velocity(p->body, 0.0f, 0.0f, 0.0f);
     pp_body_set_angular_velocity(p->body, 0.0f, 0.0f, 0.0f);
 }
@@ -175,7 +206,8 @@ static void thrown_clear(void) {
     thrown_count = thrown_next = 0;
 }
 
-/* Draw a prop's model where a body is */
+/* Draw a prop's model where a body is: the scene's object moved there, or
+ * drawn here */
 static void prop_draw(const Prop* p, PPBody* body) {
     if (!p->model || !body) return;
     PPVec3 pos, x, y, z;
@@ -190,10 +222,16 @@ static void prop_draw(const Prop* p, PPBody* body) {
     shz_vec3_t origin = shz_vec3_init(pos.x - (rot[0] * c.x + rot[3] * c.y + rot[6] * c.z),
                                       pos.y - (rot[1] * c.x + rot[4] * c.y + rot[7] * c.z),
                                       pos.z - (rot[2] * c.x + rot[5] * c.y + rot[8] * c.z));
-    dc_draw_ex(p->model, &(DCDrawOpts){ .pos = origin, .rot = rot });
+    if (p->obj && body == p->body) {
+        p->obj->pos = origin;
+        p->obj->rot = dc_scene_rot_degrees(rot);
+    } else {
+        dc_draw_ex(p->model, &(DCDrawOpts){ .pos = origin, .rot = rot });
+    }
 }
 
-/* All props: the two dropped at the start, the thrown ones, the chain */
+/* All props: the two dropped at the start (the scene draws them), the
+ * thrown ones, the chain */
 static void props_draw(void) {
     prop_draw(&ball, ball.body);
     prop_draw(&crate, crate.body);
@@ -277,14 +315,19 @@ int main(int argc, char* argv[]) {
     dc_draw2d_init();
     dc_debug_init();
 
-    dc_camera_init(&camera);
     dc_player_init(&player);
     player.cam_mode = DC_CAM_NOCLIP;
     player.move_speed = 1.0f;   /* per frame */
 
-    world_model = dc_model_load(ASSETS "world/test.dms");
-    if (world_model)
-        col_world = col_build(world_model, shz_vec3_init(0.0f, 0.0f, 0.0f), 1.0f);
+    scene = dc_scene_play(ASSETS, "scenes/main.json");
+    if (!scene) return 1;
+    dc_scene_apply(scene);
+    dc_scene_camera(scene, &camera);    /* back from the props, looking at them */
+    DCCamera view_start = camera;
+
+    DCSceneObject* world = dc_scene_find(scene, "World");
+    if (world && world->m)
+        col_world = col_build(world->m, world->pos, world->scale.x);
 
     PPVec3 gravity = {.xyz = {0.0f, -9.8f, 0.0f}};
     pp_physics_set_gravity(&gravity);
@@ -292,28 +335,19 @@ int main(int argc, char* argv[]) {
 
     /* The crate drops first; the ball starts higher and over the crate's
      * edge, so it lands on the crate and rolls off */
-    prop_load(&crate, ASSETS "crate/crate.dms");
-    prop_load(&ball, ASSETS "ball/ball.dms");
-    crate.start = drop_point(-18.0f, -15.0f, DROP_HEIGHT + crate.half.y);
-    ball.start  = shz_vec3_init(crate.start.x + crate.half.x * 0.8f,
-                                crate.start.y + crate.half.y + DROP_HEIGHT,
-                                crate.start.z);
+    prop_from_scene(&crate, "Crate");
+    prop_from_scene(&ball, "Ball");
     ball.radius = ball.half.x > ball.half.y ? ball.half.x : ball.half.y;
     if (ball.half.z > ball.radius) ball.radius = ball.half.z;
-    if (crate.model) crate.body = prop_body(&crate, crate.start);
-    if (ball.model)  ball.body  = prop_body(&ball, ball.start);
+    if (crate.model) { crate.body = prop_body(&crate, crate.start); prop_reset(&crate); }
+    if (ball.model)  { ball.body  = prop_body(&ball, ball.start);   prop_reset(&ball); }
 
     /* Wrecking ball to the side of the drop, swinging across in front of it */
     prop_load(&link_prop, ASSETS "link/link.dms");
     prop_load(&bob_prop, ASSETS "bob/bob.dms");
     bob_prop.radius = bob_prop.half.y;
-    shz_vec3_t under = drop_point(crate.start.x + 8.0f, crate.start.z - 6.0f, 0.0f);
-    chain_build(shz_vec3_init(under.x, under.y + CHAIN_TOP, under.z));
-
-    /* Start back from the props, looking at them */
-    shz_vec3_t view_start = shz_vec3_init(crate.start.x, crate.start.y - DROP_HEIGHT * 0.5f,
-                                          crate.start.z - 25.0f);
-    camera.pos = view_start;
+    DCSceneObject* pivot = dc_scene_find(scene, "Chain");
+    if (pivot) chain_build(pivot->pos);
 
     printf("VRAM free after loading: %luKB\n", (unsigned long)(pvr_mem_available() / 1024));
 
@@ -324,9 +358,9 @@ int main(int argc, char* argv[]) {
 
         /* Reset (Y button): camera and both props back to the start, thrown ones gone */
         if (inp && dc_input_pressed(inp, CONT_Y)) {
-            camera.pos = view_start;
-            camera.yaw = 0.0f;
-            camera.pitch = 0.0f;
+            camera.pos = view_start.pos;
+            camera.yaw = view_start.yaw;
+            camera.pitch = view_start.pitch;
             prop_reset(&crate);
             prop_reset(&ball);
             thrown_clear();
@@ -343,17 +377,15 @@ int main(int argc, char* argv[]) {
         pp_physics_step(PHYS_DT, 8, 3);
 
         dc_set_camera(&camera);
-        dc_draw(world_model, shz_vec3_init(0.0f, 0.0f, 0.0f));
         props_draw();
+        dc_scene_draw(scene);
         dc_debug_stats();
         dc_frame_end();
     }
 
     pp_physics_clear();
     col_free(col_world);
-    dc_model_free(world_model);
-    dc_model_free(ball.model);
-    dc_model_free(crate.model);
+    dc_scene_free(scene);
     dc_model_free(link_prop.model);
     dc_model_free(bob_prop.model);
     dc_shutdown();

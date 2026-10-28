@@ -11,20 +11,21 @@
 #include "dms/dc_draw2d.h"
 #include "dms/dc_debug.h"
 #include "dms/collision.h"
+#include "dms/dc_scene.h"
 
-/* Where assets are read from: /pc/ over dcload, /cd/ when built with make disc */
+/* Where assets are read from: /pc/ over dcload; on a disc the engine finds them at /cd/ */
 #ifndef ASSETS
 #define ASSETS "/pc/"
 #endif
+
+/* The room (World), the projector's lens (marker Projector) and where the
+ * player starts (the camera) are scenes/main.json. */
 
 /* ---- App state ---- */
 static DCCamera camera;
 static DCPlayer player;
 static ColWorld* col_world = NULL;
-
-static DMSModel* dms_model = NULL;
-static shz_vec3_t dms_pos;
-static float dms_scale = 1.0f;
+static DCScene* scene = NULL;
 
 /* The TV shows what the projector on the table sees. The projector looks at
  * the TV, so the TV shows itself, smaller each time. */
@@ -32,7 +33,6 @@ static DCTarget* tv = NULL;
 static DCCamera  projector_cam;
 #define TV_SIZE        256          /* the TV's picture, in pixels */
 #define TV_MATERIAL    "RTT_effect" /* the screen's material name in Blender */
-#define START_X        -3.0f        /* the player starts behind the table */
 
 /* ========== MAIN ========== */
 
@@ -50,32 +50,37 @@ int main(int argc, char* argv[]) {
     dc_draw2d_init();
     dc_debug_init();
 
-    dc_camera_init(&camera);
     dc_player_init(&player);
     player.cam_mode = DC_CAM_FPS;
     player.move_speed = 0.06f;  /* per frame; the room is 10 units across */
 
-    /* Load world */
-    dms_model = dc_model_load(ASSETS "world/rtt.dms");
-    dms_pos = shz_vec3_init(0.0f, 0.0f, 0.0f);
-    dms_scale = 1.0f;
+    scene = dc_scene_play(ASSETS, "scenes/main.json");
+    if (!scene) return 1;
+    dc_scene_apply(scene);
+    dc_scene_camera(scene, &camera);
+    const shz_vec3_t start = camera.pos;
+    const float start_yaw = camera.yaw;
 
-    if (dms_model && !dms_model->skeleton)
-        col_world = col_build(dms_model, dms_pos, dms_scale);
+    DCSceneObject* world = dc_scene_find(scene, "World");
+    DMSModel* room = world ? world->m : NULL;
+    if (room && !room->skeleton)
+        col_world = col_build(room, world->pos, world->scale.x);
 
     tv = dc_target_create(TV_SIZE, TV_SIZE);
-    dc_target_show_on(tv, dms_model, TV_MATERIAL);
+    dc_target_show_on(tv, room, TV_MATERIAL);
 
     /* Just above the projector (it sits on the table in the middle of the
      * room), looking along +x at the TV on the wall, zoomed in on it */
     dc_camera_init(&projector_cam);
-    projector_cam.pos = shz_vec3_init(0.3f, 1.05f, 0.0f);
+    DCSceneObject* lens = dc_scene_find(scene, "Projector");
+    projector_cam.pos = lens ? lens->pos : shz_vec3_init(0.3f, 1.05f, 0.0f);
     projector_cam.yaw = F_PI * 0.5f;
     projector_cam.fov = 60.0f;
 
-    /* Spawn player on the floor behind the table, facing the TV */
+    /* Spawn player on the floor below the scene's camera (behind the
+     * table, facing the TV) */
     {
-        shz_vec3_t spawn = shz_vec3_init(START_X, 2.0f, 0.0f);
+        shz_vec3_t spawn = start;
         ColGroundHit gh = col_ground(col_world, spawn, 200.0f);
         if (gh.hit)
             spawn.y = gh.y + player.eye_height;
@@ -83,7 +88,7 @@ int main(int argc, char* argv[]) {
 
         /* First person: camera sits at the player's eyes */
         camera.pos = spawn;
-        camera.yaw = player.yaw = F_PI * 0.5f;
+        player.yaw = start_yaw;
     }
 
     printf("VRAM free after loading: %luKB\n", (unsigned long)(pvr_mem_available() / 1024));
@@ -96,10 +101,10 @@ int main(int argc, char* argv[]) {
         /* ---- Input ---- */
         /* Reset (Y button) */
         if (inp && dc_input_held(inp, CONT_Y)) {
-            player.pos = shz_vec3_init(START_X, 2.0f, 0.0f);
+            player.pos = start;
             player.vy = 0.0f;
             camera.pos = player.pos;
-            camera.yaw = player.yaw = F_PI * 0.5f;
+            camera.yaw = player.yaw = start_yaw;
             camera.pitch = 0.0f;
         }
 
@@ -114,18 +119,18 @@ int main(int argc, char* argv[]) {
         /* The room as the projector sees it, into the TV's picture */
         dc_set_target(tv);
         dc_set_camera(&projector_cam);
-        dc_draw(dms_model, dms_pos);
+        dc_scene_draw(scene);
 
         /* The room as the player sees it, to the screen */
         dc_set_target(NULL);
         dc_set_camera(&camera);
-        dc_draw(dms_model, dms_pos);
+        dc_scene_draw(scene);
         dc_debug_stats();
         dc_frame_end();
     }
 
     dc_target_free(tv);
-    dc_model_free(dms_model);
+    dc_scene_free(scene);
     col_free(col_world);
     dc_shutdown();
 

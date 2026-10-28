@@ -3,7 +3,7 @@
  * A scene is the models placed in it, the lights, the background colour,
  * fog and where the camera starts. The game loads it and draws it:
  *
- *     DCScene* scene = dc_scene_load(ASSETS "scenes/main.json", ASSETS);
+ *     DCScene* scene = dc_scene_play(ASSETS, "scenes/main.json");
  *     dc_scene_apply(scene);              // background, fog, lights
  *     dc_scene_camera(scene, &camera);    // where the camera starts
  *     ...each frame
@@ -90,6 +90,11 @@ typedef struct {
 /* Read a scene and load its models. NULL if the file is missing or not a
  * scene; a model that won't load leaves its object's m NULL (not drawn). */
 DCScene* dc_scene_load(const char* path, const char* root);
+/* The scene to play: the one the editor has open when its Play runs the
+ * game (DMS_SCENE, Linux only), else the one named, both under root. */
+DCScene* dc_scene_play(const char* root, const char* scene);
+/* The model of the object of that name (NULL if none) */
+DMSModel* dc_scene_model(DCScene* scene, const char* name);
 /* The same from text already in memory. */
 DCScene* dc_scene_parse(const char* json, const char* root);
 /* An empty scene (the editor's File > New). */

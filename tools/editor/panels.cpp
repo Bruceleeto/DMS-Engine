@@ -373,7 +373,10 @@ void panel_inspector() {
  * Project: the folders on the left, their files as tiles
  * ================================================================ */
 
-enum EntryKind { ENTRY_MODEL, ENTRY_SCENE, ENTRY_TEXTURE, ENTRY_SOUND, ENTRY_SOURCE };
+enum EntryKind { ENTRY_MODEL, ENTRY_SCENE, ENTRY_TEXTURE, ENTRY_SOUND, ENTRY_SOURCE, ENTRY_CODE };
+/* The game's code is a second tree beside assets/: its folders are "code:", "code:/src"... */
+#define CODE_ROOT "code:"
+static bool is_code(const std::string& dir) { return dir.compare(0, 5, CODE_ROOT) == 0; }
 struct Entry { std::string name, rel; EntryKind kind; };
 static std::map<std::string, std::vector<Entry>> folders;   /* "" is the top */
 static int indexed_gen = -1;
@@ -400,6 +403,13 @@ static void index_assets() {
         std::string built = s.substr(0, s.size() - 4) + ".dms";
         if (std::find(ed.models.begin(), ed.models.end(), built) == ed.models.end()) add(s, ENTRY_SOURCE);
     }
+    for (auto& c : ed.code) {
+        std::string dir = parent_of(c);
+        std::string key = dir.empty() ? CODE_ROOT : CODE_ROOT "/" + dir;
+        for (std::string d = key; d != CODE_ROOT; d = parent_of(d)) folders[d];
+        folders[CODE_ROOT];
+        folders[key].push_back({ c.substr(dir.empty() ? 0 : dir.size() + 1), c, ENTRY_CODE });
+    }
     for (auto& f : folders)
         std::sort(f.second.begin(), f.second.end(), [](const Entry& a, const Entry& b) {
             return a.kind != b.kind ? a.kind < b.kind : a.name < b.name; });
@@ -410,7 +420,7 @@ static void index_assets() {
 static std::vector<std::string> subfolders(const std::string& dir) {
     std::vector<std::string> kids;
     for (auto& f : folders)
-        if (!f.first.empty() && f.first != dir && parent_of(f.first) == dir) kids.push_back(f.first);
+        if (!f.first.empty() && f.first != dir && f.first != CODE_ROOT && parent_of(f.first) == dir) kids.push_back(f.first);
     return kids;
 }
 
@@ -466,8 +476,9 @@ void panel_project() {
     static char filter[64];
 
     /* The bar: breadcrumbs, then search and the asset buttons */
-    if (ImGui::SmallButton(ICON_FOLDER " Assets")) cwd = "";
-    for (size_t i = 0; i < cwd.size();) {
+    bool in_code = is_code(cwd);
+    if (in_code ? ImGui::SmallButton(ICON_CODE " Code") : ImGui::SmallButton(ICON_FOLDER " Assets")) cwd = in_code ? CODE_ROOT : "";
+    for (size_t i = in_code ? sizeof(CODE_ROOT) : 0; i < cwd.size();) {
         size_t j = cwd.find('/', i);
         if (j == std::string::npos) j = cwd.size();
         ImGui::SameLine(0, 4);
@@ -477,7 +488,7 @@ void panel_project() {
         if (ImGui::SmallButton((part + "##" + std::to_string(i)).c_str())) cwd = cwd.substr(0, j);
         i = j + 1;
     }
-    float right = 220 + 2 * (ImGui::GetFrameHeight() + 8);
+    float right = 220 + 3 * (ImGui::GetFrameHeight() + 8);
     ImGui::SameLine(std::max(ImGui::GetCursorPosX() + 10, ImGui::GetWindowWidth() - right));
     ImGui::SetNextItemWidth(200);
     ImGui::InputTextWithHint("##pf", ICON_SEARCH "  Search", filter, sizeof(filter));
@@ -485,6 +496,8 @@ void panel_project() {
     if (ui::icon_button("conv", ICON_PACKAGE, "Convert assets: assets/ to pc/ (make assets)")) ed_run("assets");
     ImGui::SameLine();
     if (ui::icon_button("rescan", ICON_REFRESH, "Rescan")) ed_scan_assets();
+    ImGui::SameLine();
+    if (ui::icon_button("vscode", ICON_VSCODE, "Open the project in VS Code")) ed_open_code("");
     ImGui::Spacing();
 
     if (ImGui::BeginTable("proj", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
@@ -497,6 +510,13 @@ void panel_project() {
                                       ICON_FOLDER_OPEN "  Assets");
         if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) cwd = "";
         if (open) { folder_tree(""); ImGui::TreePop(); }
+        if (folders.count(CODE_ROOT)) {
+            bool copen = ImGui::TreeNodeEx("##code", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanAvailWidth |
+                                           ImGuiTreeNodeFlags_OpenOnArrow | (subfolders(CODE_ROOT).empty() ? ImGuiTreeNodeFlags_Leaf : 0) |
+                                           (cwd == CODE_ROOT ? ImGuiTreeNodeFlags_Selected : 0), ICON_CODE "  Code");
+            if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) cwd = CODE_ROOT;
+            if (copen) { folder_tree(CODE_ROOT); ImGui::TreePop(); }
+        }
         ImGui::EndChild();
 
         ImGui::TableNextColumn();
@@ -512,11 +532,12 @@ void panel_project() {
                     cwd = d;
             }
         }
-        static const char* icons[] = { ICON_MODEL, ICON_SCENE, ICON_IMAGE, ICON_CONSOLE, ICON_PACKAGE };
+        static const char* icons[] = { ICON_MODEL, ICON_SCENE, ICON_IMAGE, ICON_CONSOLE, ICON_PACKAGE, ICON_CODE };
         static const ImU32 cols[] = { IM_COL32(120, 170, 255, 255), IM_COL32(150, 180, 255, 255), IM_COL32(120, 210, 160, 255),
-                                      IM_COL32(220, 150, 240, 255), ui::WARN };
+                                      IM_COL32(220, 150, 240, 255), ui::WARN, IM_COL32(90, 200, 230, 255) };
         static const char* tips[] = { "Drag into the scene, or double-click to add it", "Double-click to open",
-                                      "Texture (.dt)", "Sound (.dca)", "Not converted yet: press Convert assets" };
+                                      "Texture (.dt)", "Sound (.dca)", "Not converted yet: press Convert assets",
+                                      "Double-click to open in VS Code" };
         for (auto& f : folders) {
             if (*filter ? false : f.first != cwd) continue;
             for (const Entry& e : f.second) {
@@ -527,6 +548,7 @@ void panel_project() {
                 if (tile(e.rel.c_str(), icons[e.kind], cols[e.kind], 0.4f, e.name,
                          e.kind == ENTRY_SOURCE ? ui::WARN : ImGui::GetColorU32(ImGuiCol_Text), lit, size, tip.c_str())) {
                     if (e.kind == ENTRY_MODEL) ed_add_model(e.rel);
+                    else if (e.kind == ENTRY_CODE) ed_open_code(e.rel);
                     else if (e.kind == ENTRY_SCENE && e.rel != ed.scene_rel) {
                         if (ed.dirty) ed_log("Save first (or File > Reload): %s has unsaved changes", ed.scene_rel.c_str());
                         else ed_open(e.rel);

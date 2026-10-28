@@ -1,0 +1,11 @@
+{
+  "dms_scene": 1,
+  "background": "#28283c",
+  "camera": { "pos": [0, 0, 0], "yaw": 0, "pitch": 0, "fov": 60 },
+  "lights": [],
+  "objects": [
+    { "name": "Goal", "model": "goal/goal.dms",
+      "pos": [0, 0, 10], "rot": [0, -85.943669, 0], "scale": [1, 1, 1],
+      "tint": "#ffffff", "add": false, "visible": true }
+  ]
+}

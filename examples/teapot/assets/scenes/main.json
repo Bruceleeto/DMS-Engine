@@ -1,22 +1,11 @@
 {
   "dms_scene": 1,
-  "background": "#1c2430",
-  "camera": { "pos": [0, 6, -14], "yaw": 0, "pitch": 20, "fov": 60 },
-  "lights": [
-    { "name": "Sun", "pos": [-0.5, -1, 0.4], "sun": true, "color": "#fff4e0", "range": 500, "ambient": 0.3, "bands": 0 }
-  ],
+  "background": "#000000",
+  "camera": { "pos": [0, 0, 0], "yaw": 0, "pitch": 0, "fov": 60 },
+  "lights": [],
   "objects": [
     { "name": "Teapot", "model": "teapot/teapot.dms",
-      "pos": [0, 2.271, 0], "rot": [0, 30, 0], "scale": [1, 1, 1],
-      "tint": "#ffffff", "add": false, "visible": true },
-    { "name": "Floor", "model": "@cube",
-      "pos": [0, -0.25, 0], "rot": [0, 0, 0], "scale": [12, 0.5, 12],
-      "tint": "#506070", "add": false, "visible": true },
-    { "name": "Block", "model": "@cube",
-      "pos": [-4.5, 0.5, 2], "rot": [0, 20, 0], "scale": [1, 1, 1],
-      "tint": "#c05040", "add": false, "visible": true },
-    { "name": "Block 2", "model": "@cube",
-      "pos": [4.5, 0.75, 1.5], "rot": [0, -35, 0], "scale": [1.5, 1.5, 1.5],
-      "tint": "#40a060", "add": false, "visible": true }
+      "pos": [0, 0, 16], "rot": [-20, 0, 0], "scale": [1, 1, 1],
+      "tint": "#ffffff", "add": false, "visible": true }
   ]
 }

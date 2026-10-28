@@ -1,0 +1,11 @@
+{
+  "dms_scene": 1,
+  "background": "#000000",
+  "camera": { "pos": [-120.78, 44.33, -201.08], "yaw": 28.6479, "pitch": 14.3239, "fov": 60 },
+  "lights": [],
+  "objects": [
+    { "name": "Scanner", "model": "scanner/scanner.dms",
+      "pos": [0, 0, 0], "rot": [0, 0, 0], "scale": [1, 1, 1],
+      "tint": "#ffffff", "add": false, "visible": true }
+  ]
+}

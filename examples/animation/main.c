@@ -11,24 +11,25 @@
 #include "dms/dc_draw2d.h"
 #include "dms/dc_debug.h"
 #include "dms/collision.h"
+#include "dms/dc_scene.h"
 
-/* Where assets are read from: /pc/ over dcload, /cd/ when built with make disc */
+/* Where assets are read from: /pc/ over dcload; on a disc the engine finds them at /cd/ */
 #ifndef ASSETS
 #define ASSETS "/pc/"
 #endif
+
+/* The world and the Player (the skinned character: where it starts, which
+ * way it faces, and its scale, ~1.8 units tall) are scenes/main.json. */
 
 /* ---- App state ---- */
 static DCCamera camera;
 static DCPlayer player;
 static ColWorld* col_world = NULL;
+static DCScene* scene = NULL;
 
-static DMSModel* dms_model = NULL;
-static shz_vec3_t dms_pos;
-static float dms_scale = 1.0f;
-
-/* Player character (skinned, animated) */
+/* Player character (skinned, animated); dc_scene_draw draws it */
+static DCSceneObject* hero = NULL;
 static DMSModel* char_model = NULL;
-static float char_scale = 1.0f;
 
 /* Animation indices, in the order they are in model.glb */
 #define ANIM_ATTACK 0
@@ -49,24 +50,33 @@ int main(int argc, char* argv[]) {
     dc_draw2d_init();
     dc_debug_init();
 
-    dc_camera_init(&camera);
     dc_player_init(&player);
     player.cam_mode = DC_CAM_THIRD;
     player.move_speed = 0.08f;   /* walking pace for the character (per frame) */
     player.cam_distance = 3.0f;  /* closer so the character fills more of the screen */
     player.cam_height = 1.7f;
 
-    /* Load world */
-    dms_model = dc_model_load(ASSETS "world/test.dms");
-    dms_pos = shz_vec3_init(0.0f, 0.0f, 0.0f);
-    dms_scale = 1.0f;
+    /* Load world and character */
+    scene = dc_scene_play(ASSETS, "scenes/main.json");
+    if (!scene) {
+        dc_shutdown();
+        return 1;
+    }
+    dc_scene_apply(scene);
+    dc_scene_camera(scene, &camera);
 
-    if (dms_model && !dms_model->skeleton)
-        col_world = col_build(dms_model, dms_pos, dms_scale);
+    DCSceneObject* world = dc_scene_find(scene, "World");
+    if (world && world->m && !world->m->skeleton)
+        col_world = col_build(world->m, world->pos, world->scale.x);
 
-    /* Spawn player on ground at origin */
+    hero = dc_scene_find(scene, "Player");
+    char_model = hero ? hero->m : NULL;
+    if (hero) player.yaw = SHZ_DEG_TO_RAD(hero->rot.y) - player.model_yaw_offset;
+
+    /* Spawn player on the ground below the Player's place */
     {
-        shz_vec3_t spawn = shz_vec3_init(0.0f, col_world ? col_world->max_y + 50.0f : 40.0f, 0.0f);
+        shz_vec3_t spawn = shz_vec3_init(hero ? hero->pos.x : 0.0f, col_world ? col_world->max_y + 50.0f : 40.0f,
+                                         hero ? hero->pos.z : 0.0f);
         ColGroundHit gh = col_ground(col_world, spawn, 200.0f);
         if (gh.hit)
             spawn.y = gh.y + player.eye_height;
@@ -78,22 +88,6 @@ int main(int argc, char* argv[]) {
         camera.pos = shz_vec3_init(spawn.x - sc.sin * player.cam_distance,
                                    feet + player.cam_height,
                                    spawn.z - sc.cos * player.cam_distance);
-    }
-
-    /* Load character, scaled so it matches the player's collision height */
-    char_model = dc_model_load(ASSETS "char/model.dms");
-    if (char_model) {
-        float lo = 1e30f, hi = -1e30f;
-        for (uint32_t m = 0; m < char_model->mesh_count; m++) {
-            const DMSMesh* mesh = &char_model->meshes[m];
-            for (uint32_t v = 0; v < mesh->vertex_count; v++) {
-                float y = mesh->vertices[v].y;
-                if (y < lo) lo = y;
-                if (y > hi) hi = y;
-            }
-        }
-        if (hi > lo) char_scale = player.height / (hi - lo);
-        printf("Character height %.2f, scale %.3f\n", hi - lo, char_scale);
     }
 
     printf("VRAM free after loading: %luKB\n", (unsigned long)(pvr_mem_available() / 1024));
@@ -133,20 +127,20 @@ int main(int argc, char* argv[]) {
         dc_camera_update(&camera);
 
         /* ---- Character sits at the player's feet ---- */
-        shz_vec3_t char_pos = shz_vec3_init(player.pos.x, player.pos.y - player.eye_height, player.pos.z);
-        float char_yaw = -(player.yaw + player.model_yaw_offset);
+        if (hero) {
+            hero->pos = shz_vec3_init(player.pos.x, player.pos.y - player.eye_height, player.pos.z);
+            hero->rot.y = SHZ_RAD_TO_DEG(player.yaw + player.model_yaw_offset);
+        }
 
         /* ---- Rendering ---- */
         dc_set_camera(&camera);
-        dc_draw(dms_model, dms_pos);
-        dc_draw_ex(char_model, &(DCDrawOpts){ .pos = char_pos, .scale = char_scale, .yaw = char_yaw });
+        dc_scene_draw(scene);
         dc_debug_stats();
         dc_frame_end();
     }
 
-    dc_model_free(char_model);
-    dc_model_free(dms_model);
     col_free(col_world);
+    dc_scene_free(scene);
     dc_shutdown();
 
     return 0;

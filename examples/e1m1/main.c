@@ -11,20 +11,22 @@
 #include "dms/dc_draw2d.h"
 #include "dms/dc_debug.h"
 #include "dms/collision.h"
+#include "dms/dc_scene.h"
 
-/* Where assets are read from: /pc/ over dcload, /cd/ when built with make disc */
+/* Where assets are read from: /pc/ over dcload; on a disc the engine finds them at /cd/ */
 #ifndef ASSETS
 #define ASSETS "/pc/"
 #endif
+
+/* scenes/main.json holds the World model (its place and size are what the
+ * collision is built from) and where the noclip camera starts. */
 
 /* ---- App state ---- */
 static DCCamera camera;
 static DCPlayer player;
 static ColWorld* col_world = NULL;
 
-static DMSModel* dms_model = NULL;
-static shz_vec3_t dms_pos;
-static float dms_scale = 1.0f;
+static DCScene* scene = NULL;
 
 /* ========== MAIN ========== */
 
@@ -40,35 +42,19 @@ int main(int argc, char* argv[]) {
     dc_draw2d_init();
     dc_debug_init();
 
-    dc_camera_init(&camera);
+    scene = dc_scene_play(ASSETS, "scenes/main.json");
+    if (!scene) return 1;
+    dc_scene_apply(scene);
+    dc_scene_camera(scene, &camera);
     dc_player_init(&player);
     player.cam_mode = DC_CAM_NOCLIP;
+    player.pos = camera.pos;
+    player.yaw = camera.yaw;
 
-    /* Load world */
-    dms_model = dc_model_load(ASSETS "world/test.dms");
-    dms_pos = shz_vec3_init(0.0f, 0.0f, 0.0f);
-    dms_scale = 1.0f;
-
-    if (dms_model && !dms_model->skeleton)
-        col_world = col_build(dms_model, dms_pos, dms_scale);
-
-    /* Spawn player on ground at origin */
-    {
-        shz_vec3_t spawn = shz_vec3_init(0.0f, col_world ? col_world->max_y + 50.0f : 40.0f, 0.0f);
-        ColGroundHit gh = col_ground(col_world, spawn, 200.0f);
-        if (gh.hit)
-            spawn.y = gh.y + player.eye_height;
-        player.pos = spawn;
-
-        /* Initialize camera behind player */
-        shz_sincos_t _sc = shz_sincosf(player.yaw);
-        float _feet = spawn.y - player.eye_height;
-        camera.pos = shz_vec3_init(
-            spawn.x - _sc.sin * player.cam_distance,
-            _feet + player.cam_height,
-            spawn.z - _sc.cos * player.cam_distance
-        );
-    }
+    /* Collision for the world, where the scene puts it */
+    DCSceneObject* world = dc_scene_find(scene, "World");
+    if (world && world->m && !world->m->skeleton)
+        col_world = col_build(world->m, world->pos, world->scale.x);
 
     printf("VRAM free after loading: %luKB\n", (unsigned long)(pvr_mem_available() / 1024));
 
@@ -92,12 +78,12 @@ int main(int argc, char* argv[]) {
 
         /* ---- Rendering ---- */
         dc_set_camera(&camera);
-        dc_draw(dms_model, dms_pos);
+        dc_scene_draw(scene);
         dc_debug_stats();
         dc_frame_end();
     }
 
-    dc_model_free(dms_model);
+    dc_scene_free(scene);
     col_free(col_world);
     dc_shutdown();
 

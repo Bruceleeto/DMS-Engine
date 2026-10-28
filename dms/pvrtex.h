@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <malloc.h>
 #include <kos/fs.h>
+#include "dc_file.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -47,7 +48,7 @@ static inline int pvrtex_load_from_buffer(const void *data, size_t size, dttex_i
  * sector at a time through its cache, and each call pays the drive's latency.
  * Returns malloc'd memory the caller frees, NULL on failure. */
 static inline void *dc_file_read(const char *filename, size_t *size_out) {
-  file_t fd = fs_open(filename, O_RDONLY);
+  file_t fd = dc_asset_open(filename, O_RDONLY);
   if (fd < 0) {
     printf("Error: cannot open %s\n", filename);
     return NULL;
@@ -146,7 +147,7 @@ static inline int pvrtex_load_palette(const char *filename, int fmt, size_t offs
 
   FILE *fp = NULL;
   do {
-    fp = fopen(filename, "rb");
+    fp = dc_asset_fopen(filename, "rb");
     if (fp == NULL) {
       printf("Error: fopen %s failed, %s\n", filename, strerror(errno));
       success = 0;

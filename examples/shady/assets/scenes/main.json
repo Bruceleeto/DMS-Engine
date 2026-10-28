@@ -1,0 +1,14 @@
+{
+  "dms_scene": 1,
+  "background": "#000000",
+  "camera": { "pos": [-9.5, 14.57, -17.38], "yaw": 28.6479, "pitch": 25.7831, "fov": 60 },
+  "lights": [],
+  "objects": [
+    { "name": "Floor", "model": "world/floor.dms",
+      "pos": [0, 0, 0], "rot": [0, 0, 0], "scale": [1, 1, 1],
+      "tint": "#ffffff", "add": false, "visible": true },
+    { "name": "Knot", "model": "knot/torus_knot.dms",
+      "pos": [0, 5, 0], "rot": [0, 0, 0], "scale": [1, 1, 1],
+      "tint": "#ffffff", "add": false, "visible": true }
+  ]
+}

@@ -2,6 +2,13 @@
   "dms_scene": 1,
   "background": "#000000",
   "camera": { "pos": [0, 10, 20], "yaw": 0, "pitch": 0, "fov": 60 },
-  "lights": [ { "name": "Sun", "pos": [-0.4, -1, -0.3], "sun": true, "color": "#ffffff", "ambient": 0.25 } ],
-  "objects": [ { "name": "World", "model": "world/test.dms" } ]
+  "lights": [],
+  "objects": [
+    { "name": "World", "model": "world/test.dms",
+      "pos": [0, 0, 0], "rot": [0, 0, 0], "scale": [1, 1, 1],
+      "tint": "#ffffff", "add": false, "visible": true },
+    { "name": "Spawn", "model": "",
+      "pos": [0, 0, 0], "rot": [0, 0, 0], "scale": [1, 1, 1],
+      "tint": "#ffffff", "add": false, "visible": true }
+  ]
 }

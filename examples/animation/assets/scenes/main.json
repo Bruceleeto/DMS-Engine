@@ -1,0 +1,14 @@
+{
+  "dms_scene": 1,
+  "background": "#000000",
+  "camera": { "pos": [0, 1.7, -3], "yaw": 0, "pitch": 0, "fov": 60 },
+  "lights": [],
+  "objects": [
+    { "name": "World", "model": "world/test.dms",
+      "pos": [0, 0, 0], "rot": [0, 0, 0], "scale": [1, 1, 1],
+      "tint": "#ffffff", "add": false, "visible": true },
+    { "name": "Player", "model": "char/model.dms",
+      "pos": [0, 0, 0], "rot": [0, 0, 0], "scale": [0.558758, 0.558758, 0.558758],
+      "tint": "#ffffff", "add": false, "visible": true }
+  ]
+}

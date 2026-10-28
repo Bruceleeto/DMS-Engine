@@ -12,8 +12,9 @@
 #include "dms/dc_draw2d.h"
 #include "dms/dc_debug.h"
 #include "dms/collision.h"
+#include "dms/dc_scene.h"
 
-/* Where assets are read from: /pc/ over dcload, /cd/ when built with make disc */
+/* Where assets are read from: /pc/ over dcload; on a disc the engine finds them at /cd/ */
 #ifndef ASSETS
 #define ASSETS "/pc/"
 #endif
@@ -23,13 +24,15 @@
 #define PICOPHYSICS_IMPLEMENTATION
 #include "dms/picophysics.h"
 
+/* The alley (World), the pins (every object named Pin...) and where the
+ * camera starts are scenes/main.json. The balls are thrown from code. */
+
 /* ---- App state ---- */
 static DCCamera camera;
 static DCPlayer player;
 
-
 /* Level */
-static DMSModel* world_model = NULL;
+static DCScene*  scene = NULL;
 static ColWorld* col_world = NULL;
 
 /* A prop is a model driven by a picophysics body. Models are not always built
@@ -42,23 +45,22 @@ typedef struct {
     float      scale;       /* drawn and collided at this size */
 } Prop;
 
-static Prop ball, pin;
+static Prop ball;
 
 /* The alley has two lanes running along z. The bowler stands at the near end
  * (z close to 0) and the pins stand in front of the pinsetter at the far end. */
-#define LANES        2
-static const float lane_x[LANES] = { -2.615f, 2.685f };    /* lane centres */
 #define LANE_Y       0.0f       /* lane surface */
-#define PIN_BACK_Z   -60.5f     /* back row of pins */
-#define PIN_SPACING  0.79f      /* between neighbours: 12 inches at this pin's size */
 #define BALL_RADIUS  0.29f      /* a real ball against a 0.98 tall pin */
 #define BALL_SPEED   22.0f
-#define START_Z      -5.0f      /* where the camera starts */
 
-#define PINS_PER_LANE 10
-#define PIN_COUNT     (LANES * PINS_PER_LANE)
-static PPBody* pin_body[PIN_COUNT];
-static PPVec3  pin_start[PIN_COUNT];
+/* A pin is a scene object moved by its body; it stands up straight where the
+ * scene puts it (its turn in the scene is not read) */
+#define MAX_PINS 48
+static DCSceneObject* pin_obj[MAX_PINS];
+static Prop    pin[MAX_PINS];
+static PPBody* pin_body[MAX_PINS];
+static PPVec3  pin_start[MAX_PINS];
+static int     pin_count;
 
 /* Every throw adds a ball; when the pool is full the oldest one goes */
 #define MAX_THROWN 8
@@ -92,10 +94,10 @@ static int phys_tri_query(const PPVec3* centre, float reach, PPTriangle* out, in
     return n;
 }
 
-/* Load a prop's model and measure its box */
-static void prop_load(Prop* p, const char* path) {
+/* Measure a prop's model's box */
+static void prop_measure(Prop* p, DMSModel* model, const char* name) {
     memset(p, 0, sizeof(*p));
-    p->model = dc_model_load(path);
+    p->model = model;
     if (!p->model) return;
 
     shz_vec3_t lo = shz_vec3_init( 1e9f,  1e9f,  1e9f);
@@ -115,14 +117,14 @@ static void prop_load(Prop* p, const char* path) {
     p->centre = shz_vec3_scale(shz_vec3_add(lo, hi), 0.5f);
     p->half   = shz_vec3_scale(shz_vec3_sub(hi, lo), 0.5f);
     p->scale  = 1.0f;
-    printf("%s: box %.2f x %.2f x %.2f, centre %.2f %.2f %.2f\n", path,
+    printf("%s: box %.2f x %.2f x %.2f, centre %.2f %.2f %.2f\n", name,
            p->half.x * 2.0f, p->half.y * 2.0f, p->half.z * 2.0f,
            p->centre.x, p->centre.y, p->centre.z);
 }
 
-/* Stand the pins up: a triangle on each lane, point towards the bowler */
+/* Stand the pins up where the scene has them */
 static void pins_reset(void) {
-    for (int i = 0; i < PIN_COUNT; i++) {
+    for (int i = 0; i < pin_count; i++) {
         if (!pin_body[i]) continue;
         pp_body_set_position(pin_body[i], pin_start[i].x, pin_start[i].y, pin_start[i].z);
         pp_body_set_rotation(pin_body[i], 0.0f, 0.0f, 0.0f, 1.0f);
@@ -133,19 +135,21 @@ static void pins_reset(void) {
 
 /* Pins are boxes: a box stands on its own, a capsule would balance on a point */
 static void pins_build(void) {
-    if (!pin.model) return;
-    int n = 0;
-    for (int l = 0; l < LANES; l++) {
-        for (int row = 0; row < 4; row++) {
-            float z = PIN_BACK_Z + (3 - row) * PIN_SPACING * 0.866f;   /* row 0 is the head pin */
-            for (int i = 0; i <= row; i++, n++) {
-                PPVec3 at = {.xyz = {lane_x[l] + (i - row * 0.5f) * PIN_SPACING,
-                                     LANE_Y + pin.half.y + 0.01f, z}};
-                pin_start[n] = at;
-                pin_body[n]  = pp_physics_create_box(pin.half.x * 2.0f, pin.half.y * 2.0f,
-                                                     pin.half.z * 2.0f, &at, 1.0f, 0);
-            }
-        }
+    for (int i = 0; i < scene->object_count && pin_count < MAX_PINS; i++) {
+        DCSceneObject* o = &scene->objects[i];
+        if (strncmp(o->name, "Pin", 3) || !o->m) continue;
+        Prop* p = &pin[pin_count];
+        if (pin_count && o->m == pin[pin_count - 1].model) *p = pin[pin_count - 1];
+        else prop_measure(p, o->m, o->model);
+        float k = p->scale = o->scale.x;
+        /* the body is at the middle of the box */
+        PPVec3 at = {.xyz = {o->pos.x + p->centre.x * k, o->pos.y + p->centre.y * k, o->pos.z + p->centre.z * k}};
+        o->rot = shz_vec3_init(0.0f, 0.0f, 0.0f);
+        pin_obj[pin_count]   = o;
+        pin_start[pin_count] = at;
+        pin_body[pin_count]  = pp_physics_create_box(p->half.x * 2.0f * k, p->half.y * 2.0f * k,
+                                                     p->half.z * 2.0f * k, &at, 1.0f, 0);
+        pin_count++;
     }
 }
 
@@ -179,30 +183,44 @@ static void thrown_clear(void) {
     thrown_count = thrown_next = 0;
 }
 
-/* Draw a prop's model where a body is */
-static void prop_draw(const Prop* p, PPBody* body) {
-    if (!p->model || !body) return;
+/* Where a prop's model goes for a body to be where it is: its origin and its
+ * axes (rot) */
+static shz_vec3_t prop_place(const Prop* p, PPBody* body, float rot[9]) {
     PPVec3 pos, x, y, z;
     pp_body_get_position(body, &pos);
     pp_body_get_right(body, &x);
     pp_body_get_up(body, &y);
     pp_body_get_forward(body, &z);
-    float rot[9] = { x.x, x.y, x.z,  y.x, y.y, y.z,  z.x, z.y, z.z };
+    rot[0] = x.x; rot[1] = x.y; rot[2] = x.z;
+    rot[3] = y.x; rot[4] = y.y; rot[5] = y.z;
+    rot[6] = z.x; rot[7] = z.y; rot[8] = z.z;
 
     /* The body is at the middle of the box; step back to the model's origin */
     shz_vec3_t c = shz_vec3_scale(p->centre, p->scale);
-    shz_vec3_t origin = shz_vec3_init(pos.x - (rot[0] * c.x + rot[3] * c.y + rot[6] * c.z),
-                                      pos.y - (rot[1] * c.x + rot[4] * c.y + rot[7] * c.z),
-                                      pos.z - (rot[2] * c.x + rot[5] * c.y + rot[8] * c.z));
-    dc_draw_ex(p->model, &(DCDrawOpts){ .pos = origin, .scale = p->scale, .rot = rot });
+    return shz_vec3_init(pos.x - (rot[0] * c.x + rot[3] * c.y + rot[6] * c.z),
+                         pos.y - (rot[1] * c.x + rot[4] * c.y + rot[7] * c.z),
+                         pos.z - (rot[2] * c.x + rot[5] * c.y + rot[8] * c.z));
 }
 
-/* All props */
-static void props_draw(void) {
-    for (int i = 0; i < PIN_COUNT; i++)
-        prop_draw(&pin, pin_body[i]);
-    for (int i = 0; i < thrown_count; i++)
-        prop_draw(&ball, thrown[i]);
+/* Pins: their scene objects follow their bodies (dc_scene_draw draws them) */
+static void pins_move(void) {
+    for (int i = 0; i < pin_count; i++) {
+        if (!pin_body[i]) continue;
+        float rot[9];
+        pin_obj[i]->pos = prop_place(&pin[i], pin_body[i], rot);
+        pin_obj[i]->rot = dc_scene_rot_degrees(rot);
+    }
+}
+
+/* Balls are not in the scene: drawn here */
+static void balls_draw(void) {
+    if (!ball.model) return;
+    for (int i = 0; i < thrown_count; i++) {
+        if (!thrown[i]) continue;
+        float rot[9];
+        shz_vec3_t origin = prop_place(&ball, thrown[i], rot);
+        dc_draw_ex(ball.model, &(DCDrawOpts){ .pos = origin, .scale = ball.scale, .rot = rot });
+    }
 }
 
 /* ========== MAIN ========== */
@@ -219,28 +237,29 @@ int main(int argc, char* argv[]) {
     dc_draw2d_init();
     dc_debug_init();
 
-    dc_camera_init(&camera);
     dc_player_init(&player);
     player.cam_mode = DC_CAM_NOCLIP;
     player.move_speed = 0.25f;  /* per frame; the alley is small */
 
-    world_model = dc_model_load(ASSETS "world/test.dms");
-    if (world_model)
-        col_world = col_build(world_model, shz_vec3_init(0.0f, 0.0f, 0.0f), 1.0f);
+    scene = dc_scene_play(ASSETS, "scenes/main.json");
+    if (!scene) {
+        dc_shutdown();
+        return 1;
+    }
+    dc_scene_apply(scene);
+    dc_scene_camera(scene, &camera);
+
+    DCSceneObject* world = dc_scene_find(scene, "World");
+    if (world && world->m)
+        col_world = col_build(world->m, world->pos, world->scale.x);
 
     PPVec3 gravity = {.xyz = {0.0f, -9.8f, 0.0f}};
     pp_physics_set_gravity(&gravity);
     pp_physics_set_triangle_query(phys_tri_query, NULL);
 
-    prop_load(&pin, ASSETS "pin/pin.dms");
-    prop_load(&ball, ASSETS "ball/ball.dms");
-    if (ball.model) ball.scale = BALL_RADIUS / ball.half.y;    /* the model is not ball sized */
     pins_build();
-
-    /* Start at the near end of the first lane, looking down it */
-    shz_vec3_t view_start = shz_vec3_init(lane_x[0], LANE_Y + 1.6f, START_Z);
-    camera.pos = view_start;
-    camera.yaw = F_PI;
+    prop_measure(&ball, dc_model_load(ASSETS "ball/ball.dms"), "ball/ball.dms");
+    if (ball.model) ball.scale = BALL_RADIUS / ball.half.y;    /* the model is not ball sized */
 
     printf("VRAM free after loading: %luKB\n", (unsigned long)(pvr_mem_available() / 1024));
 
@@ -252,9 +271,7 @@ int main(int argc, char* argv[]) {
         /* ---- Input ---- */
         /* Reset (Y button): camera back to the start, pins up, balls gone */
         if (inp && dc_input_pressed(inp, CONT_Y)) {
-            camera.pos = view_start;
-            camera.yaw = F_PI;
-            camera.pitch = 0.0f;
+            dc_scene_camera(scene, &camera);
             pins_reset();
             thrown_clear();
         }
@@ -266,20 +283,20 @@ int main(int argc, char* argv[]) {
         dc_camera_update(&camera);
 
         pp_physics_step(PHYS_DT, 8, 3);
+        pins_move();
 
         /* ---- Rendering ---- */
         dc_set_camera(&camera);
-        dc_draw(world_model, shz_vec3_init(0.0f, 0.0f, 0.0f));
-        props_draw();
+        dc_scene_draw(scene);
+        balls_draw();
         dc_debug_stats();
         dc_frame_end();
     }
 
     pp_physics_clear();
     col_free(col_world);
-    dc_model_free(world_model);
+    dc_scene_free(scene);
     dc_model_free(ball.model);
-    dc_model_free(pin.model);
     dc_shutdown();
 
     return 0;

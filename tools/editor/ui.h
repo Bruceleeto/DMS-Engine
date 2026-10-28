@@ -51,6 +51,8 @@
 #define ICON_PACKAGE     ""
 #define ICON_MARKER      "\ue114"
 #define ICON_IMPORT      "\ue22e"
+#define ICON_CODE        "\ue0c7"
+#define ICON_VSCODE      "\ue5ff"
 
 /* Window titles: the icon and name shown, the id after ### fixed */
 #define WIN_HIERARCHY ICON_TREE "  Hierarchy###Hierarchy"

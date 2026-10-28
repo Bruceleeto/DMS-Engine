@@ -1,0 +1,11 @@
+{
+  "dms_scene": 1,
+  "background": "#000000",
+  "camera": { "pos": [0, 3.76013947, -5], "yaw": 0, "pitch": 0, "fov": 60 },
+  "lights": [],
+  "objects": [
+    { "name": "World", "model": "world/test.dms",
+      "pos": [0, 0, 0], "rot": [0, 0, 0], "scale": [1, 1, 1],
+      "tint": "#ffffff", "add": false, "visible": true }
+  ]
+}

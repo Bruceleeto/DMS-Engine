@@ -10,8 +10,9 @@
 #include "dms/dc_draw2d.h"
 #include "dms/dc_particles.h"
 #include "dms/dc_debug.h"
+#include "dms/dc_scene.h"
 
-/* Where assets are read from: /pc/ over dcload, /cd/ when built with make disc */
+/* Where assets are read from: /pc/ over dcload; on a disc the engine finds them at /cd/ */
 #ifndef ASSETS
 #define ASSETS "/pc/"
 #endif
@@ -44,10 +45,13 @@
  * the obvious way. The original could not afford one and used a sun instead:
  * a single direction for the whole model, swung about on sin() to fake the
  * flame moving.
+ *
+ * scenes/main.json holds the Burner (head, torso and burner, with the flame
+ * markers in it) and the camera's start; the light is made here, each frame.
  */
 
 static DCCamera  camera;
-static DMSModel* scene = NULL;
+static DCScene*  scene = NULL;
 static float     distance = 700.0f;
 
 static bool check_exit(void) {
@@ -61,17 +65,27 @@ int main(int argc, char* argv[]) {
     dc_draw2d_init();
     dc_debug_init();
 
-    dc_camera_init(&camera);
-    camera.yaw = 0.5f;
-    camera.pitch = 0.1f;
+    scene = dc_scene_play(ASSETS, "scenes/main.json");
+    if (!scene) return 1;
+    dc_scene_apply(scene);
+    dc_scene_camera(scene, &camera);
+    DCSceneObject* burner = dc_scene_find(scene, "Burner");
+    if (!burner || !burner->m) { printf("FIRE: the scene has no Burner\n"); return 1; }
+    dc_model_materials(burner->m);
 
-    scene = dc_model_load(ASSETS "fire/fire.dms");
-    dc_model_materials(scene);
-
-    /* The burner's eight markers: a bottom and a top for each flame */
+    /* The burner's eight markers: a bottom and a top for each flame, put
+     * where the scene puts the model */
     shz_vec3_t mark[FLAMES * 2];
-    int marks = dc_model_points(scene, "MFIRE", mark, FLAMES * 2);
+    int marks = dc_model_points(burner->m, "MFIRE", mark, FLAMES * 2);
     printf("FIRE: %d flame markers\n", marks);
+    float turn[9];
+    dc_scene_object_rot(burner, turn);
+    for (int i = 0; i < marks && i < FLAMES * 2; i++) {
+        shz_vec3_t m = shz_vec3_init(mark[i].x * burner->scale.x, mark[i].y * burner->scale.y, mark[i].z * burner->scale.z);
+        mark[i] = shz_vec3_init(burner->pos.x + turn[0] * m.x + turn[3] * m.y + turn[6] * m.z,
+                                burner->pos.y + turn[1] * m.x + turn[4] * m.y + turn[7] * m.z,
+                                burner->pos.z + turn[2] * m.x + turn[5] * m.y + turn[8] * m.z);
+    }
 
     DCParticles* flame[FLAMES] = { NULL };
     shz_vec3_t   middle = shz_vec3_init(0.0f, 0.0f, 0.0f);
@@ -105,7 +119,6 @@ int main(int argc, char* argv[]) {
            "X swaps the light, B light off, Y flames off\n");
     printf("VRAM free after loading: %luKB\n", (unsigned long)(pvr_mem_available() / 1024));
 
-    shz_vec3_t origin = shz_vec3_init(0.0f, 0.0f, 0.0f);
     float t = 0.0f, lh = 20.0f, drift = LH_DRIFT;
     bool  sun = false, no_light = false, no_flame = false, held = false;
 
@@ -133,7 +146,7 @@ int main(int argc, char* argv[]) {
             }
             held = press;
         }
-        dc_camera_orbit(&camera, origin, distance, inp, LOOK_SPEED, dt);
+        dc_camera_orbit(&camera, burner->pos, distance, inp, LOOK_SPEED, dt);
         dc_camera_update(&camera);
 
         if (lh > LH_HIGH) { lh = LH_HIGH; drift = -LH_DRIFT; }
@@ -163,7 +176,7 @@ int main(int argc, char* argv[]) {
         }
 
         dc_set_camera(&camera);
-        dc_draw(scene, origin);
+        dc_scene_draw(scene);
         for (int i = 0; i < flames; i++) dc_particles_draw(flame[i]);
 
         dc_debug_stats();
@@ -171,7 +184,7 @@ int main(int argc, char* argv[]) {
     }
 
     for (int i = 0; i < flames; i++) dc_particles_free(flame[i]);
-    dc_model_free(scene);
+    dc_scene_free(scene);
     dc_shutdown();
     return 0;
 }

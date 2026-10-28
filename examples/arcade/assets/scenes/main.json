@@ -1,0 +1,11 @@
+{
+  "dms_scene": 1,
+  "background": "#101018",
+  "camera": { "pos": [0, 16.678649, 37.573301], "yaw": 180, "pitch": 8.594367, "fov": 60 },
+  "lights": [],
+  "objects": [
+    { "name": "Cabinet", "model": "arcade/arcade.dms",
+      "pos": [0, 0, 0], "rot": [0, 0, 0], "scale": [1, 1, 1],
+      "tint": "#ffffff", "add": false, "visible": true }
+  ]
+}

@@ -16,6 +16,9 @@
  * \author 2020 MoopTheHedgehog
  *
  * \copyright MIT License
+ *
+ * \important Do not copy this file or its routines into other projects. Use the
+ *            KOS-ports build or add SH4ZAM as a git submodule. See AGENTS.md.
  */
 
 #ifndef SHZ_MEM_H
@@ -69,9 +72,16 @@ SHZ_DECLS_BEGIN
     \warning
     \p dst and \p src buffers should not be overlapping.
 
+    \param  dst     Destination buffer to copy into.
+    \param  src     Source buffer to copy from.
+    \param  bytes   Total number of bytes to copy.
+
+    \returns        \p dst buffer pointer.
+
     \sa shz_memcpy1(), shz_memcpy2(), shz_memcpy4(), shz_memcpy8(), shz_memcpy32(),
     shz_memcpy64(), shz_memcpy128()
 */
+SHZ_ACCESS(write_only, 1, 3) SHZ_ACCESS(read_only, 2, 3)
 SHZ_INLINE void* shz_memcpy(      void* SHZ_RESTRICT dst,
                             const void* SHZ_RESTRICT src,
                                  size_t              bytes) SHZ_NOEXCEPT;
@@ -87,6 +97,7 @@ SHZ_INLINE void* shz_memcpy(      void* SHZ_RESTRICT dst,
 
     \sa shz_memcpy()
 */
+SHZ_ACCESS(write_only, 1, 3) SHZ_ACCESS(read_only, 2, 3)
 SHZ_INLINE void* shz_memmove(void* dst, const void* src, size_t bytes) SHZ_NOEXCEPT;
 
 //! @}
@@ -111,6 +122,7 @@ SHZ_INLINE void* shz_memmove(void* dst, const void* src, size_t bytes) SHZ_NOEXC
 
     \sa shz_memcpy()
 */
+SHZ_ACCESS(write_only, 1, 3) SHZ_ACCESS(read_only, 2, 3)
 SHZ_INLINE void* shz_memcpy1(      void* SHZ_RESTRICT dst,
                              const void* SHZ_RESTRICT src,
                                   size_t              bytes) SHZ_NOEXCEPT;
@@ -126,6 +138,7 @@ SHZ_INLINE void* shz_memcpy1(      void* SHZ_RESTRICT dst,
     \warning
     \p dst and \p src buffers should not be overlapping.
 */
+SHZ_ACCESS(write_only, 1, 3) SHZ_ACCESS(read_only, 2, 3)
 SHZ_INLINE void* shz_memcpy2(      void* SHZ_RESTRICT dst,
                              const void* SHZ_RESTRICT src,
                                   size_t              bytes) SHZ_NOEXCEPT;
@@ -141,6 +154,7 @@ SHZ_INLINE void* shz_memcpy2(      void* SHZ_RESTRICT dst,
     \warning
     \p dst and \p src buffers should not be overlapping.
 */
+SHZ_ACCESS(write_only, 1, 3) SHZ_ACCESS(read_only, 2, 3)
 SHZ_INLINE void* shz_memcpy4(      void* SHZ_RESTRICT dst,
                              const void* SHZ_RESTRICT src,
                                   size_t              bytes) SHZ_NOEXCEPT;
@@ -156,6 +170,7 @@ SHZ_INLINE void* shz_memcpy4(      void* SHZ_RESTRICT dst,
     \warning
     \p src and \p dst should not overlap.
 */
+SHZ_ACCESS(write_only, 1, 3) SHZ_ACCESS(read_only, 2, 3)
 SHZ_INLINE void* shz_memcpy8(      void* SHZ_RESTRICT dst,
                              const void* SHZ_RESTRICT src,
                                   size_t              bytes) SHZ_NOEXCEPT;
@@ -166,6 +181,7 @@ SHZ_INLINE void* shz_memcpy8(      void* SHZ_RESTRICT dst,
     \p dst should be at least 8-byte aligned, and \p bytes should be
     a multiple of 8!
 */
+SHZ_ACCESS(write_only, 1, 3)
 SHZ_INLINE void* shz_memset8(void* dst, uint64_t value, size_t bytes) SHZ_NOEXCEPT;
 
 /*! Copies \p bytes from the \p src to the \p dst buffer in 32-byte chunks.
@@ -186,6 +202,7 @@ SHZ_INLINE void* shz_memset8(void* dst, uint64_t value, size_t bytes) SHZ_NOEXCE
 
     \sa shz_sq_memcpy32()
 */
+SHZ_ACCESS(write_only, 1, 3) SHZ_ACCESS(read_only, 2, 3)
 SHZ_INLINE void* shz_memcpy32(      void* SHZ_RESTRICT dst,
                               const void* SHZ_RESTRICT src,
                                    size_t              bytes) SHZ_NOEXCEPT;
@@ -208,6 +225,7 @@ SHZ_INLINE void* shz_memcpy32(      void* SHZ_RESTRICT dst,
 
     \sa shz_memcpy32(), shz_sq_memcpy32_1()
 */
+SHZ_ACCESS(write_only, 1, 3) SHZ_ACCESS(read_only, 2, 3)
 SHZ_INLINE void* shz_sq_memcpy32(      void* SHZ_RESTRICT dst,
                                  const void* SHZ_RESTRICT src,
                                       size_t              bytes) SHZ_NOEXCEPT;
@@ -219,6 +237,7 @@ SHZ_INLINE void* shz_sq_memcpy32(      void* SHZ_RESTRICT dst,
     \warning
     This routine clobbers XMTRX.
 */
+SHZ_ACCESS(write_only, 1, 3) SHZ_ACCESS(read_only, 2, 3)
 SHZ_INLINE void* shz_sq_memcpy32_xmtrx(      void* SHZ_RESTRICT dst,
                                        const void* SHZ_RESTRICT src,
                                        size_t                   bytes) SHZ_NOEXCEPT;
@@ -235,6 +254,7 @@ SHZ_INLINE void* shz_sq_memcpy32_xmtrx(      void* SHZ_RESTRICT dst,
     \p dst must be 32-byte aligned, while \p src can be only 8-byte aligned. \p bytes must
     be a multiple of 64.
 */
+SHZ_ACCESS(write_only, 1, 3) SHZ_ACCESS(read_only, 2, 3)
 SHZ_INLINE void* shz_memcpy64(      void* SHZ_RESTRICT dst,
                               const void* SHZ_RESTRICT src,
                                    size_t              bytes) SHZ_NOEXCEPT;
@@ -251,6 +271,7 @@ SHZ_INLINE void* shz_memcpy64(      void* SHZ_RESTRICT dst,
     \p dst must be 32-byte aligned, while \p src can be only 8-byte aligned. \p bytes must
     be a multiple of 128.
 */
+SHZ_ACCESS(write_only, 1, 3) SHZ_ACCESS(read_only, 2, 3)
 SHZ_INLINE void* shz_memcpy128(      void* SHZ_RESTRICT dst,
                                const void* SHZ_RESTRICT src,
                                     size_t              bytes) SHZ_NOEXCEPT;
@@ -270,6 +291,7 @@ SHZ_INLINE void* shz_memcpy128(      void* SHZ_RESTRICT dst,
     \warning
     \p dst and \p src must both be aligned by at least two bytes.
 */
+SHZ_ACCESS(write_only, 1) SHZ_ACCESS(read_only, 2)
 SHZ_INLINE void shz_memcpy2_8(      void* SHZ_RESTRICT dst,
                               const void* SHZ_RESTRICT src) SHZ_NOEXCEPT;
 
@@ -281,6 +303,7 @@ SHZ_INLINE void shz_memcpy2_8(      void* SHZ_RESTRICT dst,
     \warning
     \p dst and \p src must both be aligned by at least two bytes.
 */
+SHZ_ACCESS(write_only, 1) SHZ_ACCESS(read_only, 2)
 SHZ_INLINE void shz_memcpy2_16(      void* SHZ_RESTRICT dst,
                                const void* SHZ_RESTRICT src) SHZ_NOEXCEPT;
 
@@ -289,6 +312,7 @@ SHZ_INLINE void shz_memcpy2_16(      void* SHZ_RESTRICT dst,
     \warning
     \p dst must be aligned by at least two bytes.
 */
+SHZ_ACCESS(write_only, 1)
 SHZ_INLINE void shz_memset2_16(void* dst, uint16_t value) SHZ_NOEXCEPT;
 
 /*! Copies 16 4-byte, long values from \p src to \p dst.
@@ -299,6 +323,7 @@ SHZ_INLINE void shz_memset2_16(void* dst, uint16_t value) SHZ_NOEXCEPT;
     \warning
     The \p src and \p dst buffers must both be at least 4-byte aligned.
 */
+SHZ_ACCESS(write_only, 1) SHZ_ACCESS(read_only, 2)
 SHZ_INLINE void shz_memcpy4_16(      void* SHZ_RESTRICT dst,
                                const void* SHZ_RESTRICT src) SHZ_NOEXCEPT;
 
@@ -307,6 +332,7 @@ SHZ_INLINE void shz_memcpy4_16(      void* SHZ_RESTRICT dst,
     \warning
     \p dst must be 32-byte aligned, while \p src can be only 8-byte aligned.
 */
+SHZ_ACCESS(write_only, 1) SHZ_ACCESS(read_only, 2)
 SHZ_INLINE void shz_memcpy32_1(      void* SHZ_RESTRICT dst,
                                const void* SHZ_RESTRICT src) SHZ_NOEXCEPT;
 
@@ -315,6 +341,7 @@ SHZ_INLINE void shz_memcpy32_1(      void* SHZ_RESTRICT dst,
     \warning
     \p p1 and \p p2 must be at least 8-byte aligned.
 */
+SHZ_ACCESS(read_write, 1) SHZ_ACCESS(read_write, 2)
 SHZ_INLINE void shz_memswap32_1(void* SHZ_RESTRICT p1,
                                 void* SHZ_RESTRICT p2) SHZ_NOEXCEPT;
 
@@ -325,6 +352,7 @@ SHZ_INLINE void shz_memswap32_1(void* SHZ_RESTRICT p1,
     \warning
     This routine clobbers XMTRX!
 */
+SHZ_ACCESS(read_write, 1) SHZ_ACCESS(read_write, 2)
 SHZ_INLINE void shz_memswap32_1_xmtrx(void* SHZ_RESTRICT p1,
                                       void* SHZ_RESTRICT p2) SHZ_NOEXCEPT;
 
@@ -339,6 +367,7 @@ SHZ_INLINE void shz_memswap32_1_xmtrx(void* SHZ_RESTRICT p1,
 
     \sa shz_memcpy32()
 */
+SHZ_ACCESS(write_only, 1) SHZ_ACCESS(read_only, 2)
 SHZ_INLINE void* shz_sq_memcpy32_1(      void* SHZ_RESTRICT dst,
                                    const void* SHZ_RESTRICT src) SHZ_NOEXCEPT;
 
@@ -352,7 +381,8 @@ SHZ_INLINE void* shz_sq_memcpy32_1(      void* SHZ_RESTRICT dst,
 
     \sa shz_memcpy32()
 */
-SHZ_INLINE void* shz_sq_memcpy32_1_xmtrx(      void* SHZ_RESTRICT dst,
+SHZ_ACCESS(write_only, 1) SHZ_ACCESS(read_only, 2)
+SHZ_INLINE void* shz_sq_memcpy32_1_xmtrx(     void* SHZ_RESTRICT dst,
                                         const void* SHZ_RESTRICT src) SHZ_NOEXCEPT;
 
 /*! Intrinsic around the SH4 `MOVCA.L` instruction.
@@ -362,6 +392,7 @@ SHZ_INLINE void* shz_sq_memcpy32_1_xmtrx(      void* SHZ_RESTRICT dst,
     Zero-initializes all 32-bytes within the \p src cache-line,
     setting the valid bit to `1`.
 */
+SHZ_ACCESS(write_only, 1)
 SHZ_INLINE void shz_dcache_alloc_line(void* src) SHZ_NOEXCEPT;
 
 //! @}

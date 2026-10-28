@@ -10,8 +10,9 @@
 #include "dms/dc_draw.h"
 #include "dms/dc_draw2d.h"
 #include "dms/dc_debug.h"
+#include "dms/dc_scene.h"
 
-/* Where assets are read from: /pc/ over dcload, /cd/ when built with make disc */
+/* Where assets are read from: /pc/ over dcload; on a disc the engine finds them at /cd/ */
 #ifndef ASSETS
 #define ASSETS "/pc/"
 #endif
@@ -21,7 +22,10 @@
  * each floor vertex looks along the line to the lamp. Through the glass it
  * takes the glass's colour there, through the wall it is in shadow, past the
  * wall it is lit. dc_model_recolour() sets the colours, and the hardware
- * multiplies them by the floor's texture. */
+ * multiplies them by the floor's texture.
+ *
+ * scenes/main.json places the room (wall, window, floor and lamp, one model)
+ * and the camera's start; the code recolours the floor and orbits the camera. */
 
 #define FLOOR_MATERIAL "Material__1"   /* the floor, and the wall wears it too */
 #define GLASS_MATERIAL "Material__2"
@@ -173,21 +177,22 @@ int main(int argc, char* argv[]) {
     dc_init((DCInitParams){ .vram_size = 1024 * 1024 });
     dc_draw2d_init();
     dc_debug_init();
-    dc_set_clear_color(0xFF101018);
 
-    DMSModel* model = dc_model_load(ASSETS "stained/staind.dms");
-    if (!model) { dc_shutdown(); return 1; }
+    DCScene* scene = dc_scene_play(ASSETS, "scenes/main.json");
+    if (!scene) { dc_shutdown(); return 1; }
+    dc_scene_apply(scene);
+    DCSceneObject* room = dc_scene_find(scene, "Room");
+    DMSModel* model = room ? room->m : NULL;
+    if (!model) { printf("STAINED: the scene has no Room model\n"); dc_shutdown(); return 1; }
 
     if (!window_setup(model)) printf("STAINED: could not find the window\n");
 
     DCBounds all = dc_model_bounds(model, NULL);
-    shz_vec3_t look = shz_vec3_init((all.min.x + all.max.x) * 0.5f, 20.0f,
-                                    (all.min.z + all.max.z) * 0.5f);
+    shz_vec3_t look = shz_vec3_init(room->pos.x + (all.min.x + all.max.x) * 0.5f, room->pos.y + 20.0f,
+                                    room->pos.z + (all.min.z + all.max.z) * 0.5f);
 
     DCCamera camera;
-    dc_camera_init(&camera);
-    camera.yaw = 2.6f;
-    camera.pitch = 0.45f;
+    dc_scene_camera(scene, &camera);
 
     printf("STAINED: A stops the lamp, triggers zoom, stick turns, Start exits\n");
 
@@ -214,13 +219,13 @@ int main(int argc, char* argv[]) {
         dc_model_recolour(model, FLOOR_MATERIAL, floor_colour, NULL);
 
         dc_set_camera(&camera);
-        dc_draw(model, shz_vec3_init(0.0f, 0.0f, 0.0f));
+        dc_scene_draw(scene);
 
         dc_debug_stats();
         dc_frame_end();
     }
 
-    dc_model_free(model);
+    dc_scene_free(scene);
     dc_shutdown();
     return 0;
 }

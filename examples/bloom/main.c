@@ -8,8 +8,9 @@
 #include "dms/dc_draw.h"
 #include "dms/dc_draw2d.h"
 #include "dms/dc_debug.h"
+#include "dms/dc_scene.h"
 
-/* Where assets are read from: /pc/ over dcload, /cd/ when built with make disc */
+/* Where assets are read from: /pc/ over dcload; on a disc the engine finds them at /cd/ */
 #ifndef ASSETS
 #define ASSETS "/pc/"
 #endif
@@ -25,19 +26,17 @@
  * The room itself is lit by the same materials, baked (`BAKE = 1` in the
  * Makefile), so what glows and what lights the walls are the one thing said
  * once.
+ *
+ * The arena, the camera's start and the Middle marker it turns around are
+ * scenes/main.json.
  */
 
 #define LOOK_SPEED  1.5f
 #define ZOOM_SPEED  400.0f
 #define DRIFT       0.12f   /* radians a second the camera turns by itself */
 
-/* The middle of the level, which the camera turns around */
-#define LOOK_X  -19.5f
-#define LOOK_Y  -44.3f
-#define LOOK_Z -105.8f
-
 static DCCamera  camera;
-static DMSModel* scene;
+static DCScene*  scene;
 static float     distance;
 
 static bool check_exit(void) {
@@ -49,18 +48,20 @@ int main(int argc, char* argv[]) {
     dc_init((DCInitParams){ .vram_size = 1024 * 1024 });
     dc_draw2d_init();
     dc_debug_init();
-    dc_set_clear_color(0xFF05060A);
 
-    scene = dc_model_load(ASSETS "bloom/arena.dms");
+    scene = dc_scene_play(ASSETS, "scenes/main.json");
+    if (!scene) return 1;
+    dc_scene_apply(scene);
+    const DCSceneObject* middle = dc_scene_find(scene, "Middle");
+    if (!middle) { printf("BLOOM: the scene has no marker called Middle\n"); return 1; }
 
-    /* The camera starts where the Empty in arena.glb is. dc_camera_orbit puts
-     * the camera behind its target along the way it looks, so the turn and
-     * the distance that land it there are worked back out of the Empty. */
-    dc_camera_init(&camera);
-    shz_vec3_t look = shz_vec3_init(LOOK_X, LOOK_Y, LOOK_Z);
-    const DMSEntity* start = dc_model_entity(scene, "Empty");
-    shz_vec3_t cam = start ? start->pos : shz_vec3_init(0.0f, 100.0f, 200.0f);
-    float vx = cam.x - LOOK_X, vy = cam.y - LOOK_Y, vz = cam.z - LOOK_Z;
+    /* The camera starts where the scene's is. dc_camera_orbit puts the camera
+     * behind its target along the way it looks, so the turn and the distance
+     * that land it there are worked back out of that place. */
+    dc_scene_camera(scene, &camera);
+    shz_vec3_t look = middle->pos;
+    shz_vec3_t cam = camera.pos;
+    float vx = cam.x - look.x, vy = cam.y - look.y, vz = cam.z - look.z;
     distance = sqrtf(vx * vx + vy * vy + vz * vz);
     camera.pitch = asinf(vy / distance);
     camera.yaw   = atan2f(-vx, -vz);
@@ -110,7 +111,7 @@ int main(int argc, char* argv[]) {
 
         dc_set_bloom(on ? &bloom : NULL);
         dc_set_camera(&camera);
-        dc_draw(scene, shz_vec3_init(0.0f, 0.0f, 0.0f));
+        dc_scene_draw(scene);
 
         char line[64];
         if (on) snprintf(line, sizeof(line), "bloom  strength %.2f  spread %.1f  %dx%d",
@@ -123,7 +124,7 @@ int main(int argc, char* argv[]) {
     }
 
     dc_set_bloom(NULL);
-    dc_model_free(scene);
+    dc_scene_free(scene);
     dc_shutdown();
     return 0;
 }

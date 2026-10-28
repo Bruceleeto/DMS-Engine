@@ -12,23 +12,23 @@
 #include "dms/dc_draw2d.h"
 #include "dms/dc_debug.h"
 #include "dms/collision.h"
+#include "dms/dc_scene.h"
 
-/* Where assets are read from: /pc/ over dcload, /cd/ when built with make disc */
+/* Where assets are read from: /pc/ over dcload; on a disc the engine finds them at /cd/ */
 #ifndef ASSETS
 #define ASSETS "/pc/"
 #endif
 
+/* The track (World) and the car (Car) are scenes/main.json; the car's place
+ * there is where the player starts, and the code then drives it. */
+
 /* ---- App state ---- */
 static DCCamera camera;
 static DCPlayer player;
-
-
-/* Track */
-static DMSModel* world_model = NULL;
+static DCScene* scene = NULL;
 static ColWorld* col_world = NULL;
-
-/* Car: the player's model, drawn at the player's feet */
-static DMSModel* car_model = NULL;
+static DCSceneObject* car = NULL;    /* drawn at the player's feet */
+static shz_vec3_t start;             /* the player's eyes over the car's start */
 
 /* ========== MAIN ========== */
 
@@ -44,19 +44,26 @@ int main(int argc, char* argv[]) {
     dc_draw2d_init();
     dc_debug_init();
 
-    dc_camera_init(&camera);
     dc_player_init(&player);
     player.cam_mode = DC_CAM_THIRD;
     player.move_speed = 1.0f;   /* per frame */
 
-    player.pos = shz_vec3_init(0.0f, 50.0f, 0.0f);
+    scene = dc_scene_play(ASSETS, "scenes/main.json");
+    if (!scene) return 1;
+    dc_scene_apply(scene);
+    dc_scene_camera(scene, &camera);    /* its fov; the code puts it behind the car */
+    car = dc_scene_find(scene, "Car");
+    if (!car) { printf("RACE_TRACK: the scene has no object called Car\n"); return 1; }
+    start = shz_vec3_init(car->pos.x, car->pos.y + player.eye_height, car->pos.z);
+    player.pos = start;
+    player.yaw = SHZ_DEG_TO_RAD(car->rot.y);
 
-    world_model = dc_model_load(ASSETS "world/test.dms");
-    if (world_model)
-        col_world = col_build(world_model, shz_vec3_init(0.0f, 0.0f, 0.0f), 1.0f);
+    DCSceneObject* world = dc_scene_find(scene, "World");
+    if (world && world->m)
+        col_world = col_build(world->m, world->pos, world->scale.x);
 
     /* Car: camera distance follows the car's size */
-    car_model = dc_model_load(ASSETS "car/car.dms");
+    const DMSModel* car_model = car->m;
     if (car_model) {
         float r = 0.0f;
         for (uint32_t m = 0; m < car_model->mesh_count; m++) {
@@ -70,7 +77,7 @@ int main(int argc, char* argv[]) {
         printf("Car radius %.2f\n", r);
     }
 
-    /* Camera starts behind the player */
+    /* Camera starts behind the player (the scene's camera is about there) */
     {
         shz_sincos_t sc = shz_sincosf(player.yaw);
         float feet = player.pos.y - player.eye_height;
@@ -89,7 +96,7 @@ int main(int argc, char* argv[]) {
         /* ---- Input ---- */
         /* Reset (Y button) */
         if (inp && dc_input_held(inp, CONT_Y)) {
-            player.pos = shz_vec3_init(0.0f, 50.0f, 0.0f);
+            player.pos = start;
             player.vy = 0.0f;
             camera.pos = player.pos;
             camera.yaw = 0.0f;
@@ -99,20 +106,18 @@ int main(int argc, char* argv[]) {
         dc_player_update(&player, &camera, inp, col_world, dt);
         dc_camera_update(&camera);
 
-        shz_vec3_t car_pos = shz_vec3_init(player.pos.x, player.pos.y - player.eye_height, player.pos.z);
-        float car_yaw = -(player.yaw + player.model_yaw_offset);
+        car->pos = shz_vec3_init(player.pos.x, player.pos.y - player.eye_height, player.pos.z);
+        car->rot.y = SHZ_RAD_TO_DEG(player.yaw + player.model_yaw_offset);
 
         /* ---- Rendering ---- */
         dc_set_camera(&camera);
-        dc_draw(world_model, shz_vec3_init(0.0f, 0.0f, 0.0f));
-        dc_draw_ex(car_model, &(DCDrawOpts){ .pos = car_pos, .yaw = car_yaw });
+        dc_scene_draw(scene);
         dc_debug_stats();
         dc_frame_end();
     }
 
     col_free(col_world);
-    dc_model_free(world_model);
-    dc_model_free(car_model);
+    dc_scene_free(scene);
     dc_shutdown();
 
     return 0;

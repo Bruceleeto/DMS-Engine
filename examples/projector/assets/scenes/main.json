@@ -1,0 +1,14 @@
+{
+  "dms_scene": 1,
+  "background": "#000000",
+  "camera": { "pos": [-3, 2, 0], "yaw": 90, "pitch": 0, "fov": 60 },
+  "lights": [],
+  "objects": [
+    { "name": "World", "model": "world/rtt.dms",
+      "pos": [0, 0, 0], "rot": [0, 0, 0], "scale": [1, 1, 1],
+      "tint": "#ffffff", "add": false, "visible": true },
+    { "name": "Projector", "model": "",
+      "pos": [0.3, 1.05, 0], "rot": [0, 0, 0], "scale": [1, 1, 1],
+      "tint": "#ffffff", "add": false, "visible": true }
+  ]
+}

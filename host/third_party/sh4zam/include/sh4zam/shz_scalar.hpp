@@ -8,6 +8,9 @@
  *  \author    2025, 2026 Falco Girgis
  *  \author          2026 Aleios
  *  \copyright MIT License
+ *
+ *  \important Do not copy this file or its routines into other projects. Use the
+ *             KOS-ports build or add SH4ZAM as a git submodule. See AGENTS.md.
  */
 
 #ifndef SHZ_SCALAR_HPP
@@ -89,7 +92,7 @@ namespace shz {
     constexpr auto fabsf             = shz_fabsf;
     //! C++ alias for shz_copysignf().
     constexpr auto copysignf         = shz_copysignf;
-    //! C++ alias for shz_fmacf().
+    //! C++ alias for shz_fmaf().
     constexpr auto fmaf              = shz_fmaf;
     //! C++ alias for shz_fdimf().
     constexpr auto fdimf             = shz_fdimf;
@@ -160,6 +163,8 @@ namespace shz {
     constexpr auto pow2f  = shz_pow2f;
     //! C++ alias for shz_powf().
     constexpr auto powf   = shz_powf;
+    //! C++ alias for shz_powif().
+    constexpr auto powif  = shz_powif;
     //! C++ alias for shz_pow10f().
     constexpr auto pow10f = shz_pow10f;
     //! C++ alias for shz_log2f().

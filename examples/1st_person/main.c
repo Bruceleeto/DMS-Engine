@@ -11,20 +11,21 @@
 #include "dms/dc_draw2d.h"
 #include "dms/dc_debug.h"
 #include "dms/collision.h"
+#include "dms/dc_scene.h"
 
-/* Where assets are read from: /pc/ over dcload, /cd/ when built with make disc */
+/* Where assets are read from: /pc/ over dcload; on a disc the engine finds them at /cd/ */
 #ifndef ASSETS
 #define ASSETS "/pc/"
 #endif
+
+/* The world model and the Spawn marker (where the player drops onto the
+ * ground, straight down from above) are scenes/main.json. */
 
 /* ---- App state ---- */
 static DCCamera camera;
 static DCPlayer player;
 static ColWorld* col_world = NULL;
-
-static DMSModel* dms_model = NULL;
-static shz_vec3_t dms_pos;
-static float dms_scale = 1.0f;
+static DCScene* scene = NULL;
 
 /* ========== MAIN ========== */
 
@@ -40,25 +41,27 @@ int main(int argc, char* argv[]) {
     dc_draw2d_init();
     dc_debug_init();
 
-    dc_camera_init(&camera);
     dc_player_init(&player);
     player.cam_mode = DC_CAM_FPS;
 
     /* Load world */
-    dms_model = dc_model_load(ASSETS "world/test.dms");
-    if (!dms_model) {
+    scene = dc_scene_play(ASSETS, "scenes/main.json");
+    if (!scene) {
         dc_shutdown();
         return 1;
     }
-    dms_pos = shz_vec3_init(0.0f, 0.0f, 0.0f);
-    dms_scale = 1.0f;
+    dc_scene_apply(scene);
+    dc_scene_camera(scene, &camera);
 
-    if (dms_model && !dms_model->skeleton)
-        col_world = col_build(dms_model, dms_pos, dms_scale);
+    DCSceneObject* world = dc_scene_find(scene, "World");
+    if (world && world->m && !world->m->skeleton)
+        col_world = col_build(world->m, world->pos, world->scale.x);
 
-    /* Spawn player on ground at origin */
+    /* Spawn player on the ground below the Spawn marker */
     {
-        shz_vec3_t spawn = shz_vec3_init(0.0f, col_world ? col_world->max_y + 50.0f : 40.0f, 0.0f);
+        DCSceneObject* mark = dc_scene_find(scene, "Spawn");
+        shz_vec3_t spawn = shz_vec3_init(mark ? mark->pos.x : 0.0f, col_world ? col_world->max_y + 50.0f : 40.0f,
+                                         mark ? mark->pos.z : 0.0f);
         ColGroundHit gh = col_ground(col_world, spawn, 200.0f);
         if (gh.hit)
             spawn.y = gh.y + player.eye_height;
@@ -90,13 +93,13 @@ int main(int argc, char* argv[]) {
 
         /* ---- Rendering ---- */
         dc_set_camera(&camera);
-        dc_draw(dms_model, dms_pos);
+        dc_scene_draw(scene);
         dc_debug_stats();
         dc_frame_end();
     }
 
-    dc_model_free(dms_model);
     col_free(col_world);
+    dc_scene_free(scene);
     dc_shutdown();
 
     return 0;
