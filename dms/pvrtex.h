@@ -156,7 +156,7 @@ static inline int pvrtex_load_palette(const char *filename, int fmt, size_t offs
     uint32_t colors[palette_hdr.colors];
     fread(&colors, sizeof(uint32_t), palette_hdr.colors, fp);
 
-    pvr_set_pal_format(fmt);
+    pvr_set_pal_format((pvr_palfmt_t)fmt);
     for (size_t i = 0; i < palette_hdr.colors; i++) {
       uint32_t color = colors[i];  // format 0xAARRGGBB
       switch (fmt) {

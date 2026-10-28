@@ -9,6 +9,10 @@
 #include <dc/video.h>
 #include <arch/cache.h>
 #include <arch/timer.h>
+#include <kos/fs.h>
+#include <kos/thread.h>
+
+#define F_PI 3.1415926f
 
 #define CONT_B (1u << 1)
 #define CONT_A (1u << 2)
@@ -20,11 +24,18 @@
 #define CONT_Y (1u << 9)
 #define CONT_X (1u << 10)
 #define MAPLE_FUNC_CONTROLLER 1
-typedef struct { int port; } maple_device_t;
+#define MAPLE_FUNC_MEMCARD 2
+typedef struct { int port, unit; } maple_device_t;
 typedef struct {
     uint32_t buttons;
     int joyx, joyy, joy2x, joy2y;
     unsigned ltrig, rtrig;
 } cont_state_t;
+#ifdef __cplusplus
+extern "C" {
+#endif
 maple_device_t* maple_enum_type(int port, int function);
 void* maple_dev_status(maple_device_t* device);
+#ifdef __cplusplus
+}
+#endif

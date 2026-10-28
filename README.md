@@ -11,7 +11,8 @@ converted from `.glb` to the engine's `.dms` format with the converter in
 | `dms/` | The engine. Projects include it as `#include "dms/dc_engine.h"` |
 | `examples/` | One small demo per folder: `main.c`, `assets/`, a 1–3 line `Makefile` |
 | `games/` | Full games (multi-file `src/`) built the same way |
-| `host/` | Linux/SDL3 desktop preview of the engine |
+| `host/` | Linux build: the same engine and game code on gpu_pvr (software PVR), with the Dreamcast's heap |
+| `tools/editor/` | Unity-style scene editor (Dear ImGui), drawn by the engine itself |
 | `tools/converter/` | `strippy` (`.glb` → `.dms`) and the `dcaconv` audio submodule |
 | `mk/example.mk` | The shared build rules every project Makefile includes |
 | `build/` | All build output, one folder per project (git-ignored) |
@@ -29,7 +30,11 @@ the repo root:
 | `make teapot/assets` | Converts assets only |
 | `make teapot/clean`, `make teapot/assets-clean` | Removes `build/teapot/` or `pc/` |
 | `make all` / `make list` | Builds or lists every project |
-| `make host EXAMPLE=teapot` | Runs the Linux desktop preview (needs SDL3) |
+| `make teapot/host-run` | Builds and runs the game on Linux (needs 32-bit SDL3; no KOS needed) |
+| `make teapot/shot` | Runs 60 frames without a window and writes `build/teapot/shot.png` |
+| `make teapot/edit` | Opens `assets/scenes/main.json` in the scene editor (`SCENE=...` for another) |
+| `make teapot/scene-shot` | That scene drawn by the engine to `build/teapot/scene.png` |
+| `make editor` | Builds the editor alone (`build/editor/dms-editor`) |
 
 The same targets work inside a project folder: `cd examples/teapot && make run`.
 
@@ -46,6 +51,46 @@ include ../../mk/example.mk
 Asset conversion is automatic: `.glb` → `.dms`, `.png` → `.dt`, `.wav`/`.mp3` →
 `.dca` (files in `assets/music/` are converted for streaming) and `.bin` is copied.
 Multi-file projects set `SRCS` (see `games/botboy/Makefile`).
+
+### On Linux
+
+`make <name>/host` builds the project for Linux: the same C, with
+[gpu_pvr](host/third_party/gpu_pvr) doing the PVR's work in software, sh4zam's
+portable backend for the SH4 maths, and `malloc` going to a copy of the
+Dreamcast's 16 MB (`host/dcsim`, starting where the Dreamcast ELF ends). A
+project that runs out of memory there runs out of memory on hardware; the peak
+is printed on exit. KOS calls the engine uses are stubbed in `host/include` and
+`host/shim.c`.
+
+### Scenes and the editor
+
+A scene is a JSON file under `assets/` (copied to `pc/`): models placed with
+position, rotation, scale and tint, lights, the background, fog and the start
+camera. The format is in `dms/dc_scene.h`. A game draws it with
+
+```c
+DCScene* scene = dc_scene_load(ASSETS "scenes/main.json", ASSETS);
+dc_scene_apply(scene);
+dc_scene_camera(scene, &camera);
+/* each frame */
+dc_scene_draw(scene);
+```
+
+`make <name>/edit` opens it in the editor: Hierarchy, Scene view, Inspector,
+Project and Console. The Scene view is the engine's own 640x480 frame, so what it
+shows is what the Dreamcast draws.
+
+- Hold the right button and use WASD/QE to fly. Middle-drag pans, Alt+left-drag
+  orbits, the wheel moves forward and back, and F frames the selection.
+- W, E and R switch between move, rotate and scale. Click an object to select it.
+- Drag models from Project into the scene.
+- Ctrl+S saves, Ctrl+Z/Y undoes and redoes, Ctrl+D duplicates and Del deletes.
+- The Build menu converts assets, runs the game on PC or builds for the Dreamcast.
+
+The editor reloads the file when it changes on disk, so the JSON can be edited
+by hand, or by Claude, while the editor is open. To check a scene without a
+window, run `dms-editor <project> --scene scenes/main.json --shot out.png`. To
+capture the whole editor, run `dms-editor <project> --ui-shot out.png --select Name`.
 
 ## Examples
 
