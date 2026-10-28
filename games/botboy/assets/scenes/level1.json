@@ -1,0 +1,37 @@
+{
+  "dms_scene": 1,
+  "background": "#000000",
+  "camera": { "pos": [0, 150, 500], "yaw": 180, "pitch": 10, "fov": 70 },
+  "lights": [
+    { "name": "Sun", "pos": [-0.2, -0.5, -1], "sun": true, "color": "#ffffff", "range": 500, "ambient": 0.314, "bands": 0 }
+  ],
+  "objects": [
+    { "name": "Level", "model": "game/level1.dms",
+      "pos": [0, 0, 0], "rot": [0, 0, 0], "scale": [64, 64, 64],
+      "tint": "#ffffff", "add": false, "visible": true },
+    { "name": "spawn", "model": "",
+      "pos": [-621.9, 52.2, -13.6], "rot": [0, 180, 0], "scale": [64, 64, 64],
+      "tint": "#ffffff", "add": false, "visible": true },
+    { "name": "door1", "model": "",
+      "pos": [-667.7, 52, -478.5], "rot": [0, 180, 0], "scale": [16, 16, 16],
+      "tint": "#ffffff", "add": false, "visible": true },
+    { "name": "door2", "model": "",
+      "pos": [-591.2, 52, -478.5], "rot": [0, 180, 0], "scale": [16, 16, 16],
+      "tint": "#ffffff", "add": false, "visible": true },
+    { "name": "door3", "model": "",
+      "pos": [-504.5, 52, -478.5], "rot": [0, 180, 0], "scale": [16, 16, 16],
+      "tint": "#ffffff", "add": false, "visible": true },
+    { "name": "door4", "model": "",
+      "pos": [-422.7, 52, -478.5], "rot": [0, 180, 0], "scale": [16, 16, 16],
+      "tint": "#ffffff", "add": false, "visible": true },
+    { "name": "door5", "model": "",
+      "pos": [-328.5, 52, -478.5], "rot": [0, 180, 0], "scale": [16, 16, 16],
+      "tint": "#ffffff", "add": false, "visible": true },
+    { "name": "door6", "model": "",
+      "pos": [-239.2, 52, -478.5], "rot": [0, 180, 0], "scale": [16, 16, 16],
+      "tint": "#ffffff", "add": false, "visible": true },
+    { "name": "door1.001", "model": "",
+      "pos": [1415.1, 109.9, -13.6], "rot": [0, 180, 0], "scale": [187.52, 187.52, 187.52],
+      "tint": "#ffffff", "add": false, "visible": true }
+  ]
+}

@@ -9,6 +9,7 @@
 #include "dms/dc_model.h"
 #include "dms/dc_camera.h"
 #include "dms/collision.h"
+#include "dms/dc_scene.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,14 +19,12 @@
 #define TAU 6.2831853f
 
 typedef enum { BODY_FB, BODY_TORSO, BODY_ARMS } Body;
+/* What only the game knows of a level. The rest (the sky, the fog, the sun,
+ * the level model and anything else put in it) is its scene,
+ * assets/scenes/<file>.json, made in the editor. */
 typedef struct {
     const char* file;
     Body        body;
-    shz_vec3_t  towards;        /* the way to the light */
-    float       ambient;
-    uint32_t    fog;            /* 0 for none */
-    float       fogNear, fogFar;
-    uint32_t    clear;          /* the sky */
     const char* music;
 } LevelDef;
 typedef enum { PLAYING, DOOR_FADE_OUT, DOOR_MESSAGE, FADE_IN, CELEBRATE, CUTSCENE, PAUSED, TRANSITION } GameState;
@@ -62,7 +61,8 @@ typedef struct {
 } Robot;
 
 extern const LevelDef* def;
-extern DMSModel*  level;
+extern DCScene*   stage;                /* the level's scene */
+extern DMSModel*  level;                /* its "Level" object's model: the walls, floors and Empties */
 extern ColWorld*  col;                  /* the level's walls and floors */
 /* Two player is co-op, the screen split top and bottom, one robot each on
  * the same level. `bot` is the selected one: every file that reads him

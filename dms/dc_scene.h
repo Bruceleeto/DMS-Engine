@@ -16,6 +16,13 @@
  * the same model share one copy of it. dc_scene_find() gets an object by
  * name, to move it from game code.
  *
+ * An object with no model is a marker: a named place, as a Blender Empty
+ * is, that the game reads and nothing draws. Markers are the Empties of a
+ * model moved into the scene, where the editor shows them and they can be
+ * moved (dc_scene_import_entities), and dc_scene_entities() hands them back
+ * to the game as that model's Empties, so dc_model_entity() finds them.
+ * A marker's scale is its size in the world: the Empty's times the model's.
+ *
  * The file, every field optional:
  *
  *     { "dms_scene": 1,
@@ -107,6 +114,19 @@ void dc_scene_object_rot(const DCSceneObject* obj, float rot[9]);
 DCSceneObject* dc_scene_add(DCScene* scene, const char* name, const char* model);
 void dc_scene_remove(DCScene* scene, int index);
 void dc_scene_load_models(DCScene* scene);
+
+/* Markers: an object with no model (model[0] == 0) */
+static inline bool dc_scene_is_marker(const DCSceneObject* obj) { return !obj->model[0]; }
+/* The Empties of host's model added as markers, placed in the world as host
+ * places the model; how many. Done once, in the editor; then the scene has
+ * them and the model's own are not read. */
+int dc_scene_import_entities(DCScene* scene, const DCSceneObject* host);
+/* The scene's markers as host's model's Empties, in its own space (host's
+ * place and scale undone; its turn is not), in place of those in the file.
+ * How many; a scene with no markers leaves the model's as they are. */
+int dc_scene_entities(const DCScene* scene, DCSceneObject* host);
+/* Degrees about x, y, z from 3 axis columns: dc_scene_object_rot backwards */
+shz_vec3_t dc_scene_rot_degrees(const float rot[9]);
 
 /* The scene as JSON text, malloc'd (the caller frees it). */
 char* dc_scene_write(const DCScene* scene);

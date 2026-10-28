@@ -20,7 +20,7 @@ static DCSound* sounds[SFX_COUNT];
 void sound_init(void) {
     if (!dc_audio_init()) return;
     dc_audio_set_volume(save_sfx_volume() / 10.0f, save_music_volume() / 10.0f);
-    char path[64];
+    char path[256];
     for (int i = 0; i < SFX_COUNT; i++) {
         snprintf(path, sizeof(path), ASSETS "sfx/%s.dca", FILES[i]);
         sounds[i] = dc_sound_load(path);
@@ -37,7 +37,7 @@ void sfx_pick(int first, int count) {
 
 void music(const char* name) {
     if (!name) { dc_music_stop(); return; }
-    char path[64];
+    char path[256];
     snprintf(path, sizeof(path), ASSETS "music/%s.dca", name);
     dc_music_play(path, true);
 }

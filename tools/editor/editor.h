@@ -88,6 +88,10 @@ void ed_run(const std::string& what, std::function<void(bool ok)> then = nullptr
 void ed_log_async(const char* line);    /* from another thread */
 void ed_add_model(const std::string& model);
 void ed_add_light();
+void ed_add_marker();
+/* The Empties of object index's model into the scene as markers; how many */
+int  ed_import_entities(int index);
+int  ed_marker_count();
 void ed_duplicate();
 void ed_delete();
 std::string ed_unique_name(const char* base);

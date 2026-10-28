@@ -32,6 +32,7 @@ the repo root:
 | `make all` / `make list` | Builds or lists every project |
 | `make teapot/host-run` | Builds and runs the game on Linux (needs 32-bit SDL3; no KOS needed) |
 | `make teapot/shot` | Runs 60 frames without a window and writes `build/teapot/shot.png` |
+| `make teapot/check` | Runs each scene 300 frames without a window: a line each saying whether it finished, its peak RAM and its warnings (a missing texture, a file that won't load). The Linux build has 32 MB; a `!` marks a peak past a retail Dreamcast's 16 |
 | `make teapot/edit` | Opens `assets/scenes/main.json` in the scene editor (`SCENE=...` for another) |
 | `make teapot/scene-shot` | That scene drawn by the engine to `build/teapot/scene.png` |
 | `make editor` | Builds the editor alone (`build/editor/dms-editor`) |

@@ -412,7 +412,7 @@ static void start_script(int scriptId) {
 /* ---- Scene ---- */
 
 static DMSModel* load(const char* name) {
-    char path[64];
+    char path[256];
     snprintf(path, sizeof(path), ASSETS "menu/%s.dms", name);
     DMSModel* m = dc_model_load(path);
     if (!m) printf("menu: cannot load %s\n", path);

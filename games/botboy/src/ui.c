@@ -21,7 +21,7 @@ static const char* const frameNames[8] = {
 };
 
 void ui_load(void) {
-    char path[64];
+    char path[256];
     for (int i = 0; i < 8; i++) {
         snprintf(path, sizeof(path), ASSETS "ui/UI_%s.dt", frameNames[i]);
         frame[i] = dc_image_load(path);

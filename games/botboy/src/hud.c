@@ -50,7 +50,7 @@ static void slider_load(Slider* s, const char* fmt, const int* numbers, int coun
     s->count = count; s->fps = fps; s->showX = showX; s->hideX = hideX;
     s->x = s->target = hideX; s->shown = 0.0f; s->frame = 0; s->animTime = 0.0f;
     for (int i = 0; i < count; i++) {
-        char path[64];
+        char path[256];
         snprintf(path, sizeof(path), fmt, numbers[i]);
         s->frames[i] = dc_image_load(path);
     }
@@ -80,7 +80,7 @@ void hud_init(void) {
     slider_load(&screwHud, ASSETS "ui/GBOLT%d.dt",   screwNumbers, SCREW_FRAMES, SCREW_FPS, SCREW_SHOW_X, SCREW_HIDE_X);
     star = dc_image_load(ASSETS "ui/star.dt");
     for (int i = 0; i <= HEALTH; i++) {
-        char path[64];
+        char path[256];
         snprintf(path, sizeof(path), ASSETS "ui/health%d.dt", i + 1);
         hearts[i] = dc_image_load(path);
     }

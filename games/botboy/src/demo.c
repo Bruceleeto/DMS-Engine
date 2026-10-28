@@ -23,7 +23,7 @@ static uint32_t  prevButtons;
 /* ---- Recording ---- */
 
 static void record_write(void) {
-    char path[32];
+    char path[256];
     snprintf(path, sizeof(path), "/pc/demo%d.bin", (int)head.level);
     file_t f = fs_open(path, O_WRONLY | O_CREAT | O_TRUNC);
     if (f == FILEHND_INVALID) { printf("REC: cannot open %s to write (run with dc-tool -c pc)\n", path); return; }
@@ -75,7 +75,7 @@ int demo_count(void) {
     if (found >= 0) return found;
     found = 0;
     for (int lv = 0; lv < DEMO_LEVELS; lv++) {
-        char path[48];
+        char path[256];
         demo_path(lv, path, sizeof(path));
         file_t f = fs_open(path, O_RDONLY);
         if (f == FILEHND_INVALID) continue;
@@ -88,7 +88,7 @@ int demo_count(void) {
 
 bool demo_play(int i) {
     if (i < 0 || i >= demo_count()) return false;
-    char path[48];
+    char path[256];
     demo_path(levels[i], path, sizeof(path));
     size_t size = 0;
     uint8_t* data = dc_file_read(path, &size);

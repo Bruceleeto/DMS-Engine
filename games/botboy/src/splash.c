@@ -31,7 +31,7 @@ static void load_card(Card c) {
     for (int i = 0; i < 4; i++) {
         images[i] = NULL;
         if (!card_files[c][i]) continue;
-        char path[64];
+        char path[256];
         snprintf(path, sizeof path, ASSETS "splash/%s.dt", card_files[c][i]);
         images[i] = dc_image_load(path);
     }

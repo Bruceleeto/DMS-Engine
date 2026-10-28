@@ -18,6 +18,8 @@
 # make host      build build/<name>/host/<name>
 # make host-run  run it in a window
 # make shot      render SHOT_FRAMES frames without a window -> build/<name>/shot.png
+# make check     run each scene CHECK_FRAMES frames without a window: a line
+#                each (finished? peak RAM? warnings?), no screenshots needed
 # make edit      open assets/$(SCENE) (scenes/main.json) in the scene editor
 # make scene-shot  that scene drawn by the engine -> build/<name>/scene.png
 
@@ -50,7 +52,7 @@ ENGINE_OBJS = $(addprefix $(OUT)/dms/,$(addsuffix .o,$(ENGINE)))
 OBJS        = $(addprefix $(OUT)/dc/,$(SRCS:.c=.o))
 DISC_OBJS   = $(addprefix $(OUT)/disc/,$(SRCS:.c=.o))
 
-.PHONY: all assets assets-clean clean run disc dist host host-run shot
+.PHONY: all assets assets-clean clean run disc dist host host-run shot check
 all: assets $(ELF)
 
 $(OUT)/dms/%.o: $(DMS_ROOT)/dms/%.c
@@ -86,6 +88,9 @@ host-run: host
 	$(HOST_EXE)
 shot: host
 	$(HOST_EXE) --headless --frames $(SHOT_FRAMES) --shot $(OUT)/shot.png
+CHECK_FRAMES ?= 300
+check: host
+	@$(DMS_ROOT)/tools/check.sh $(HOST_EXE) $(CURDIR) $(CHECK_FRAMES)
 
 clean:
 	-rm -rf $(OUT)

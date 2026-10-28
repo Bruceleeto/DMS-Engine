@@ -6,8 +6,9 @@
  * DCSIM_KOS_BYTES, what KallistiOS has malloced before the engine starts.
  * See dcsim.h.
  *
- * DCSIM_MEGS=<n> in the environment is the RAM, 16 by default for a retail
- * Dreamcast; use 32 explicitly when diagnosing an over-budget build.
+ * DCSIM_MEGS=<n> in the environment is the RAM: 32 by default (a dev
+ * kit's), so a build over a retail Dreamcast's 16 still runs and shows by
+ * how much. It warns once when it passes 16.
  */
 #undef malloc
 #undef calloc
@@ -22,6 +23,7 @@
 #include <string.h>
 
 #define DC_MEM_TOP	memtop
+#define RETAIL		(16ul * 1024 * 1024)	// a retail Dreamcast's RAM
 static uintptr_t memtop;
 
 static unsigned char *arena;	// where DCSIM_HEAP_START is
@@ -52,6 +54,12 @@ static void *dcsim_sbrk(ptrdiff_t increment)
 	sbrkbase = newbase;
 	if (sbrkpeak < newbase)
 		sbrkpeak = newbase;
+	static int over;
+	if (!over && newbase + 64 * 1024 - 0x8c000000u > RETAIL)
+	{
+		over = 1;
+		printf("dcsim: WARNING past the 16 MB of a retail Dreamcast: this would not run there\n");
+	}
 	// how high the heap's been, each 256K more: what it takes, with DCSIM_MEGS
 	// high enough not to run out
 	if ((newbase - DCSIM_HEAP_START) >> 18 != (base - DCSIM_HEAP_START) >> 18)
@@ -97,17 +105,17 @@ static int DCSim_InArena(void *p)
 
 static void DCSim_Report(void)
 {
-	fprintf(stderr, "dcsim: peak RAM including image, KOS and 64 K stack: %lu bytes (%.3f MiB), %ld bytes headroom\n",
-		(unsigned long)(sbrkpeak + 64 * 1024 - 0x8c000000u),
-		(double)(sbrkpeak + 64 * 1024 - 0x8c000000u) / (1024 * 1024),
-		(long)(DC_MEM_TOP - sbrkpeak));
+	unsigned long peak = sbrkpeak + 64 * 1024 - 0x8c000000u;
+	fprintf(stderr, "dcsim: peak RAM including image, KOS and 64 K stack: %lu bytes (%.3f MiB), %s %ld bytes of a retail 16 MB\n",
+		peak, (double)peak / (1024 * 1024), peak > RETAIL ? "OVER by" : "headroom",
+		peak > RETAIL ? (long)(peak - RETAIL) : (long)(RETAIL - peak));
 }
 
 static void DCSim_Init(void)
 {
 	unsigned char *block;
 	size_t size;
-	int megs = 16;
+	int megs = 32;
 
 	if (arena)
 		return;
@@ -199,6 +207,8 @@ void DCSim_Info(int *inuse, int *freebytes)
 
 	DCSim_Init();
 	mi = dl_mallinfo();
-	*inuse = mi.uordblks;
+	// the whole RAM as the Dreamcast's: the image, KOS, the stack and the
+	// heap in use, against everything else
+	*inuse = (DCSIM_HEAP_START - 0x8c000000u) + 64 * 1024 + mi.uordblks;
 	*freebytes = (DC_MEM_TOP - sbrkbase) + mi.fordblks;
 }

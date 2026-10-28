@@ -168,11 +168,23 @@ static void draw_icons(ImDrawList* dl, const DCCamera& c) {
     for (int i = 0; i < 4; i++) { line3(dl, c, o, k[i], cc); line3(dl, c, k[i], k[(i + 1) % 4], cc); }
 }
 
-/* An object's box: its model's bounds, turned, scaled and placed */
-static bool object_box(const DCSceneObject& o, shz_vec3_t corner[8]) {
+/* An object's own bounds: its model's, or a marker's unit cube (its scale
+ * makes it the size it is) */
+static bool object_bounds(const DCSceneObject& o, DCBounds* bd) {
+    if (dc_scene_is_marker(&o)) {
+        bd->min = shz_vec3_init(-0.5f, -0.5f, -0.5f);
+        bd->max = shz_vec3_init(0.5f, 0.5f, 0.5f);
+        return true;
+    }
     if (!o.m) return false;
-    DCBounds bd = dc_model_bounds(o.m, nullptr);
-    if (bd.min.x > bd.max.x) return false;
+    *bd = dc_model_bounds(o.m, nullptr);
+    return bd->min.x <= bd->max.x;
+}
+
+/* An object's box: its bounds, turned, scaled and placed */
+static bool object_box(const DCSceneObject& o, shz_vec3_t corner[8]) {
+    DCBounds bd;
+    if (!object_bounds(o, &bd)) return false;
     float r[9];
     dc_scene_object_rot(&o, r);
     for (int i = 0; i < 8; i++) {
@@ -186,12 +198,33 @@ static bool object_box(const DCSceneObject& o, shz_vec3_t corner[8]) {
     return true;
 }
 
+static const int box_edges[12][2] = { {0,1},{2,3},{4,5},{6,7},{0,2},{1,3},{4,6},{5,7},{0,4},{1,5},{2,6},{3,7} };
+
 static void draw_selection(ImDrawList* dl, const DCCamera& c) {
     if (ed.sel.kind != SelKind::Object) return;
     shz_vec3_t k[8];
     if (!object_box(ed.scene->objects[ed.sel.index], k)) return;
-    static const int e[12][2] = { {0,1},{2,3},{4,5},{6,7},{0,2},{1,3},{4,6},{5,7},{0,4},{1,5},{2,6},{3,7} };
-    for (auto& l : e) line3(dl, c, k[l[0]], k[l[1]], IM_COL32(255, 160, 30, 230), 1.5f);
+    for (auto& l : box_edges) line3(dl, c, k[l[0]], k[l[1]], IM_COL32(255, 160, 30, 230), 1.5f);
+}
+
+/* Markers: a box each, its name over it when the mouse is near or it is chosen */
+static void draw_markers(ImDrawList* dl, const DCCamera& c) {
+    ImVec2 mouse = ImGui::GetMousePos();
+    for (int i = 0; i < ed.scene->object_count; i++) {
+        const DCSceneObject& o = ed.scene->objects[i];
+        if (!dc_scene_is_marker(&o) || o.hidden) continue;
+        shz_vec3_t k[8];
+        object_box(o, k);
+        bool sel = ed.sel.is(SelKind::Object, i);
+        if (!sel) for (auto& l : box_edges) line3(dl, c, k[l[0]], k[l[1]], IM_COL32(120, 220, 200, 150));
+        float x, y;
+        if (!view_project(c, o.pos, &x, &y)) continue;
+        ImVec2 s = screen(x, y);
+        dl->AddCircleFilled(s, 3.0f, IM_COL32(120, 220, 200, 230));
+        float dx = mouse.x - s.x, dy = mouse.y - s.y;
+        if (sel || dx * dx + dy * dy < 40.0f * 40.0f)
+            dl->AddText(ImVec2(s.x + 6, s.y - 16), IM_COL32(200, 245, 235, 230), o.name);
+    }
 }
 
 /* ================================================================
@@ -199,9 +232,8 @@ static void draw_selection(ImDrawList* dl, const DCCamera& c) {
  * ================================================================ */
 
 static bool ray_box(shz_vec3_t o, shz_vec3_t d, const DCSceneObject& ob, float* t_out) {
-    if (!ob.m) return false;
-    DCBounds bd = dc_model_bounds(ob.m, nullptr);
-    if (bd.min.x > bd.max.x) return false;
+    DCBounds bd;
+    if (!object_bounds(ob, &bd)) return false;
     float r[9];
     dc_scene_object_rot(&ob, r);
     /* into the object's own space: undo the place, turn and scale */
@@ -255,6 +287,8 @@ static void pick(const DCCamera& c, float fx, float fy) {
             /* a box the camera is in loses to anything in front */
             if (t == 0.0f) dist += 1e6f;
         }
+        /* a marker is small and inside a level's box: it wins */
+        if (dc_scene_is_marker(&o)) dist -= 1e7f;
         if (dist < best) { best = dist; hit = { SelKind::Object, i }; }
     }
     ed.sel = hit;
@@ -516,7 +550,7 @@ void view_window() {
     dl->PushClipRect(at, ImVec2(at.x + w, at.y + h), true);
     if (ed.show_grid) draw_grid(dl, ed.cam);
     draw_selection(dl, ed.cam);
-    if (ed.show_icons) draw_icons(dl, ed.cam);
+    if (ed.show_icons) { draw_icons(dl, ed.cam); draw_markers(dl, ed.cam); }
     dl->PopClipRect();
 
     gizmo(ed.cam, at, ImVec2(w, h));

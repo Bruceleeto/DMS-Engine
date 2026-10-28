@@ -234,20 +234,29 @@ bool component(const char* icon, const char* name, bool default_open) {
     return open;
 }
 
-void meter(const char* label, float used, float total, const char* unit, float width) {
+void meter(const char* label, float used, float total, const char* unit, float width, float limit) {
     float k = total > 0 ? used / total : 0;
+    float lk = limit > 0 ? used / limit : k;
     ImVec2 p = ImGui::GetCursorScreenPos();
     float h = ImGui::GetFrameHeight();
     ImGui::InvisibleButton(label, ImVec2(width, h));
     ImDrawList* dl = ImGui::GetWindowDrawList();
     float r = h * 0.5f;
     dl->AddRectFilled(p, ImVec2(p.x + width, p.y + h), IM_COL32(44, 46, 52, 255), r);
-    ImU32 col = k > 0.9f ? ERROR : k > 0.75f ? WARN : ACCENT;
+    ImU32 col = lk > 1.0f ? ERROR : lk > 0.85f ? WARN : ACCENT;
     if (k > 0) dl->AddRectFilled(p, ImVec2(p.x + width * (k > 1 ? 1 : k), p.y + h), (col & 0x00FFFFFF) | 0x90000000, r);
+    if (limit > 0 && limit < total) {
+        float x = p.x + width * limit / total;
+        dl->AddLine(ImVec2(x, p.y + 3), ImVec2(x, p.y + h - 3), IM_COL32(255, 255, 255, 110), 1.5f);
+    }
     char text[96];
     snprintf(text, sizeof(text), "%s  %.1f / %.0f %s", label, used, total, unit);
     ImVec2 ts = ImGui::CalcTextSize(text);
     dl->AddText(ImVec2(p.x + (width - ts.x) * 0.5f, p.y + (h - ts.y) * 0.5f), IM_COL32(230, 232, 236, 255), text);
+    if (limit > 0 && ImGui::IsItemHovered())
+        ImGui::SetTooltip(used > limit ? "Over the %.0f %s of a retail Dreamcast by %.1f: it would not run there"
+                                       : "%.1f %s left before the %.0f of a retail Dreamcast",
+                          used > limit ? limit : limit - used, unit, used > limit ? used - limit : limit);
 }
 
 }

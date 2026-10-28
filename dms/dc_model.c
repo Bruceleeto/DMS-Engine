@@ -3452,6 +3452,10 @@ DMSModel* dc_model_load(const char* filename) {
             dc_model_compile_header(mesh, &mesh->header, tex->pvrformat,
                                     tex->width, tex->height, tex->ptr);
         } else {
+            /* A slot the converter left empty draws untextured: say so */
+            if (tid >= 0)
+                printf("DMS: WARNING %s: mesh %lu wants texture %d, which is missing\n",
+                       filename, (unsigned long)m, tid);
             dc_model_compile_header(mesh, &mesh->header, 0, 0, 0, NULL);
         }
 

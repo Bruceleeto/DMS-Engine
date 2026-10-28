@@ -58,6 +58,7 @@ static void launch() {
         close(out[1]);
         if (chdir(ed.project.c_str())) _exit(127);
         setenv("DMS_EMBED", shm_path.c_str(), 1);
+        setenv("DMS_SCENE", ed.scene_rel.c_str(), 1);   /* a game may start there */
         execl(exe.c_str(), exe.c_str(), (char*)nullptr);
         _exit(127);
     }

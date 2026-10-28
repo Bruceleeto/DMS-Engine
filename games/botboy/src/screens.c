@@ -119,7 +119,7 @@ void celebration_start(void) {
     rank = calc_rank();
     bestRank = save_level_rank(game_level_id, rank);
     save_write();
-    char path[64];
+    char path[256];
     snprintf(path, sizeof(path), ASSETS "ui/%c_Score.dt", rank);
     dc_image_free(rankImg);
     rankImg = dc_image_load(path);
@@ -204,7 +204,7 @@ void pause_update(const DCInput* inp, float dt) {
 
 static void load_slide(int i) {
     dc_image_free(slideImage);
-    char path[64];
+    char path[256];
     snprintf(path, sizeof(path), ASSETS "%s_%d.dt", show->file, i + 1);
     slideImage = dc_image_load(path);
 }

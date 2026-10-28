@@ -19,16 +19,17 @@ extern bool menu_starts_with_fade_in;
 
 /* ---- Levels ---- */
 
-/* Maps draw as they are in the glb, the camera on the +z side. `towards`
- * is the way to the light; a DMS sun is the way it shines, so it is negated. */
+/* Each level is a scene, scenes/<file>.json: the level model is its object
+ * named "Level", at 64 to the metre (WORLD_SCALE), the camera on the +z
+ * side. Its first light is the one the zones change. */
 static const LevelDef LEVELS[] = {
-    { "level1", BODY_FB,    { .x = 0.2f, .y = 0.5f, .z = 1.0f }, 80.0f / 255.0f, 0, 0, 0, 0xFF000000, "scrap1" },
-    { "level2", BODY_TORSO, { .x = 0.2f, .y = 0.5f, .z = 1.0f }, 124.0f / 255.0f, 0xFF8C28, 100.0f, 600.0f, 0xFF000000, "CalmJunglescrap" },
-    { "level3", BODY_TORSO, { .x = 0.2f, .y = 0.5f, .z = 1.0f }, 80.0f / 255.0f, 0x5A1E78, 100.0f, 600.0f, 0xFF280F37, "androidjungle1" },
-    { "level4", BODY_ARMS,  { .x = 0.2f, .y = 0.5f, .z = 1.0f }, 80.0f / 255.0f, 0x8CAAC8, 200.0f, 900.0f, 0xFF000000, "scrap1-level1" },
-    { "level5", BODY_ARMS,  { .x = 0.2f, .y = 0.5f, .z = 1.0f }, 80.0f / 255.0f, 0xC8DCF0, 100.0f, 600.0f, 0xFF87CEEB, "N64Chiller3" },
-    { "level6", BODY_FB,    { .x = 0.2f, .y = 0.5f, .z = 1.0f }, 80.0f / 255.0f, 0xC83C14, 100.0f, 600.0f, 0xFF000000, "N64JetForceTrack" },
-    { "level7", BODY_FB,    { .x = -0.577f, .y = 0.577f, .z = -0.577f }, 80.0f / 255.0f, 0, 0, 0, 0xFF000000, "scrap1" },
+    { "level1", BODY_FB,    "scrap1" },
+    { "level2", BODY_TORSO, "CalmJunglescrap" },
+    { "level3", BODY_TORSO, "androidjungle1" },
+    { "level4", BODY_ARMS,  "scrap1-level1" },
+    { "level5", BODY_ARMS,  "N64Chiller3" },
+    { "level6", BODY_FB,    "N64JetForceTrack" },
+    { "level7", BODY_FB,    "scrap1" },
 };
 #define LEVEL_COUNT (int)(sizeof(LEVELS) / sizeof(LEVELS[0]))
 
@@ -95,6 +96,7 @@ typedef struct {
 } Zone;
 
 const LevelDef* def;
+DCScene*   stage;
 DMSModel*  level;
 ColWorld*  col;
 GameState  state;
@@ -139,7 +141,7 @@ static DCParticles* oil;
 static DCImage*  shine;             /* what the bolts and the screw reflect */
 
 DMSModel* load(const char* dir, const char* name) {
-    char path[64];
+    char path[256];
     snprintf(path, sizeof(path), ASSETS "%s/%s.dms", dir, name);
     DMSModel* m = dc_model_load(path);
     if (!m) printf("game: cannot load %s\n", path);
@@ -168,14 +170,11 @@ static void shake_update(float dt) {
 /* ---- Light, fog and the zones ---- */
 
 void light_reset(void) {
-    light = (DCLight){ .pos = { .x = -def->towards.x, .y = -def->towards.y, .z = -def->towards.z },
-                       .sun = true, .ambient = def->ambient, .r = 1.0f, .g = 1.0f, .b = 1.0f };
-    dc_set_light(&light);
+    if (stage) dc_scene_apply(stage);
+    if (stage && stage->light_count) light = stage->lights[0].light;
+    else light = (DCLight){ .pos = { .x = -0.2f, .y = -0.5f, .z = -1.0f }, .sun = true, .r = 1.0f, .g = 1.0f, .b = 1.0f };
     lightFading = false;
-    fogWant = def->fog;
-    dc_set_clear_color(def->clear);
-    if (def->fog) dc_set_fog(def->fog, def->fogNear, def->fogFar);
-    else dc_set_fog_off();
+    fogWant = stage && stage->fog ? stage->fog_rgb : 0;
     for (int i = 0; i < zoneCount; i++) zones[i].inside = false;
 }
 
@@ -233,10 +232,10 @@ static void zones_update(float dt) {
             }
         } else if (z->kind == ZONE_FOG) {       /* the light and the fog are one level's: player 1 sets them */
             uint32_t c = ((uint32_t)(z->r * 255) << 16) | ((uint32_t)(z->g * 255) << 8) | (uint32_t)(z->b * 255);
-            if (def->fog && c != fogWant
+            if (fogWant && c != fogWant
                 && fabsf(bots[0].pos.x - z->pos.x) < z->half.x && fabsf(bots[0].pos.y - z->pos.y) < z->half.y && fabsf(bots[0].pos.z - z->pos.z) < z->half.z) {
                 fogWant = c;
-                dc_set_fog_over(c, def->fogNear, def->fogFar, FOG_FADE);
+                dc_set_fog_over(c, stage->fog_near, stage->fog_far, FOG_FADE);
                 dc_set_clear_color_over(0xFF000000u | c, FOG_FADE);
             }
         } else if (z->kind == ZONE_LIGHT_PERM) {
@@ -289,8 +288,19 @@ static void init(void) {
     def = &LEVELS[game_level_id < LEVEL_COUNT ? game_level_id : 0];
     if (game_demo) game_coop = false;
     game_players = game_coop ? 2 : 1;
-    level = load("game", def->file);
-    col = level ? col_build(level, shz_vec3_init(0.0f, 0.0f, 0.0f), WORLD_SCALE) : NULL;
+    char path[256];
+    snprintf(path, sizeof(path), ASSETS "scenes/%s.json", def->file);
+    stage = dc_scene_load(path, ASSETS);
+    DCSceneObject* lv = stage ? dc_scene_find(stage, "Level") : NULL;
+    if (!stage) printf("game: cannot load %s\n", path);
+    else if (!lv || !lv->m) printf("game: %s has no Level object with a model\n", path);
+    level = lv ? lv->m : NULL;
+    /* The props, enemies, doors and zones: the scene's markers, placed in
+     * the editor (the glb's own Empties if it has none) */
+    if (lv) dc_scene_entities(stage, lv);
+    /* The Empties are read at WORLD_SCALE about the origin, so the Level
+     * object is moved and scaled in the editor only with care */
+    col = level ? col_build(level, lv->pos, lv->scale.x) : NULL;
     memset(ids, 0, sizeof(ids));
     levelTime = 0.0f;
     deaths = 0;
@@ -323,7 +333,7 @@ static void init(void) {
     countTime = -FADE_TIME; countDone = !game_coop; pauser = 0;
     if (game_coop) {                    /* the countdown, nobody moving until GO */
         static const char* NAMES[4] = { "Three", "Two", "One", "Go" };
-        for (int i = 0; i < 4; i++) { char path[48]; snprintf(path, sizeof(path), ASSETS "ui/%s.dt", NAMES[i]); countImg[i] = dc_image_load(path); }
+        for (int i = 0; i < 4; i++) { char path[256]; snprintf(path, sizeof(path), ASSETS "ui/%s.dt", NAMES[i]); countImg[i] = dc_image_load(path); }
         FOR_PLAYERS(p) robot_lock(FADE_TIME + COUNT_TOTAL);
     }
     hud_init();
@@ -361,8 +371,8 @@ static void deinit(void) {
     dc_image_free(trLogo); trLogo = NULL;
     fx_free();
     hud_free();
-    dc_model_free(level);
-    level = NULL; col = NULL;
+    dc_scene_free(stage);
+    stage = NULL; level = NULL; col = NULL;
     dc_set_fog_off();
 }
 
@@ -664,7 +674,7 @@ static void draw(void) {
         View* v = &views[p];
         dc_camera_update(&v->cam);
         dc_set_camera(&v->cam);
-        draw_at(level, shz_vec3_init(0.0f, 0.0f, 0.0f), 1.0f, 0.0f);
+        if (stage) dc_scene_draw(stage);
         FOR_PLAYERS(q) {
             /* The charge pad's glow: his texture swapped for the glow picture and
              * back, a quarter second each, while it lasts */

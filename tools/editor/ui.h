@@ -49,6 +49,8 @@
 #define ICON_X           ""
 #define ICON_REFRESH     ""
 #define ICON_PACKAGE     ""
+#define ICON_MARKER      "\ue114"
+#define ICON_IMPORT      "\ue22e"
 
 /* Window titles: the icon and name shown, the id after ### fixed */
 #define WIN_HIERARCHY ICON_TREE "  Hierarchy###Hierarchy"
@@ -89,8 +91,8 @@ bool drag_xyz(const char* label, float v[3], float speed, const char* fmt, float
 void row_label(const char* label);
 /* A component header, as Unity's: icon, bold name, open or shut */
 bool component(const char* icon, const char* name, bool default_open = true);
-/* A bar of how much of something is used */
-void meter(const char* label, float used, float total, const char* unit, float width);
+/* A bar of how much of something is used; past limit (if any, marked) it is red */
+void meter(const char* label, float used, float total, const char* unit, float width, float limit = 0);
 void tooltip(const char* text);
 
 }

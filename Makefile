@@ -17,7 +17,7 @@ list:
 	@echo $(NAMES)
 $(NAMES):
 	$(MAKE) -C $(call dir_of,$@)
-TARGETS  := run disc assets clean assets-clean dist host host-run shot edit scene-shot
+TARGETS  := run disc assets clean assets-clean dist host host-run shot check edit scene-shot
 $(foreach n,$(NAMES),$(foreach t,$(TARGETS),$(eval $(n)/$(t): ; $$(MAKE) -C $(call dir_of,$(n)) $(t))))
 
 converter:

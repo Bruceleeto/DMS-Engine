@@ -373,7 +373,10 @@ void dc_scene_draw(const DCScene* s) {
         float rot[9];
         DCDrawOpts d = { .pos = o->pos, .add = o->add };
         if ((o->tint & 0xFFFFFF) != 0xFFFFFF) d.tint = o->tint ? o->tint : 0x010101;
-        if (o->scale.x != 1.0f || o->scale.y != 1.0f || o->scale.z != 1.0f)
+        /* the same on every axis is a plain scale, lit exactly; a stretch is lit close */
+        if (o->scale.x == o->scale.y && o->scale.y == o->scale.z)
+            d.scale = fmaxf(o->scale.x, 0.001f);
+        else
             d.stretch = shz_vec3_init(fmaxf(o->scale.x, 0.001f), fmaxf(o->scale.y, 0.001f), fmaxf(o->scale.z, 0.001f));
         if (o->m->skeleton) {
             d.yaw = -SHZ_DEG_TO_RAD(o->rot.y);
@@ -383,6 +386,69 @@ void dc_scene_draw(const DCScene* s) {
         }
         dc_draw_ex(o->m, &d);
     }
+}
+
+shz_vec3_t dc_scene_rot_degrees(const float r[9]) {
+    float x, y, z;
+    if (fabsf(r[7]) < 0.9999f) {
+        x = asinf(-r[7]);
+        y = atan2f(r[6], r[8]);
+        z = atan2f(r[1], r[4]);
+    } else {                            /* straight up or down: y and z are one turn */
+        x = r[7] < 0.0f ? 1.5707963f : -1.5707963f;
+        y = atan2f(-r[2], r[0]);
+        z = 0.0f;
+    }
+    return shz_vec3_init(SHZ_RAD_TO_DEG(x), SHZ_RAD_TO_DEG(y), SHZ_RAD_TO_DEG(z));
+}
+
+static float host_scale(const DCSceneObject* host) {
+    return host->scale.x != 0.0f ? host->scale.x : 1.0f;
+}
+
+int dc_scene_import_entities(DCScene* s, const DCSceneObject* host) {
+    if (!host->m || !host->m->entity_count) return 0;
+    const DMSModel* m = host->m;
+    shz_vec3_t at = host->pos;
+    float k = host_scale(host);
+    int n = 0;
+    for (uint32_t i = 0; i < m->entity_count; i++) {
+        const DMSEntity* e = &m->entities[i];
+        DCSceneObject* o = add_object(s);
+        if (!o) break;
+        host = NULL;                    /* add_object may have moved the objects */
+        snprintf(o->name, sizeof(o->name), "%s", e->name);
+        o->model[0] = 0;
+        o->pos = shz_vec3_init(at.x + e->pos.x * k, at.y + e->pos.y * k, at.z + e->pos.z * k);
+        o->rot = dc_scene_rot_degrees(e->rot);
+        o->scale = shz_vec3_init(e->scale.x * k, e->scale.y * k, e->scale.z * k);
+        n++;
+    }
+    return n;
+}
+
+int dc_scene_entities(const DCScene* s, DCSceneObject* host) {
+    if (!host->m) return 0;
+    int n = 0;
+    for (int i = 0; i < s->object_count; i++) n += dc_scene_is_marker(&s->objects[i]);
+    if (!n) return 0;
+    DMSEntity* es = calloc(n, sizeof(DMSEntity));
+    if (!es) return 0;
+    float k = host_scale(host);
+    DMSEntity* e = es;
+    for (int i = 0; i < s->object_count; i++) {
+        const DCSceneObject* o = &s->objects[i];
+        if (!dc_scene_is_marker(o)) continue;
+        snprintf(e->name, sizeof(e->name), "%s", o->name);
+        e->pos = shz_vec3_init((o->pos.x - host->pos.x) / k, (o->pos.y - host->pos.y) / k, (o->pos.z - host->pos.z) / k);
+        dc_scene_object_rot(o, e->rot);
+        e->scale = shz_vec3_init(o->scale.x / k, o->scale.y / k, o->scale.z / k);
+        e++;
+    }
+    free(host->m->entities);            /* the model frees what it has */
+    host->m->entities = es;
+    host->m->entity_count = n;
+    return n;
 }
 
 DCSceneObject* dc_scene_find(DCScene* s, const char* name) {

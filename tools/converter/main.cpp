@@ -673,7 +673,19 @@ static float ShineOf(float metal, float rough, const cgltf_material *mat, float 
     return strength >= 0.05f && gloss >= 0.2f ? strength : 0.0f;
 }
 
+/* The model's name without folder or extension: its loose texture files are
+ * named after it, so models converted side by side (make -j) in one folder
+ * never take each other's */
+static std::string ModelStem(const char *path) {
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    std::string stem = base;
+    size_t dot = stem.find_last_of('.');
+    return dot == std::string::npos ? stem : stem.substr(0, dot);
+}
+
 void ExtractAndConvertTextures(cgltf_data *data, const char *inputFilename) {
+    std::string stem = ModelStem(inputFilename);
     if (data->images_count == 0) return;
 
     // Get directory of input file
@@ -712,8 +724,8 @@ void ExtractAndConvertTextures(cgltf_data *data, const char *inputFilename) {
         if (img->mime_type && strstr(img->mime_type, "jpeg")) ext = ".jpg";
         else if (img->mime_type && strstr(img->mime_type, "jpg")) ext = ".jpg";
 
-        snprintf(tmpPath, sizeof(tmpPath), "%s/_tmp_texture_%zu%s", outputDir, i, ext);
-        snprintf(dtPath, sizeof(dtPath), "%s/texture_%zu.dt", outputDir, i);
+        snprintf(tmpPath, sizeof(tmpPath), "%s/_tmp_%s_texture_%zu%s", outputDir, stem.c_str(), i, ext);
+        snprintf(dtPath, sizeof(dtPath), "%s/%s_texture_%zu.dt", outputDir, stem.c_str(), i);
 
         if (img->buffer_view) {
             // Embedded in .glb binary chunk
@@ -4029,7 +4041,7 @@ void ExportTristrippedModel(const Model *model, const char *filename,
   // Also check for .dt files that might exist without being in textureNames
   for (uint32_t i = 0; i < 256; i++) {
     char dtPath[512];
-    snprintf(dtPath, sizeof(dtPath), "%s/texture_%u.dt", outputDir, i);
+    snprintf(dtPath, sizeof(dtPath), "%s/%s_texture_%u.dt", outputDir, ModelStem(filename).c_str(), i);
     FILE *probe = fopen(dtPath, "rb");
     if (probe) {
       fclose(probe);
@@ -4051,7 +4063,7 @@ void ExportTristrippedModel(const Model *model, const char *filename,
 
   for (uint32_t i = 0; i < tex_count; i++) {
     char dtPath[512];
-    snprintf(dtPath, sizeof(dtPath), "%s/texture_%u.dt", outputDir, i);
+    snprintf(dtPath, sizeof(dtPath), "%s/%s_texture_%u.dt", outputDir, ModelStem(filename).c_str(), i);
     FILE *dtf = fopen(dtPath, "rb");
     if (!dtf) {
       printf("  Texture %u: not found (%s), skipping\n", i, dtPath);

@@ -371,6 +371,31 @@ void ed_add_model(const std::string& model) {
     if (!o->m) ed_log("%s: could not load %s", o->name, model.c_str());
 }
 
+void ed_add_marker() {
+    ed_checkpoint();
+    DCSceneObject* o = dc_scene_add(ed.scene, ed_unique_name("Marker").c_str(), "");
+    if (!o) return;
+    o->pos = drop_point();
+    ed.sel = { SelKind::Object, ed.scene->object_count - 1 };
+    ed_changed();
+}
+
+int ed_marker_count() {
+    int n = 0;
+    for (int i = 0; i < ed.scene->object_count; i++) n += dc_scene_is_marker(&ed.scene->objects[i]);
+    return n;
+}
+
+int ed_import_entities(int index) {
+    if (index < 0 || index >= ed.scene->object_count) return 0;
+    ed_checkpoint();
+    std::string host = ed.scene->objects[index].name;
+    int n = dc_scene_import_entities(ed.scene, &ed.scene->objects[index]);
+    if (n) ed_changed();
+    ed_log("%s: %d Empties now markers in the scene", host.c_str(), n);
+    return n;
+}
+
 void ed_add_light() {
     if (ed.scene->light_count >= DC_MAX_LIGHTS) { ed_log("The engine takes %d lights at most", DC_MAX_LIGHTS); return; }
     ed_checkpoint();
@@ -602,7 +627,7 @@ static void toolbar() {
         int used, freeb;
         if (g) { used = g->heap_used; freeb = g->heap_free; }
         else DCSim_Info(&used, &freeb);
-        ui::meter(g ? "Game RAM" : "Scene RAM", used / 1048576.0f, (used + freeb) / 1048576.0f, "MB", meter_w);
+        ui::meter(g ? "Game RAM" : "Scene RAM", used / 1048576.0f, (used + freeb) / 1048576.0f, "MB", meter_w, 16.0f);
         ui::tooltip(g ? "The running game's Dreamcast heap: malloc'd now, of what is free after its image and KOS"
                       : "This scene's models on the Dreamcast heap, as the editor has them loaded");
     }
@@ -664,6 +689,7 @@ int main(int argc, char** argv) {
     const char* shot_out = nullptr;
     const char* ui_shot = nullptr;
     const char* select = nullptr;
+    const char* import = nullptr;
     bool play = false;
     int frames = 3;
     for (int i = 1; i < argc; i++) {
@@ -673,10 +699,11 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--ui-shot") && i + 1 < argc) ui_shot = argv[++i];
         else if (!strcmp(argv[i], "--select") && i + 1 < argc) select = argv[++i];
         else if (!strcmp(argv[i], "--play")) play = true;
+        else if (!strcmp(argv[i], "--import-empties") && i + 1 < argc) import = argv[++i];
         else if (argv[i][0] != '-') project = argv[i];
         else {
             fprintf(stderr, "Usage: %s <project> [--scene scenes/main.json] [--shot out.png | --ui-shot out.png]"
-                            " [--frames N] [--select Name] [--play]\n", argv[0]);
+                            " [--frames N] [--select Name] [--play] [--import-empties Object]\n", argv[0]);
             return 2;
         }
     }
@@ -684,7 +711,7 @@ int main(int argc, char** argv) {
     if (ed.project.empty()) { fprintf(stderr, "No project folder %s\n", project); return 2; }
     ed.root = DMS_ROOT_DIR "/";
 
-    if (!SDL_Init(SDL_INIT_EVENTS | (shot_out ? 0 : SDL_INIT_VIDEO))) {
+    if (!SDL_Init(SDL_INIT_EVENTS | (shot_out || import ? 0 : SDL_INIT_VIDEO))) {
         fprintf(stderr, "SDL: %s\n", SDL_GetError());
         return 1;
     }
@@ -695,6 +722,33 @@ int main(int argc, char** argv) {
     if (!stat((ed.project + "assets/" + scene).c_str(), &st)) ed_open(scene);
     else if (shot_out) { fprintf(stderr, "No scene assets/%s\n", scene); return 1; }
     else ed_new(scene);
+
+    /* The object's model's Empties made markers, saved, and done: no window */
+    if (import) {
+        DCSceneObject* o = dc_scene_find(ed.scene, import);
+        if (!o) { fprintf(stderr, "No object %s in %s\n", import, scene); return 1; }
+        if (ed_marker_count()) { fprintf(stderr, "%s has markers already\n", scene); return 1; }
+        int idx = (int)(o - ed.scene->objects);
+        std::vector<DMSEntity> was(o->m ? o->m->entities : nullptr, o->m ? o->m->entities + o->m->entity_count : nullptr);
+        int n = ed_import_entities(idx);
+        for (auto& l : ed.log) printf("%s\n", l.c_str());
+        /* back again, as the game reads them, against what the model had */
+        DCSceneObject* host = &ed.scene->objects[idx];
+        int back = dc_scene_entities(ed.scene, host);
+        float worst = 0.0f;
+        int names = 0;
+        for (int i = 0; i < back && i < (int)was.size(); i++) {
+            const DMSEntity &a = was[i], &b = host->m->entities[i];
+            names += strcmp(a.name, b.name) != 0;
+            float d[] = { a.pos.x - b.pos.x, a.pos.y - b.pos.y, a.pos.z - b.pos.z,
+                          a.scale.x - b.scale.x, a.scale.y - b.scale.y, a.scale.z - b.scale.z };
+            for (float v : d) worst = fmaxf(worst, fabsf(v));
+            for (int k = 0; k < 9; k++) worst = fmaxf(worst, fabsf(a.rot[k] - b.rot[k]));
+        }
+        printf("round trip: %d of %d back, %d names differ, worst difference %g\n", back, (int)was.size(), names, worst);
+        if (back != (int)was.size() || names || worst > 1e-3f) return 1;
+        return n && ed_save() ? 0 : 1;
+    }
 
     if (shot_out) {
         int r = shot(shot_out, frames < 1 ? 1 : frames);

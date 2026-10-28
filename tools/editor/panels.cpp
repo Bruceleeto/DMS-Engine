@@ -83,6 +83,7 @@ static void badge(const char* icon, ImU32 col) {
 static void add_menu() {
     if (ImGui::MenuItem(ICON_BOX "  Cube")) ed_add_model("@cube");
     if (ImGui::MenuItem(ICON_LIGHT "  Light")) ed_add_light();
+    if (ImGui::MenuItem(ICON_MARKER "  Marker")) ed_add_marker();
     if (ImGui::BeginMenu(ICON_MODEL "  Model", !ed.models.empty())) {
         for (auto& m : ed.models)
             if (ImGui::MenuItem(m.c_str())) ed_add_model(m);
@@ -147,7 +148,9 @@ void panel_hierarchy() {
         char id[16];
         snprintf(id, sizeof(id), "o%d", i);
         bool visible = !o.hidden;
-        bool clicked = row(id, o.model[0] == '@' ? ICON_BOX : ICON_MODEL, o.m ? IM_COL32(120, 170, 255, 255) : ui::ERROR,
+        bool marker = dc_scene_is_marker(&o);
+        bool clicked = row(id, marker ? ICON_MARKER : o.model[0] == '@' ? ICON_BOX : ICON_MODEL,
+                           marker ? IM_COL32(120, 220, 200, 255) : o.m ? IM_COL32(120, 170, 255, 255) : ui::ERROR,
                            o.name, ed.sel.is(SelKind::Object, i), o.hidden, &visible);
         o.hidden = !visible;
         if (clicked) {
@@ -241,7 +244,9 @@ static void set_model(DCSceneObject& o, const char* model) {
 
 static void inspect_object(DCSceneObject& o) {
     bool visible = !o.hidden;
-    title(o.model[0] == '@' ? ICON_BOX : ICON_MODEL, IM_COL32(120, 170, 255, 255), o.name, sizeof(o.name), &visible);
+    bool marker = dc_scene_is_marker(&o);
+    title(marker ? ICON_MARKER : o.model[0] == '@' ? ICON_BOX : ICON_MODEL,
+          marker ? IM_COL32(120, 220, 200, 255) : IM_COL32(120, 170, 255, 255), o.name, sizeof(o.name), &visible);
     o.hidden = !visible;
 
     if (ui::component(ICON_MOVE, "Transform")) {
@@ -257,6 +262,13 @@ static void inspect_object(DCSceneObject& o) {
         }
         if (o.m && o.m->skeleton && (o.rot.x != 0.0f || o.rot.z != 0.0f))
             ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "Skinned: only the turn about y is drawn");
+    }
+
+    if (marker) {
+        if (ui::component(ICON_MARKER, "Marker"))
+            ImGui::TextWrapped("A named place the game reads, as a Blender Empty is: its name says what goes here "
+                               "(\"bolt\", \"rat.002\", \"spawn\"). Nothing is drawn; its box is its size.");
+        return;
     }
 
     if (ui::component(ICON_MODEL, "Model")) {
@@ -279,6 +291,17 @@ static void inspect_object(DCSceneObject& o) {
             for (uint32_t i = 0; i < o.m->mesh_count; i++) verts += o.m->meshes[i].vertex_count;
             ImGui::TextDisabled("%u meshes   %u vertices   %s", o.m->mesh_count, verts, o.m->skeleton ? "skinned" : "static");
             ImGui::TextDisabled("%.2f x %.2f x %.2f units", b.max.x - b.min.x, b.max.y - b.min.y, b.max.z - b.min.z);
+            if (o.m->entity_count) {
+                int have = ed_marker_count();
+                ImGui::Spacing();
+                ImGui::BeginDisabled(have > 0);
+                char label[96];
+                snprintf(label, sizeof(label), ICON_IMPORT "  Bring its %u Empties into the scene", (unsigned)o.m->entity_count);
+                if (ImGui::Button(label, ImVec2(-1, 0))) ed_import_entities((int)(&o - ed.scene->objects));
+                ImGui::EndDisabled();
+                ui::tooltip(have ? "The scene has markers already: the game reads those in place of the model's"
+                                 : "As markers you can see and move here; the game then reads them, not the model's");
+            }
         } else {
             ImGui::TextColored(ImVec4(1, 0.45f, 0.4f, 1), "Not loaded: convert assets (" ICON_PACKAGE " in Project)");
         }
