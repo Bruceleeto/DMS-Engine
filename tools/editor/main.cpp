@@ -19,6 +19,9 @@
 #include "pvr_host.h"
 #include <SDL3/SDL.h>
 #include <dirent.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <mutex>
 #include <stdarg.h>
 #include <sys/stat.h>
@@ -52,6 +55,8 @@ extern "C" void* maple_dev_status(maple_device_t* device) {
 static std::mutex job_lock;
 static std::vector<std::string> job_lines;
 static bool job_running, job_done, job_ok;
+static std::string job_what;
+static pid_t job_pid;
 static std::function<void(bool)> job_then;
 
 void ed_log_async(const char* line) {
@@ -70,24 +75,66 @@ void ed_log(const char* fmt, ...) {
     if (ed.log.size() > 2000) ed.log.erase(ed.log.begin(), ed.log.begin() + 500);
 }
 
+/* KallistiOS's environment, when the editor was not started from a shell
+ * that has it: the Dreamcast builds and KOS_LOADER (make run) need it */
+static std::string kos_env() {
+    if (getenv("KOS_BASE")) return "";
+    const char* kos = "/opt/toolchains/dc/kos/environ.sh";
+    struct stat st;
+    return stat(kos, &st) ? "" : std::string(". ") + kos + " >/dev/null 2>&1; ";
+}
+
+std::string ed_project_name() {
+    std::string name = ed.project.substr(0, ed.project.size() - 1);
+    return name.substr(name.find_last_of('/') + 1);
+}
+
+const char* ed_job() { return job_running ? job_what.c_str() : nullptr; }
+
+void ed_job_stop() {
+    if (job_running && job_pid > 0) kill(-job_pid, SIGTERM);    /* make and all it started */
+}
+
 void ed_run(const std::string& what, std::function<void(bool ok)> then) {
-    if (job_running) { ed_log("A job is running already"); return; }
-    job_running = true;
-    job_then = then;
-    std::string cmd = "make -C '" + ed.project + "' " + what + " 2>&1";
+    if (job_running) { ed_log("A job is running already (%s)", job_what.c_str()); return; }
+    std::string cmd = "make -C '" + ed.project + "' " + what;
     ed_log("$ %s", cmd.c_str());
-    std::thread([cmd] {
-        FILE* p = popen(cmd.c_str(), "r");
+    cmd = kos_env() + cmd + " 2>&1";
+    int out[2];
+    if (pipe(out)) return;
+    pid_t pid = fork();
+    if (pid == 0) {
+        setpgid(0, 0);                  /* its own group, so a stop reaches all of it */
+        dup2(out[1], 1);
+        dup2(out[1], 2);
+        close(out[0]);
+        close(out[1]);
+        execl("/bin/bash", "bash", "-c", cmd.c_str(), (char*)nullptr);
+        _exit(127);
+    }
+    close(out[1]);
+    if (pid < 0) { close(out[0]); ed_log("Cannot start make"); return; }
+    setpgid(pid, pid);
+    job_pid = pid;
+    job_running = true;
+    job_what = what;
+    job_then = then;
+    int fd = out[0];
+    std::thread([fd, pid] {
+        FILE* p = fdopen(fd, "r");
         char line[1024];
         while (p && fgets(line, sizeof(line), p)) {
             line[strcspn(line, "\n")] = 0;
             std::lock_guard<std::mutex> g(job_lock);
             job_lines.push_back(line);
         }
-        int status = p ? pclose(p) : -1;
+        if (p) fclose(p);
+        int status = -1;
+        waitpid(pid, &status, 0);
+        bool ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
         std::lock_guard<std::mutex> g(job_lock);
-        job_lines.push_back(status == 0 ? "-- done" : "-- failed");
-        job_ok = status == 0;
+        job_lines.push_back(ok ? "-- done" : WIFSIGNALED(status) ? "-- stopped" : "-- failed");
+        job_ok = ok;
         job_done = true;
     }).detach();
 }
@@ -178,6 +225,27 @@ static void set_scene(DCScene* s) {
     ed.dirty = false;
 }
 
+/* Saved first, the game stopped (it was playing the old one), then opened */
+void ed_switch_scene(const std::string& rel) {
+    if (ed.dirty && !ed_save()) return;
+    if (play_state() != PlayState::Stopped) play_stop();
+    ed_open(rel);
+}
+
+/* The next scene or the one before, round */
+static void step_scene(int by) {
+    if (ed.scenes.empty()) return;
+    auto it = std::find(ed.scenes.begin(), ed.scenes.end(), ed.scene_rel);
+    int i = it == ed.scenes.end() ? 0 : (int)(it - ed.scenes.begin());
+    int n = (int)ed.scenes.size();
+    ed_switch_scene(ed.scenes[((i + by) % n + n) % n]);
+}
+
+/* The scene last open in this project, for next time */
+static std::string last_scene_file() {
+    return std::string(SDL_GetBasePath()) + "last-scene-" + ed_project_name();
+}
+
 bool ed_open(const std::string& rel) {
     std::string path = ed.project + "assets/" + rel;
     DCScene* s = dc_scene_load(path.c_str(), ed.asset_root().c_str());
@@ -185,8 +253,9 @@ bool ed_open(const std::string& rel) {
     ed.scene_rel = rel;
     set_scene(s);
     ed.scene_mtime = mtime_of(path);
+    if (FILE* f = fopen(last_scene_file().c_str(), "w")) { fprintf(f, "%s\n", rel.c_str()); fclose(f); }
     for (int i = 0; i < s->object_count; i++)
-        if (!s->objects[i].m) ed_log("%s: no model %s (convert assets?)", s->objects[i].name, s->objects[i].model);
+        if (!s->objects[i].m && !dc_scene_is_marker(&s->objects[i])) ed_log("%s: no model %s (convert assets?)", s->objects[i].name, s->objects[i].model);
     ed_log("Opened %s: %d objects, %d lights", rel.c_str(), s->object_count, s->light_count);
     return true;
 }
@@ -545,6 +614,10 @@ static void menu_bar(bool* quit) {
         if (ImGui::MenuItem(ICON_CPU "  Build for Dreamcast")) ed_run("all");
         if (ImGui::MenuItem(ICON_DISC "  Build disc image")) ed_run("disc");
         if (ImGui::MenuItem(ICON_GAME "  Run in its own window")) { if (ed.dirty) ed_save(); ed_run("host-run"); }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Run on Dreamcast (dc-tool)")) dc_run_toggle();
+        if (ImGui::MenuItem("Run in Flycast")) flycast_toggle();
+        if (ImGui::MenuItem(ICON_X "  Stop the job", nullptr, false, ed_job() != nullptr)) ed_job_stop();
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("View")) {
@@ -603,6 +676,17 @@ static void toolbar() {
             ImGui::GetWindowDrawList()->AddCircleFilled(ImVec2(r.x - 5, ImGui::GetItemRectMin().y + 5), 3.5f, ui::WARN);
         }
 
+        /* The scene open, and the others to switch to (Ctrl+PgUp / PgDn) */
+        ImGui::SameLine(0, 16);
+        ImGui::SetNextItemWidth(210);
+        std::string shown = std::string(ICON_SCENE "  ") + ed.scene_rel;
+        if (ImGui::BeginCombo("##scene", shown.c_str(), ImGuiComboFlags_HeightLarge)) {
+            for (auto& sc : ed.scenes)
+                if (ImGui::Selectable(sc.c_str(), sc == ed.scene_rel) && sc != ed.scene_rel) ed_switch_scene(sc);
+            ImGui::EndCombo();
+        }
+        ui::tooltip("The scene open: pick another (Ctrl+PgUp / Ctrl+PgDn go through them). Unsaved changes are saved first");
+
         /* Play, pause, step: in the middle, whatever the width */
         float seg = (ImGui::GetFrameHeight() + 8) * 3;
         ImGui::SameLine(ImGui::GetWindowWidth() * 0.5f - seg * 0.5f);
@@ -619,8 +703,17 @@ static void toolbar() {
         float meter_w = 230, right = meter_w + 2 * (ImGui::GetFrameHeight() + 8) + 30;
         ImGui::SameLine(ImGui::GetWindowWidth() - right);
         ui::segment_begin();
-        if (ui::segment_button("dc", ICON_CPU, "Build for Dreamcast (make all)", false, true, false)) ed_run("all");
-        if (ui::segment_button("disc", ICON_DISC, "Build the disc image (make disc)", false, false, true)) ed_run("disc");
+        const char* job = ed_job();
+        bool on_dc = job && !strcmp(job, "run");
+        bool disc_building = job && !strcmp(job, "disc");
+        if (ui::segment_swirl("dc", ui::DREAMCAST, on_dc ? "Running on the Dreamcast: click to stop dc-tool"
+                              : "Run on a Dreamcast: build, then make run (dc-tool-ip, from KOS_LOADER in environ.sh)",
+                              on_dc, on_dc, true, false))
+            dc_run_toggle();
+        if (ui::segment_swirl("flycast", ui::FLYCAST, flycast_running() ? "In Flycast: click to close it"
+                              : "Run in Flycast: build the disc image (make disc), then open it",
+                              flycast_running(), disc_building, false, true))
+            flycast_toggle();
         ui::segment_end();
         ImGui::SameLine(0, 10);
         const DMSEmbed* g = play_shared();
@@ -670,6 +763,8 @@ static void shortcuts() {
         else if (ps == PlayState::Running || ps == PlayState::Paused) play_stop();
         else play_start();
     }
+    if (ctrl && ImGui::IsKeyPressed(ImGuiKey_PageDown)) step_scene(1);
+    if (ctrl && ImGui::IsKeyPressed(ImGuiKey_PageUp)) step_scene(-1);
     if (ImGui::IsKeyPressed(ImGuiKey_Delete)) ed_delete();
 }
 
@@ -685,7 +780,7 @@ static std::string absolute_dir(const char* path) {
 
 int main(int argc, char** argv) {
     const char* project = ".";
-    const char* scene = "scenes/main.json";
+    const char* scene = nullptr;      /* the last one open, else main.json, else the first */
     const char* shot_out = nullptr;
     const char* ui_shot = nullptr;
     const char* select = nullptr;
@@ -719,6 +814,20 @@ int main(int argc, char** argv) {
     dc_init(params);
     ed_scan_assets();
     struct stat st;
+    std::string remembered;
+    if (!scene) {
+        if (FILE* f = fopen(last_scene_file().c_str(), "r")) {
+            char line[256] = "";
+            if (fgets(line, sizeof(line), f)) remembered = std::string(line).substr(0, strcspn(line, "\n"));
+            fclose(f);
+        }
+        if (!remembered.empty() && std::find(ed.scenes.begin(), ed.scenes.end(), remembered) != ed.scenes.end())
+            scene = remembered.c_str();
+        else if (std::find(ed.scenes.begin(), ed.scenes.end(), "scenes/main.json") == ed.scenes.end() && !ed.scenes.empty())
+            scene = ed.scenes.front().c_str();
+        else
+            scene = "scenes/main.json";
+    }
     if (!stat((ed.project + "assets/" + scene).c_str(), &st)) ed_open(scene);
     else if (shot_out) { fprintf(stderr, "No scene assets/%s\n", scene); return 1; }
     else ed_new(scene);

@@ -13,8 +13,11 @@
 // The primary buffer is read back and written to the frame buffer by
 // flush_tile_to_framebuffer, as a tile is.
 //
-// What it does not do goes back to the tiles for that render: auto-sort,
-// modifier volumes, a polygon in a tile set that is not a rectangle (user
+// Auto-sort keeps each pixel's translucent fragments, the 8 nearest sorted by
+// depth as they come (one farther than all 8 is blended at once), and a
+// second pass blends them back to front, as Flycast's OIT does.
+//
+// What it does not do goes back to the tiles for that render: modifier volumes, a polygon in a tile set that is not a rectangle (user
 // clip "outside"), tiles that keep their buffers (z_clear) or appear twice.
 // ============================================================================
 
@@ -29,6 +32,7 @@
 #include <algorithm>
 #include <unordered_map>
 #include <vector>
+#include <string>
 
 namespace pvr {
 
@@ -136,6 +140,10 @@ layout(std430, binding = 2) readonly buffer RegBuf { uint pal[1024]; uint fogt[1
 layout(binding = 0, r32ui) coherent uniform uimage2D img_prim;
 layout(binding = 1, r32ui) coherent uniform uimage2D img_sec;
 layout(binding = 2, r32f) coherent uniform image2D img_depth;
+layout(binding = 3, r32ui) coherent uniform uimage2D img_count;    // auto-sort layers held
+layout(std430, binding = 3) coherent buffer LayerBuf { uvec4 layers[]; };   // z, colour, TSP
+uniform uint u_stride;
+const uint LAYERS = 8u;
 uniform uint u_vram_mask;
 uniform uint u_half;       // HALF_OFFSET
 uniform uint u_pt_ref;
@@ -407,6 +415,19 @@ uvec4 blend_factor(uint ins, uvec4 src, uvec4 dst, bool is_src) {
     return uvec4(255u - dst.a);
 }
 
+// a translucent fragment into the accumulation buffers
+void blend_px(ivec2 p, uvec4 shaded, uint tsp) {
+    bool ssel = ((tsp >> 25) & 1u) != 0u, dsel = ((tsp >> 24) & 1u) != 0u;
+    uvec4 sec = (ssel || dsel) ? unpack(imageLoad(img_sec, p).r) : uvec4(0u);
+    uvec4 src = ssel ? sec : shaded;
+    uvec4 dst = dsel ? sec : unpack(imageLoad(img_prim, p).r);
+    uvec4 sf = blend_factor(tsp >> 29, src, dst, true);
+    uvec4 df = blend_factor((tsp >> 26) & 7u, src, dst, false);
+    uint res = pack(add_sat(modulate(src, sf), modulate(dst, df)));
+    if (dsel) imageStore(img_sec, p, uvec4(res));
+    else imageStore(img_prim, p, uvec4(res));
+}
+
 bool depth_test(uint mode, float z, float cur) {
     if (mode == 0u) return false;
     if (mode == 1u) return z < cur;
@@ -504,7 +525,35 @@ void main() {
     // ---- the ISP depth test and the accumulation buffers, in primitive order ----
     beginInvocationInterlockARB();
     float cur = imageLoad(img_depth, p).r;
-    bool pass = depth_test(isp >> 29, z, cur);
+    if ((fl & 64u) != 0u) {
+        // auto-sort: always GreaterOrEqual, kept to blend later, farthest first;
+        // equal depths stay in the order given
+        if (z >= cur) {
+            uint base = (uint(p.y) * u_stride + uint(p.x)) * LAYERS;
+            uint n = imageLoad(img_count, p).r;
+            bool keep = true;
+            if (n == LAYERS) {
+                if (z < uintBitsToFloat(layers[base].x)) {
+                    blend_px(p, shaded, tsp);
+                    keep = false;
+                } else {
+                    blend_px(p, unpack(layers[base].y), layers[base].z);
+                    for (uint i = 0u; i + 1u < LAYERS; i++) layers[base + i] = layers[base + i + 1u];
+                    n = LAYERS - 1u;
+                }
+            }
+            if (keep) {
+                uint i = n;
+                while (i > 0u && uintBitsToFloat(layers[base + i - 1u].x) > z) {
+                    layers[base + i] = layers[base + i - 1u];
+                    i--;
+                }
+                layers[base + i] = uvec4(floatBitsToUint(z), pack(shaded), tsp, 0u);
+                imageStore(img_count, p, uvec4(n + 1u));
+            }
+        }
+    }
+    bool pass = (fl & 64u) == 0u && depth_test(isp >> 29, z, cur);
     if (list == 4u) {
         if (pass && shaded.a < u_pt_ref) pass = false;
         if (pass && !zwd) imageStore(img_depth, p, vec4(z));
@@ -512,30 +561,38 @@ void main() {
         imageStore(img_depth, p, vec4(z));
     }
     if (pass) {
-        if (list != 2u) {
-            imageStore(img_prim, p, uvec4(pack(shaded)));
-        } else {
-            bool ssel = ((tsp >> 25) & 1u) != 0u, dsel = ((tsp >> 24) & 1u) != 0u;
-            uvec4 sec = (ssel || dsel) ? unpack(imageLoad(img_sec, p).r) : uvec4(0u);
-            uvec4 src = ssel ? sec : shaded;
-            uvec4 dst = dsel ? sec : unpack(imageLoad(img_prim, p).r);
-            uvec4 sf = blend_factor(tsp >> 29, src, dst, true);
-            uvec4 df = blend_factor((tsp >> 26) & 7u, src, dst, false);
-            uint res = pack(add_sat(modulate(src, sf), modulate(dst, df)));
-            if (dsel) imageStore(img_sec, p, uvec4(res));
-            else imageStore(img_prim, p, uvec4(res));
-        }
+        if (list != 2u) imageStore(img_prim, p, uvec4(pack(shaded)));
+        else blend_px(p, shaded, tsp);
     }
     endInvocationInterlockARB();
+}
+)";
+
+// The auto-sort pass: one fragment a pixel, its layers blended farthest first
+const char *kResolveVertex = R"(#version 430 core
+flat out uint v_tri;
+void main() {
+    uint k = uint(gl_VertexID);
+    v_tri = 0u;
+    gl_Position = vec4(k == 1u ? 3.0 : -1.0, k == 2u ? 3.0 : -1.0, 0.0, 1.0);
+}
+)";
+const char *kResolveMain = R"(
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    uint n = imageLoad(img_count, p).r;
+    uint base = (uint(p.y) * u_stride + uint(p.x)) * LAYERS;
+    for (uint i = 0u; i < n; i++) blend_px(p, unpack(layers[base + i].y), layers[base + i].z);
 }
 )";
 
 struct GlState {
     SDL_Window *win = nullptr;
     SDL_GLContext ctx = nullptr;
-    GLuint prog = 0, vao = 0, fbo = 0;
-    GLuint tri_buf = 0, vram_buf = 0, reg_buf = 0;
-    GLuint tex[3] = {0, 0, 0};
+    GLuint prog = 0, resolve = 0, vao = 0, fbo = 0;
+    GLuint tri_buf = 0, vram_buf = 0, reg_buf = 0, layer_buf = 0;
+    GLuint tex[4] = {0, 0, 0, 0};       // primary, secondary, depth, auto-sort layer count
+    GLint u_stride = -1, u_stride_resolve = -1;
     int w = 0, h = 0;
     size_t tri_cap = 0;
     std::vector<uint8_t> shadow;   // PVR memory as last uploaded
@@ -578,6 +635,22 @@ GLuint compile(GLenum type, const char *src) {
     return s;
 }
 
+GLuint link(GLuint vs, GLuint fs) {
+    GLuint prog = gl.gl_CreateProgram();
+    gl.gl_AttachShader(prog, vs);
+    gl.gl_AttachShader(prog, fs);
+    gl.gl_LinkProgram(prog);
+    GLint ok = 0;
+    gl.gl_GetProgramiv(prog, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[4096];
+        gl.gl_GetProgramInfoLog(prog, sizeof log, nullptr, log);
+        std::fprintf(stderr, "pvr: gpu: link: %s\n", log);
+        return 0;
+    }
+    return prog;
+}
+
 bool gl_init() {
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 4);
@@ -598,34 +671,35 @@ bool gl_init() {
 #undef X
     GLuint vs = compile(GL_VERTEX_SHADER, kVertex);
     GLuint fs = compile(GL_FRAGMENT_SHADER, kFragment);
-    if (!vs || !fs) {
+    // the resolve: the same helpers, its own main, no interlock (a fragment a pixel)
+    std::string rsrc = kFragment;
+    rsrc.erase(rsrc.find("#extension"), rsrc.find("struct Tri") - rsrc.find("#extension"));
+    rsrc.erase(rsrc.find("void main() {"));
+    rsrc += kResolveMain;
+    GLuint rvs = compile(GL_VERTEX_SHADER, kResolveVertex);
+    GLuint rfs = compile(GL_FRAGMENT_SHADER, rsrc.c_str());
+    if (!vs || !fs || !rvs || !rfs) {
         std::fprintf(stderr, "pvr: gpu: the shaders do not compile on %s: the software tiles\n",
                      reinterpret_cast<const char *>(gl.gl_GetString(GL_RENDERER)));
         return false;
     }
-    G->prog = gl.gl_CreateProgram();
-    gl.gl_AttachShader(G->prog, vs);
-    gl.gl_AttachShader(G->prog, fs);
-    gl.gl_LinkProgram(G->prog);
-    GLint ok = 0;
-    gl.gl_GetProgramiv(G->prog, GL_LINK_STATUS, &ok);
-    if (!ok) {
-        char log[4096];
-        gl.gl_GetProgramInfoLog(G->prog, sizeof log, nullptr, log);
-        std::fprintf(stderr, "pvr: gpu: link: %s\n", log);
-        return false;
-    }
+    G->prog = link(vs, fs);
+    G->resolve = link(rvs, rfs);
+    if (!G->prog || !G->resolve) return false;
+    G->u_stride = gl.gl_GetUniformLocation(G->prog, "u_stride");
+    G->u_stride_resolve = gl.gl_GetUniformLocation(G->resolve, "u_stride");
 #define U(n) G->n = gl.gl_GetUniformLocation(G->prog, #n);
     U(u_screen) U(u_vram_mask) U(u_half) U(u_pt_ref) U(u_pal_fmt) U(u_text_stride)
     U(u_fog_col_ram) U(u_fog_col_vert) U(u_fog_density) U(u_clamp_min) U(u_clamp_max) U(u_edge_margin)
 #undef U
     gl.gl_GenVertexArrays(1, &G->vao);
     gl.gl_GenFramebuffers(1, &G->fbo);
-    GLuint b[3];
-    gl.gl_GenBuffers(3, b);
+    GLuint b[4];
+    gl.gl_GenBuffers(4, b);
     G->tri_buf = b[0];
     G->vram_buf = b[1];
     G->reg_buf = b[2];
+    G->layer_buf = b[3];
     std::fprintf(stderr, "pvr: gpu: %s\n", reinterpret_cast<const char *>(gl.gl_GetString(GL_RENDERER)));
     return true;
 }
@@ -659,15 +733,17 @@ void size_images(int w, int h) {
     if (w <= G->w && h <= G->h) return;
     w = std::max(w, G->w);
     h = std::max(h, G->h);
-    if (G->tex[0]) gl.gl_DeleteTextures(3, G->tex);
-    gl.gl_GenTextures(3, G->tex);
-    for (int i = 0; i < 3; i++) {
+    if (G->tex[0]) gl.gl_DeleteTextures(4, G->tex);
+    gl.gl_GenTextures(4, G->tex);
+    for (int i = 0; i < 4; i++) {
         gl.gl_BindTexture(GL_TEXTURE_2D, G->tex[i]);
         gl.gl_TexStorage2D(GL_TEXTURE_2D, 1, i == 2 ? GL_R32F : GL_R32UI, w, h);
     }
     G->w = w;
     G->h = h;
     G->readback.resize(static_cast<size_t>(w) * h);
+    gl.gl_BindBuffer(GL_SHADER_STORAGE_BUFFER, G->layer_buf);
+    gl.gl_BufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(w) * h * 8 * 16, nullptr, GL_DYNAMIC_DRAW);
 }
 
 float bits_f(uint32_t b) { float f; std::memcpy(&f, &b, 4); return f; }
@@ -774,20 +850,13 @@ bool CORE::render_gl(const std::vector<RegionArrayEntry> &tiles) {
         return true;
     };
 
+    bool auto_sort = false;     // the translucent list is sorted here (all tiles alike)
     for (const RegionArrayEntry &r : tiles) {
         G->copies.clear();
         if (!walk(r, ListType::Opaque, 0) || !walk(r, ListType::PunchThrough, 1) ||
             !walk(r, ListType::OpaqueModifierVolume, 0))
             return false;
-        if (!r.list_pointers[static_cast<int>(ListType::Translucent)].empty && !r.pre_sort) {
-            // an auto-sort list that holds nothing is no matter
-            uint32_t w = vram_read32(r.list_pointers[static_cast<int>(ListType::Translucent)].byte_address());
-            ObjectPointer op = ObjectPointer::parse(w);
-            if (w != 0 && !(op.type == ObjectPointer::Type::PointerBlockLink && op.end_of_list)) {
-                report_once("auto-sort");
-                return false;
-            }
-        }
+        if (!r.list_pointers[static_cast<int>(ListType::Translucent)].empty && !r.pre_sort) auto_sort = true;
         if (!walk(r, ListType::Translucent, 2)) return false;
     }
     std::sort(G->prims.begin(), G->prims.end(), [](const GlPrim &a, const GlPrim &b) { return a.key < b.key; });
@@ -839,7 +908,7 @@ bool CORE::render_gl(const std::vector<RegionArrayEntry> &tiles) {
         t.c0 = v0.base_color; t.c1 = v1.base_color; t.c2 = v2.base_color; t.isp = isp_w;
         t.o0 = v0.offset_color; t.o1 = v1.offset_color; t.o2 = v2.offset_color; t.tsp = tsp_w;
         t.tcw = tcw_w;
-        t.flags = static_cast<uint32_t>(lt) | (fill(v1.x, v1.y, v2.x, v2.y) ? 8u : 0u) |
+        t.flags = static_cast<uint32_t>(lt) | (auto_sort && lt == ListType::Translucent ? 64u : 0u) | (fill(v1.x, v1.y, v2.x, v2.y) ? 8u : 0u) |
                   (fill(v2.x, v2.y, v0.x, v0.y) ? 16u : 0u) | (fill(v0.x, v0.y, v1.x, v1.y) ? 32u : 0u);
         t.bb0 = static_cast<uint32_t>(ix0) | (static_cast<uint32_t>(iy0) << 16);
         t.bb1 = static_cast<uint32_t>(ix1) | (static_cast<uint32_t>(iy1) << 16);
@@ -965,7 +1034,7 @@ bool CORE::render_gl(const std::vector<RegionArrayEntry> &tiles) {
                      G->tris.empty() ? nullptr : G->tris.data(), GL_STREAM_DRAW);
 
     const uint32_t zero = 0;
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 4; i++)
         gl.gl_ClearTexImage(G->tex[i], 0, i == 2 ? GL_RED : GL_RED_INTEGER, i == 2 ? GL_FLOAT : GL_UNSIGNED_INT, &zero);
 
     gl.gl_BindFramebuffer(GL_FRAMEBUFFER, G->fbo);
@@ -984,6 +1053,9 @@ bool CORE::render_gl(const std::vector<RegionArrayEntry> &tiles) {
     gl.gl_BindImageTexture(0, G->tex[0], 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
     gl.gl_BindImageTexture(1, G->tex[1], 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
     gl.gl_BindImageTexture(2, G->tex[2], 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
+    gl.gl_BindImageTexture(3, G->tex[3], 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
+    gl.gl_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, G->layer_buf);
+    gl.gl_Uniform1ui(G->u_stride, static_cast<GLuint>(G->w));
 
     static float edge = -1.0f;
     if (edge < 0.0f) {
@@ -1005,6 +1077,12 @@ bool CORE::render_gl(const std::vector<RegionArrayEntry> &tiles) {
 
     if (!G->tris.empty())
         gl.gl_DrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(G->tris.size() * 6));
+    if (auto_sort) {
+        gl.gl_MemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
+        gl.gl_UseProgram(G->resolve);
+        gl.gl_Uniform1ui(G->u_stride_resolve, static_cast<GLuint>(G->w));
+        gl.gl_DrawArrays(GL_TRIANGLES, 0, 3);
+    }
 
     if (timing) gl.gl_Finish();
     uint64_t t4 = SDL_GetTicksNS();

@@ -80,12 +80,21 @@ void ed_edited();
 void ed_undo();
 void ed_redo();
 bool ed_save();
+void ed_switch_scene(const std::string& rel);   /* save, stop the game, open */
 bool ed_open(const std::string& scene_rel);
 void ed_new(const std::string& scene_rel);
 void ed_scan_assets();
 /* make <what> in the project, in the background; then() after, on this thread */
 void ed_run(const std::string& what, std::function<void(bool ok)> then = nullptr);
-void ed_log_async(const char* line);    /* from another thread */
+void ed_log_async(const char* line);
+const char* ed_job();           /* the make target running, or NULL */
+void ed_job_stop();
+std::string ed_project_name();  /* its folder's name, as make's NAME */
+/* On the Dreamcast: make run (KOS_LOADER: dc-tool-ip and the like); again stops it */
+void dc_run_toggle();
+/* In Flycast: make disc, then the .cdi in it; again closes it */
+void flycast_toggle();
+bool flycast_running();    /* from another thread */
 void ed_add_model(const std::string& model);
 void ed_add_light();
 void ed_add_marker();

@@ -27,13 +27,14 @@ the repo root:
 | `make teapot` | Converts `examples/teapot/assets/` into `examples/teapot/pc/` and builds `build/teapot/teapot.elf` |
 | `make teapot/run` | Sends the ELF with `dc-tool`, serving `pc/` as `/pc/` |
 | `make teapot/disc` | Builds `build/teapot/teapot.cdi`, reading from `/cd/` with `pc/` as the disc root (needs `mkdcdisc`) |
+| `make teapot/flycast` | Builds the disc image and opens it in Flycast (`FLYCAST=...` if it is not on the PATH) |
 | `make teapot/assets` | Converts assets only |
 | `make teapot/clean`, `make teapot/assets-clean` | Removes `build/teapot/` or `pc/` |
 | `make all` / `make list` | Builds or lists every project |
 | `make teapot/host-run` | Builds and runs the game on Linux (needs 32-bit SDL3; no KOS needed) |
 | `make teapot/shot` | Runs 60 frames without a window and writes `build/teapot/shot.png` |
 | `make teapot/check` | Runs each scene 300 frames without a window: a line each saying whether it finished, its peak RAM and its warnings (a missing texture, a file that won't load). The Linux build has 32 MB; a `!` marks a peak past a retail Dreamcast's 16 |
-| `make teapot/edit` | Opens `assets/scenes/main.json` in the scene editor (`SCENE=...` for another) |
+| `make teapot/edit` | Opens the scene editor on the scene last open (`SCENE=...` for another); the toolbar switches scenes, as do Ctrl+PgUp / Ctrl+PgDn |
 | `make teapot/scene-shot` | That scene drawn by the engine to `build/teapot/scene.png` |
 | `make editor` | Builds the editor alone (`build/editor/dms-editor`) |
 

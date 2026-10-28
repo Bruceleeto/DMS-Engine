@@ -84,6 +84,12 @@ bool icon_button(const char* id, const char* icon, const char* tip, bool on = fa
 /* Buttons joined into one bar, as the toolbar's tools are */
 void segment_begin();
 bool segment_button(const char* id, const char* icon, const char* tip, bool on, bool first, bool last);
+/* The same with a swirl for its icon, in col; it turns while busy */
+bool segment_swirl(const char* id, ImU32 col, const char* tip, bool on, bool busy, bool first, bool last);
+/* A swirl about centre, radius across, turned by angle (radians) */
+void swirl(ImDrawList* dl, ImVec2 centre, float radius, ImU32 col, float angle = 0.0f);
+constexpr ImU32 DREAMCAST = IM_COL32(240, 132, 40, 255);   /* the console's orange */
+constexpr ImU32 FLYCAST   = IM_COL32(150, 90, 245, 255);
 void segment_end();
 /* x, y, z each with its coloured tag, dragged as one */
 bool drag_xyz(const char* label, float v[3], float speed, const char* fmt, float reset);

@@ -175,6 +175,45 @@ bool segment_button(const char* id, const char* icon, const char* tip, bool on, 
     return pressed;
 }
 
+void swirl(ImDrawList* dl, ImVec2 c, float radius, ImU32 col, float angle) {
+    /* two and a half turns out from the middle, clockwise on screen, the
+     * stroke a sixth of the radius; the line between turns is as wide */
+    const int n = 72;
+    const float turns = 2.4f, start = 0.15f;
+    ImVec2 pts[n];
+    for (int i = 0; i < n; i++) {
+        float t = (float)i / (n - 1);
+        float a = angle + t * turns * 6.2831853f;
+        float r = radius * (start + (1.0f - start) * t);
+        pts[i] = ImVec2(c.x + cosf(a) * r, c.y + sinf(a) * r);
+    }
+    float thick = radius * 0.17f;
+    dl->AddPolyline(pts, n, col, ImDrawFlags_None, thick);
+    dl->AddCircleFilled(pts[0], thick * 0.5f, col);
+    dl->AddCircleFilled(pts[n - 1], thick * 0.5f, col);
+}
+
+bool segment_swirl(const char* id, ImU32 col, const char* tip, bool on, bool busy, bool first, bool last) {
+    float h = ImGui::GetFrameHeight() + 2, w = h + 6;
+    ImGui::PushID(id);
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    bool pressed = ImGui::InvisibleButton("##s", ImVec2(w, h));
+    bool hover = ImGui::IsItemHovered();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    float r = ImGui::GetStyle().FrameRounding;
+    ImDrawFlags corners = (first ? ImDrawFlags_RoundCornersLeft : 0) | (last ? ImDrawFlags_RoundCornersRight : 0);
+    if (!first && !last) corners = ImDrawFlags_RoundCornersNone;
+    ImU32 bg = on ? col : hover ? ImGui::GetColorU32(ImGuiCol_ButtonHovered) : ImGui::GetColorU32(ImGuiCol_Button);
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), bg, r, corners);
+    if (!last) dl->AddLine(ImVec2(p.x + w - 0.5f, p.y + 5), ImVec2(p.x + w - 0.5f, p.y + h - 5), IM_COL32(0, 0, 0, 90));
+    float spin = busy ? (float)ImGui::GetTime() * 5.0f : 0.0f;
+    swirl(dl, ImVec2(p.x + w * 0.5f, p.y + h * 0.5f), h * 0.32f, on ? IM_COL32_WHITE : col, spin);
+    ImGui::PopID();
+    tooltip(tip);
+    if (!last) ImGui::SameLine();
+    return pressed;
+}
+
 void segment_end() {
     ImGui::EndGroup();
     ImGui::PopStyleVar();
@@ -247,7 +286,8 @@ void meter(const char* label, float used, float total, const char* unit, float w
     if (k > 0) dl->AddRectFilled(p, ImVec2(p.x + width * (k > 1 ? 1 : k), p.y + h), (col & 0x00FFFFFF) | 0x90000000, r);
     if (limit > 0 && limit < total) {
         float x = p.x + width * limit / total;
-        dl->AddLine(ImVec2(x, p.y + 3), ImVec2(x, p.y + h - 3), IM_COL32(255, 255, 255, 110), 1.5f);
+        dl->AddLine(ImVec2(x, p.y), ImVec2(x, p.y + 5), IM_COL32(255, 255, 255, 140), 1.5f);
+        dl->AddLine(ImVec2(x, p.y + h - 5), ImVec2(x, p.y + h), IM_COL32(255, 255, 255, 140), 1.5f);
     }
     char text[96];
     snprintf(text, sizeof(text), "%s  %.1f / %.0f %s", label, used, total, unit);

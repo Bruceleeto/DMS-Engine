@@ -10,6 +10,7 @@
 #
 # make           convert assets into pc/ and build build/<name>/<name>.elf
 # make run       send the ELF with dc-tool, serving pc/ as /pc
+# make flycast   build the disc image and open it in Flycast
 # make disc      build build/<name>/<name>.cdi with pc/ as the disc root
 # make assets    convert assets/ only
 # make clean     remove build/<name>/      make assets-clean   remove pc/
@@ -20,7 +21,7 @@
 # make shot      render SHOT_FRAMES frames without a window -> build/<name>/shot.png
 # make check     run each scene CHECK_FRAMES frames without a window: a line
 #                each (finished? peak RAM? warnings?), no screenshots needed
-# make edit      open assets/$(SCENE) (scenes/main.json) in the scene editor
+# make edit      open the scene editor: on the scene last open, or SCENE=scenes/x.json
 # make scene-shot  that scene drawn by the engine -> build/<name>/scene.png
 
 # Only the Dreamcast build needs KOS; the Linux build and .glb conversion don't.
@@ -52,7 +53,7 @@ ENGINE_OBJS = $(addprefix $(OUT)/dms/,$(addsuffix .o,$(ENGINE)))
 OBJS        = $(addprefix $(OUT)/dc/,$(SRCS:.c=.o))
 DISC_OBJS   = $(addprefix $(OUT)/disc/,$(SRCS:.c=.o))
 
-.PHONY: all assets assets-clean clean run disc dist host host-run shot check
+.PHONY: all assets assets-clean clean run disc flycast dist host host-run shot check
 all: assets $(ELF)
 
 $(OUT)/dms/%.o: $(DMS_ROOT)/dms/%.c
@@ -71,10 +72,15 @@ $(OUT)/$(NAME)-disc.elf: $(DISC_OBJS) $(ENGINE_OBJS)
 	$(DC_CC) -o $@ $^ $(LIBS)
 
 run: all
-	$(KOS_LOADER) $(ELF) -c $(PC)
+	$(KOS_LOADER) $(ELF) -m $(CURDIR)/$(PC)
 
 disc: assets $(OUT)/$(NAME)-disc.elf
 	mkdcdisc -e $(OUT)/$(NAME)-disc.elf -D $(PC) -o $(CDI) -N
+
+# The disc image in the Flycast emulator (FLYCAST=/path/to/flycast if it isn't on the PATH)
+FLYCAST ?= flycast
+flycast: disc
+	$(FLYCAST) $(CDI)
 
 dist: $(ELF)
 	$(KOS_STRIP) $(ELF)
@@ -160,12 +166,12 @@ $(PC)/%.json: assets/%.json
 # The scene editor on this project (tools/editor), and its scene drawn by the
 # engine to a PNG without a window: make scene-shot SCENE=scenes/main.json
 EDITOR = $(DMS_ROOT)/build/editor/dms-editor
-SCENE ?= scenes/main.json
+SCENE ?=
 .PHONY: edit scene-shot
 $(EDITOR): FORCE
 	$(MAKE) -C $(DMS_ROOT)/tools/editor
 FORCE:
 edit: assets $(EDITOR)
-	$(EDITOR) $(CURDIR) --scene $(SCENE)
+	$(EDITOR) $(CURDIR) $(if $(SCENE),--scene $(SCENE))
 scene-shot: assets $(EDITOR)
-	$(EDITOR) $(CURDIR) --scene $(SCENE) --shot $(OUT)/scene.png
+	$(EDITOR) $(CURDIR) --scene $(or $(SCENE),scenes/main.json) --shot $(OUT)/scene.png

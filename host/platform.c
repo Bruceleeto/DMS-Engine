@@ -1,5 +1,6 @@
 #include <kos.h>
 #include <SDL3/SDL.h>
+#include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include "pvr_host.h"
@@ -12,8 +13,10 @@
 
 void DCSim_Info(int* inuse, int* freebytes);
 
-static maple_device_t keyboard = {0};
-static cont_state_t state;
+static maple_device_t ports[2] = { { 0, 0 }, { 1, 0 } };
+static cont_state_t state, state2;      /* port 1 (the keyboard and a pad), port 2 (a second pad) */
+static bool use_pads;                   /* not in a scripted --headless run */
+static SDL_Gamepad* pads[2];
 static unsigned frame_limit, frames;
 static bool quit, headless;
 static const char* shot_path;
@@ -58,17 +61,89 @@ static void save_shot(void) {
     else printf("shot: %s\n", shot_path);
 }
 
-maple_device_t* maple_enum_type(int port, int function) {
-    return port == 0 && function == MAPLE_FUNC_CONTROLLER ? &keyboard : NULL;
+/* ---- Gamepads: any SDL knows (Xbox, PlayStation, Switch...) as a
+ * Dreamcast pad, by where the buttons are: the bottom one is A, the right
+ * B, the left X, the top Y; the left stick, the d-pad, the triggers,
+ * Start (and Back) Start. The first is port 1 with the keyboard; a second
+ * is port 2. */
+
+static void pads_refresh(void) {
+    for (int i = 0; i < 2; i++)
+        if (pads[i] && !SDL_GamepadConnected(pads[i])) { SDL_CloseGamepad(pads[i]); pads[i] = NULL; }
+    if (!pads[0] && pads[1]) { pads[0] = pads[1]; pads[1] = NULL; }
+    int n;
+    SDL_JoystickID* ids = SDL_GetGamepads(&n);
+    for (int k = 0; ids && k < n; k++) {
+        if ((pads[0] && SDL_GetGamepadID(pads[0]) == ids[k]) || (pads[1] && SDL_GetGamepadID(pads[1]) == ids[k])) continue;
+        int slot = !pads[0] ? 0 : !pads[1] ? 1 : -1;
+        if (slot < 0) break;
+        if ((pads[slot] = SDL_OpenGamepad(ids[k])))
+            printf("pad: %s is port %d\n", SDL_GetGamepadName(pads[slot]), slot + 1);
+    }
+    SDL_free(ids);
 }
 
-void* maple_dev_status(maple_device_t* device) {
-    (void)device;
-    if (embed) { embed_frame(); return &state; }
+static int axis8(SDL_Gamepad* g, SDL_GamepadAxis a) {
+    int v = SDL_GetGamepadAxis(g, a) / 256;     /* -128 to 127 */
+    return v < -128 ? -128 : v > 127 ? 127 : v;
+}
+
+/* The pad on top of what the keyboard has: buttons together, the stick
+ * whichever is pushed further */
+static void pad_read(SDL_Gamepad* g, cont_state_t* s) {
+    if (!g) return;
+    static const struct { SDL_GamepadButton b; uint32_t cont; } map[] = {
+        { SDL_GAMEPAD_BUTTON_SOUTH, CONT_A }, { SDL_GAMEPAD_BUTTON_EAST, CONT_B },
+        { SDL_GAMEPAD_BUTTON_WEST, CONT_X },  { SDL_GAMEPAD_BUTTON_NORTH, CONT_Y },
+        { SDL_GAMEPAD_BUTTON_START, CONT_START }, { SDL_GAMEPAD_BUTTON_BACK, CONT_START },
+        { SDL_GAMEPAD_BUTTON_DPAD_UP, CONT_DPAD_UP }, { SDL_GAMEPAD_BUTTON_DPAD_DOWN, CONT_DPAD_DOWN },
+        { SDL_GAMEPAD_BUTTON_DPAD_LEFT, CONT_DPAD_LEFT }, { SDL_GAMEPAD_BUTTON_DPAD_RIGHT, CONT_DPAD_RIGHT },
+    };
+    for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++)
+        if (SDL_GetGamepadButton(g, map[i].b)) s->buttons |= map[i].cont;
+    int x = axis8(g, SDL_GAMEPAD_AXIS_LEFTX), y = axis8(g, SDL_GAMEPAD_AXIS_LEFTY);
+    if (abs(x) > abs(s->joyx)) s->joyx = x;
+    if (abs(y) > abs(s->joyy)) s->joyy = y;
+    s->joy2x = axis8(g, SDL_GAMEPAD_AXIS_RIGHTX);
+    s->joy2y = axis8(g, SDL_GAMEPAD_AXIS_RIGHTY);
+    unsigned lt = SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) / 128;
+    unsigned rt = SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) / 128;
+    if (lt > s->ltrig) s->ltrig = lt > 255 ? 255 : lt;
+    if (rt > s->rtrig) s->rtrig = rt > 255 ? 255 : rt;
+}
+
+maple_device_t* maple_enum_type(int port, int function) {
+    if (function != MAPLE_FUNC_CONTROLLER) return NULL;
+    if (port == 0) return &ports[0];
+    return port == 1 && pads[1] ? &ports[1] : NULL;
+}
+
+static void poll_events(void) {
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
         if (event.type == SDL_EVENT_QUIT) quit = true;
+        if (event.type == SDL_EVENT_GAMEPAD_ADDED || event.type == SDL_EVENT_GAMEPAD_REMOVED) pads_refresh();
     }
+}
+
+static cont_state_t* port1(void);
+
+void* maple_dev_status(maple_device_t* device) {
+    if (device->port == 1) {
+        memset(&state2, 0, sizeof(state2));
+        pad_read(pads[1], &state2);
+        return &state2;
+    }
+    return port1();
+}
+
+static cont_state_t* port1(void) {
+    if (embed) {
+        embed_frame();
+        if (use_pads) { poll_events(); pad_read(pads[0], &state); }
+        return &state;
+    }
+    poll_events();
     const bool* keys = SDL_GetKeyboardState(NULL);
     memset(&state, 0, sizeof(state));
     bool done = frame_limit && ++frames >= frame_limit;
@@ -86,6 +161,7 @@ void* maple_dev_status(maple_device_t* device) {
     state.joyx = 100 * (keys[SDL_SCANCODE_RIGHT] - keys[SDL_SCANCODE_LEFT]);
     state.joyy = 100 * (keys[SDL_SCANCODE_DOWN] - keys[SDL_SCANCODE_UP]);
     state.rtrig = keys[SDL_SCANCODE_LSHIFT] ? 255 : 0;
+    if (use_pads && !done) pad_read(pads[0], &state);
     if (!headless) SDL_Delay(1);
     return &state;
 }
@@ -124,11 +200,16 @@ int main(int argc, char** argv) {
         headless = true;
         setvbuf(stdout, NULL, _IOLBF, 0);   /* the editor's console reads it as it comes */
     }
-    if (!SDL_Init(SDL_INIT_EVENTS | (headless ? 0 : SDL_INIT_VIDEO))) {
+    /* Pads in a window, and in the editor's Game tab (whether or not it has
+     * the keyboard); never in a scripted run, where they would change it */
+    use_pads = !headless || embed;
+    if (use_pads) SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    if (!SDL_Init(SDL_INIT_EVENTS | (headless ? 0 : SDL_INIT_VIDEO) | (use_pads ? SDL_INIT_GAMEPAD : 0))) {
         fprintf(stderr, "SDL: %s\n", SDL_GetError()); return 1;
     }
+    if (use_pads) pads_refresh();
     if (!headless && pvr_host_open("DMS — desktop preview", 1)) { SDL_Quit(); return 1; }
-    puts("DMS preview: WASD move, arrows look, Space jump, Shift sprint, R reset, Escape exit");
+    puts("DMS preview: WASD move, arrows look, Space jump, Shift sprint, R reset, Escape exit; or a gamepad");
     int result = dms_game_main(argc, argv);
     pvr_host_close();
     SDL_Quit();

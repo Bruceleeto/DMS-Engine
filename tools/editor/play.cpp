@@ -40,8 +40,7 @@ static bool map_shared() {
 }
 
 static void launch() {
-    std::string name = ed.project.substr(0, ed.project.size() - 1);
-    name = name.substr(name.find_last_of('/') + 1);
+    std::string name = ed_project_name();
     std::string exe = ed.root + "build/" + name + "/host/" + name;
     if (!map_shared()) { ed_log("Play: cannot make %s", shm_path.c_str()); return; }
     memset(shm, 0, sizeof(*shm));
@@ -117,7 +116,49 @@ void play_step() {
     shm->step = 1;
 }
 
+/* ---- On a Dreamcast, and in Flycast ---- */
+
+static pid_t flycast_pid;
+
+void dc_run_toggle() {
+    const char* job = ed_job();
+    if (job && !strcmp(job, "run")) { ed_job_stop(); return; }
+    if (ed.dirty) ed_save();
+    ed_log("To the Dreamcast: KOS_LOADER in environ.sh says how (dc-tool-ip -t <ip>)");
+    ed_run("run");
+}
+
+bool flycast_running() { return flycast_pid > 0; }
+
+void flycast_toggle() {
+    if (flycast_pid > 0) { kill(flycast_pid, SIGTERM); return; }
+    if (ed.dirty) ed_save();
+    ed_run("disc", [](bool ok) {
+        if (!ok) { ed_log("Flycast: the disc image did not build (mkdcdisc on the PATH?)"); return; }
+        std::string name = ed_project_name();
+        std::string cdi = ed.root + "build/" + name + "/" + name + ".cdi";
+        const char* flycast = getenv("FLYCAST") ? getenv("FLYCAST") : "flycast";
+        pid_t pid = fork();
+        if (pid == 0) {
+            setsid();
+            int null = open("/dev/null", O_RDWR);
+            dup2(null, 0); dup2(null, 1); dup2(null, 2);
+            execlp(flycast, flycast, cdi.c_str(), (char*)nullptr);
+            _exit(127);
+        }
+        if (pid < 0) { ed_log("Flycast: cannot start %s", flycast); return; }
+        flycast_pid = pid;
+        ed_log("Flycast: %s", cdi.c_str());
+    });
+}
+
 void play_poll() {
+    int fstatus;
+    if (flycast_pid > 0 && waitpid(flycast_pid, &fstatus, WNOHANG) == flycast_pid) {
+        if (WIFEXITED(fstatus) && WEXITSTATUS(fstatus) == 127) ed_log("Flycast: not found (set FLYCAST to where it is)");
+        else ed_log("Flycast closed");
+        flycast_pid = 0;
+    }
     if (!game_pid) return;
     int status;
     if (waitpid(game_pid, &status, WNOHANG) == game_pid) {
@@ -192,7 +233,7 @@ void game_window(void* renderer) {
             dl->AddText(ImVec2(p.x + (w - ts.x) * 0.5f, p.y + (h - ts.y) * 0.5f), ui::TEXT_DIM, t);
         }
         const char* hint = game_focused ? "WASD d-pad   arrows stick   Space A   C B   X X   R Y   Enter Start   Shift/Z triggers   Esc releases"
-                                        : "Click the game to give it the keyboard";
+                                        : "Click the game to give it the keyboard (a gamepad works anyway)";
         ImVec2 hs = ImGui::CalcTextSize(hint);
         dl->AddRectFilled(ImVec2(p.x + (w - hs.x) * 0.5f - 8, p.y + h - 30), ImVec2(p.x + (w + hs.x) * 0.5f + 8, p.y + h - 8), IM_COL32(0, 0, 0, 140), 4);
         dl->AddText(ImVec2(p.x + (w - hs.x) * 0.5f, p.y + h - 27), game_focused ? IM_COL32(200, 205, 215, 220) : ui::WARN, hint);
@@ -209,6 +250,7 @@ void game_window(void* renderer) {
 
 void play_shutdown() {
     play_stop();
+    if (flycast_pid > 0) kill(flycast_pid, SIGTERM);
     if (game_tex) SDL_DestroyTexture(game_tex);
     if (shm) munmap(shm, sizeof(*shm));
     if (!shm_path.empty()) unlink(shm_path.c_str());
