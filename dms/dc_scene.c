@@ -266,6 +266,7 @@ DCScene* dc_scene_parse(const char* json, const char* root) {
             snprintf(o->name, sizeof(o->name), "Object %d", s->object_count);
             j_str(&j, c, "name", o->name, sizeof(o->name));
             j_str(&j, c, "model", o->model, sizeof(o->model));
+            j_str(&j, c, "anims", o->anims, sizeof(o->anims));
             o->pos = j_vec3(&j, c, "pos", o->pos);
             o->rot = j_vec3(&j, c, "rot", o->rot);
             o->scale = j_vec3(&j, c, "scale", o->scale);
@@ -282,8 +283,25 @@ DCScene* dc_scene_parse(const char* json, const char* root) {
 
 DCScene* dc_scene_play(const char* root, const char* scene) {
     const char* open = getenv("DMS_SCENE");
-    char path[256];
-    snprintf(path, sizeof(path), "%s%s", root, open && *open ? open : scene);
+    char path[256], start[128] = "";
+    if (!open || !*open) {
+        /* The editor's: the scene it had open when it sent the game off */
+        snprintf(path, sizeof(path), "%s%s", root, DC_START_SCENE);
+        file_t fd = dc_asset_open(path, O_RDONLY);
+        if (fd >= 0) {
+            ssize_t n = fs_read(fd, start, sizeof(start) - 1);
+            fs_close(fd);
+            start[n > 0 ? n : 0] = 0;
+            start[strcspn(start, "\r\n")] = 0;
+            open = start;
+        }
+    }
+    if (open && *open) {
+        snprintf(path, sizeof(path), "%s%s", root, open);
+        DCScene* s = dc_scene_load(path, root);
+        if (s) return s;
+    }
+    snprintf(path, sizeof(path), "%s%s", root, scene);
     return dc_scene_load(path, root);
 }
 
@@ -309,38 +327,80 @@ DCScene* dc_scene_load(const char* path, const char* root) {
     return s;
 }
 
+/* The model at path, loaded the first time it is asked for */
+static DMSModel* cached_model(DCScene* s, const char* path, const char* who) {
+    int k = 0;
+    while (k < s->model_count && strcmp(s->models[k].path, path)) k++;
+    if (k == s->model_count) {
+        if (s->model_count == s->model_cap) {
+            int cap = s->model_cap ? s->model_cap * 2 : 8;
+            DCSceneModel* m = realloc(s->models, cap * sizeof(*m));
+            if (!m) return NULL;
+            s->models = m;
+            s->model_cap = cap;
+        }
+        char full[256];
+        snprintf(full, sizeof(full), "%s%s", s->root, path);
+        DCSceneModel* m = &s->models[s->model_count++];
+        snprintf(m->path, sizeof(m->path), "%s", path);
+        m->model = strcmp(path, "@cube") ? dc_model_load(full) : dc_model_cube();
+        if (!m->model) printf("dc_scene: %s: cannot load %s\n", who, full);
+        /* a skinned model has no pose (nor bounds) until it is first animated:
+         * posed now at its first frame, so it shows before the game runs it */
+        else if (m->model->skeleton) dc_model_animate(m->model, 0.0f);
+    }
+    return s->models[k].model;
+}
+
+/* o's model plays the clips of the one its anims names */
+static void share_anims(DCScene* s, DCSceneObject* o) {
+    if (!o->m || !o->anims[0] || !o->m->skeleton || o->m->skeleton->animBone) return;
+    DMSModel* from = cached_model(s, o->anims, o->name);
+    if (from && dc_model_share_anims(o->m, from)) dc_model_animate(o->m, 0.0f);
+    else if (from) printf("dc_scene: %s: no clips of %s fit %s\n", o->name, o->anims, o->model);
+}
+
 void dc_scene_load_models(DCScene* s) {
     for (int i = 0; i < s->object_count; i++) {
         DCSceneObject* o = &s->objects[i];
-        if (o->m || !o->model[0]) continue;
-        int k = 0;
-        while (k < s->model_count && strcmp(s->models[k].path, o->model)) k++;
-        if (k == s->model_count) {
-            if (s->model_count == s->model_cap) {
-                int cap = s->model_cap ? s->model_cap * 2 : 8;
-                DCSceneModel* m = realloc(s->models, cap * sizeof(*m));
-                if (!m) return;
-                s->models = m;
-                s->model_cap = cap;
-            }
-            char full[256];
-            snprintf(full, sizeof(full), "%s%s", s->root, o->model);
-            DCSceneModel* m = &s->models[s->model_count++];
-            snprintf(m->path, sizeof(m->path), "%s", o->model);
-            m->model = strcmp(o->model, "@cube") ? dc_model_load(full) : dc_model_cube();
-            if (!m->model) printf("dc_scene: %s: cannot load %s\n", o->name, full);
-            /* a skinned model has no pose (nor bounds) until it is first animated:
-             * posed now at its first frame, so it shows before the game runs it */
-            else if (m->model->skeleton) dc_model_animate(m->model, 0.0f);
-        }
-        o->m = s->models[k].model;
+        if (!o->m && o->model[0]) o->m = cached_model(s, o->model, o->name);
     }
+    for (int i = 0; i < s->object_count; i++) share_anims(s, &s->objects[i]);
+}
+
+bool dc_scene_reload_model(DCScene* s, const char* path) {
+    int k = 0;
+    while (k < s->model_count && strcmp(s->models[k].path, path)) k++;
+    if (k == s->model_count || !strcmp(path, "@cube")) return false;
+    char full[256];
+    snprintf(full, sizeof(full), "%s%s", s->root, path);
+    DMSModel* m = dc_model_load(full);
+    if (!m) return false;
+    if (m->skeleton) dc_model_animate(m, 0.0f);
+    DMSModel* old = s->models[k].model;
+    s->models[k].model = m;
+    for (int i = 0; i < s->object_count; i++) {
+        DCSceneObject* o = &s->objects[i];
+        if (o->m == old && !strcmp(o->model, path)) { o->m = m; share_anims(s, o); }
+        /* Models playing its clips play the new ones */
+        else if (o->m && !strcmp(o->anims, path) && o->m->skeleton && o->m->skeleton->animBone)
+            dc_model_share_anims(o->m, m);
+    }
+    if (old) dc_model_free(old);
+    return true;
 }
 
 void dc_scene_free(DCScene* s) {
     if (!s) return;
-    for (int i = 0; i < s->model_count; i++)
-        if (s->models[i].model) dc_model_free(s->models[i].model);
+    /* Models playing another's clips go before it */
+    for (int pass = 0; pass < 2; pass++)
+        for (int i = 0; i < s->model_count; i++) {
+            DMSModel* m = s->models[i].model;
+            if (m && (pass || (m->skeleton && m->skeleton->animBone))) {
+                dc_model_free(m);
+                s->models[i].model = NULL;
+            }
+        }
     free(s->models);
     free(s->objects);
     free(s);
@@ -579,6 +639,10 @@ char* dc_scene_write(const DCScene* s) {
         out_str(&o, ob->name);
         out(&o, ", \"model\": ");
         out_str(&o, ob->model);
+        if (ob->anims[0]) {
+            out(&o, ", \"anims\": ");
+            out_str(&o, ob->anims);
+        }
         out(&o, ",\n      \"pos\": ");
         out_vec3(&o, ob->pos);
         out(&o, ", \"rot\": ");

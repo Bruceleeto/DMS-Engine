@@ -120,10 +120,20 @@ void play_step() {
 
 static pid_t flycast_pid;
 
+/* The console starts the scene open here (dc_scene_play reads it): pc/ is
+ * /pc over dcload and the disc's root */
+static void start_scene() {
+    std::string path = ed.asset_root() + DC_START_SCENE;
+    FILE* f = fopen(path.c_str(), "w");
+    if (f) { fprintf(f, "%s\n", ed.scene_rel.c_str()); fclose(f); }
+    ed_log("Starts on %s", ed.scene_rel.c_str());
+}
+
 void dc_run_toggle() {
     const char* job = ed_job();
     if (job && !strcmp(job, "run")) { ed_job_stop(); return; }
     if (ed.dirty) ed_save();
+    start_scene();
     ed_log("To the Dreamcast: KOS_LOADER in environ.sh says how (dc-tool-ip -t <ip>)");
     ed_run("run");
 }
@@ -133,6 +143,7 @@ bool flycast_running() { return flycast_pid > 0; }
 void flycast_toggle() {
     if (flycast_pid > 0) { kill(flycast_pid, SIGTERM); return; }
     if (ed.dirty) ed_save();
+    start_scene();
     ed_run("disc", [](bool ok) {
         if (!ok) { ed_log("Flycast: the disc image did not build (mkdcdisc on the PATH?)"); return; }
         std::string name = ed_project_name();

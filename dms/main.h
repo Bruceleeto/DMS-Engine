@@ -65,6 +65,9 @@ typedef struct {
     int           currentAnim;
     float         currentTime;
     int           loops;        /* times the clip has run through since it was set */
+    int          *animBone;     /* dc_model_share_anims(): each bone's in the clips'
+                                 * skeleton, -1 for none (it keeps its rest pose);
+                                 * NULL when the clips are its own */
 } DMSSkeleton;
 
 /* ================================================================

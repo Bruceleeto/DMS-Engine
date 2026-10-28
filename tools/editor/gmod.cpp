@@ -1,0 +1,772 @@
+/* The Garry's Mod tab: the game's models (and the HL2 / CS:S content it
+ * mounts, and workshop addons) as the game has them, untouched, and the
+ * choices for bringing one into the project: its skin, its body parts, its
+ * animations, how big its textures may be. Nothing is converted until asked:
+ * Bring in writes a .glb under assets/gmod/, which the Model tab then sets
+ * up for the Dreamcast. tools/gmod/gmod2glb does all the reading. */
+#include "editor.h"
+#include "ui.h"
+#include "imgui.h"
+#include "imgui_internal.h"
+#include <SDL3/SDL.h>
+#include <sys/stat.h>
+#include <algorithm>
+#include <atomic>
+#include <map>
+#include <math.h>
+#include <set>
+#include <string.h>
+#include <thread>
+#include <unistd.h>
+
+static std::string tool() { return ed.root + "tools/gmod/gmod2glb"; }
+
+static std::string q(const std::string& s) {
+    std::string o = "'";
+    for (char c : s) o += c == '\'' ? std::string("'\\''") : std::string(1, c);
+    return o + "'";
+}
+
+/* cmd's output, and what it said on stderr (a file each: the threads run at once) */
+static bool run(const std::string& cmd, std::string* out, std::string* err = nullptr) {
+    static std::atomic<int> calls{ 0 };
+    std::string dir = ed.root + "build/editor/gmod/";
+    std::string ef = dir + "err" + std::to_string(++calls) + ".txt";
+    mkdir((ed.root + "build/editor").c_str(), 0755);
+    mkdir(dir.c_str(), 0755);
+    std::string e = err ? " 2>" + q(ef) : " 2>/dev/null";
+    FILE* p = popen((cmd + e).c_str(), "r");
+    if (!p) return false;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), p)) > 0) if (out) out->append(buf, n);
+    bool ok = pclose(p) == 0;
+    if (err) {
+        FILE* f = fopen(ef.c_str(), "r");
+        if (f) { while ((n = fread(buf, 1, sizeof(buf), f)) > 0) err->append(buf, n); fclose(f); }
+        unlink(ef.c_str());
+    }
+    return ok;
+}
+
+static std::vector<std::string> fields(const std::string& line) {
+    std::vector<std::string> v;
+    size_t at = 0;
+    for (;;) {
+        size_t t = line.find('\t', at);
+        v.push_back(line.substr(at, t == std::string::npos ? std::string::npos : t - at));
+        if (t == std::string::npos) return v;
+        at = t + 1;
+    }
+}
+
+static std::string base_name(const std::string& p) {
+    std::string b = p.substr(p.find_last_of('/') + 1);
+    return b.size() > 4 && !b.compare(b.size() - 4, 4, ".mdl") ? b.substr(0, b.size() - 4) : b;
+}
+
+/* ================================================================
+ * What gmod2glb says
+ * ================================================================ */
+
+struct Entry { std::string path, from; bool workshop; };
+struct Node { std::map<std::string, Node> dirs; std::vector<int> files; };
+
+enum { ALPHATEST = 1, TRANSLUCENT = 2, TWO_SIDED = 4, ADDITIVE = 8 };
+
+struct Mat {
+    std::string name, vmt, texture, note;
+    int w = 0, h = 0;                       /* in the game */
+    int pw = 0, ph = 0;                     /* in the preview */
+    uint8_t flags = 0;
+    std::vector<uint8_t> rgba;              /* the preview's, until it is a texture */
+    SDL_Texture* tex = nullptr;
+};
+
+struct PMesh { int mat; std::vector<uint32_t> idx; };
+
+/* One model as gmod2glb --info reads it */
+struct Loaded {
+    std::string path, from, error;
+    int bones = 0, verts = 0, tris = 0, skins = 1;
+    std::vector<std::pair<std::string, std::vector<std::string>>> body;
+    std::vector<Mat> mats;
+    std::vector<std::string> anims;
+    std::set<std::string> anim_files;
+    std::vector<float> pos, nrm, uv;
+    std::vector<PMesh> meshes;
+    float centre[3] = { 0, 0, 0 }, radius = 1;
+};
+
+static bool read_preview(const std::string& file, Loaded& L) {
+    FILE* f = fopen(file.c_str(), "rb");
+    if (!f) return false;
+    std::vector<uint8_t> d;
+    uint8_t buf[1 << 16];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) d.insert(d.end(), buf, buf + n);
+    fclose(f);
+    size_t p = 0;
+    auto need = [&](size_t k) { return p + k <= d.size(); };
+    auto u32 = [&]() { uint32_t v = 0; if (need(4)) memcpy(&v, &d[p], 4); p += 4; return v; };
+    if (!need(8) || memcmp(d.data(), "GMPV", 4)) return false;
+    p = 8;
+    uint32_t nm = u32();
+    for (uint32_t i = 0; i < nm && need(5); i++) {
+        uint16_t w, h;
+        memcpy(&w, &d[p], 2);
+        memcpy(&h, &d[p + 2], 2);
+        uint8_t flags = d[p + 4];
+        p += 5;
+        size_t bytes = (size_t)w * h * 4;
+        if (!need(bytes)) return false;
+        if (i < L.mats.size()) {
+            Mat& m = L.mats[i];
+            m.flags = flags;
+            m.pw = w;
+            m.ph = h;
+            m.rgba.assign(d.begin() + p, d.begin() + p + bytes);
+        }
+        p += bytes;
+    }
+    uint32_t nv = u32();
+    if (!need((size_t)nv * 32)) return false;
+    L.pos.resize(nv * 3);
+    L.nrm.resize(nv * 3);
+    L.uv.resize(nv * 2);
+    float mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
+    for (uint32_t i = 0; i < nv; i++) {
+        float v[8];
+        memcpy(v, &d[p], 32);
+        p += 32;
+        for (int k = 0; k < 3; k++) {
+            L.pos[i * 3 + k] = v[k];
+            L.nrm[i * 3 + k] = v[3 + k];
+            mn[k] = std::min(mn[k], v[k]);
+            mx[k] = std::max(mx[k], v[k]);
+        }
+        L.uv[i * 2] = v[6];
+        L.uv[i * 2 + 1] = v[7];
+    }
+    if (nv) {
+        float r = 0;
+        for (int k = 0; k < 3; k++) {
+            L.centre[k] = (mn[k] + mx[k]) * 0.5f;
+            r += (mx[k] - mn[k]) * (mx[k] - mn[k]);
+        }
+        L.radius = std::max(0.01f, sqrtf(r) * 0.5f);
+    }
+    uint32_t nmesh = u32();
+    for (uint32_t i = 0; i < nmesh && need(8); i++) {
+        PMesh m;
+        m.mat = (int)u32();
+        uint32_t ni = u32();
+        if (!need((size_t)ni * 4)) return false;
+        m.idx.resize(ni);
+        memcpy(m.idx.data(), &d[p], (size_t)ni * 4);
+        p += (size_t)ni * 4;
+        for (uint32_t& x : m.idx) if (x >= nv) x = 0;
+        L.meshes.push_back(std::move(m));
+    }
+    return true;
+}
+
+static void load(const std::string& path, int skin, const std::vector<int>& body, Loaded& L) {
+    std::string dir = ed.root + "build/editor/gmod/";
+    std::string cmd = q(tool()) + " --info " + q(path) + " --preview " + q(dir + "preview.bin") + " --tex 512";
+    if (skin) cmd += " --skin " + std::to_string(skin);
+    if (!body.empty()) {
+        std::string b;
+        for (size_t i = 0; i < body.size(); i++) b += (i ? "," : "") + std::to_string(body[i]);
+        cmd += " --body " + b;
+    }
+    std::string out, err;
+    bool ok = run(cmd, &out, &err);
+    L.path = path;
+    size_t at = 0;
+    while (at < out.size()) {
+        size_t nl = out.find('\n', at);
+        if (nl == std::string::npos) nl = out.size();
+        std::vector<std::string> f = fields(out.substr(at, nl - at));
+        at = nl + 1;
+        const std::string& k = f[0];
+        if (k == "model" && f.size() > 2) L.from = f[2];
+        else if (k == "counts" && f.size() > 4) {
+            L.bones = atoi(f[1].c_str());
+            L.verts = atoi(f[2].c_str());
+            L.tris = atoi(f[3].c_str());
+            L.skins = std::max(1, atoi(f[4].c_str()));
+        } else if (k == "body" && f.size() > 1) {
+            L.body.push_back({ f[1], std::vector<std::string>(f.begin() + 2, f.end()) });
+        } else if (k == "mat" && f.size() > 6) {
+            Mat m;
+            m.name = f[1];
+            m.vmt = f[2];
+            m.texture = f[3];
+            m.w = atoi(f[4].c_str());
+            m.h = atoi(f[5].c_str());
+            m.note = f[6];
+            L.mats.push_back(m);
+        } else if (k == "anim" && f.size() > 2) {
+            L.anims.push_back(f[1]);
+            L.anim_files.insert(f[2]);
+        }
+    }
+    if (!ok) {
+        L.error = err.empty() ? "gmod2glb failed" : err;
+        while (!L.error.empty() && L.error.back() == '\n') L.error.pop_back();
+        return;
+    }
+    if (!read_preview(dir + "preview.bin", L)) L.error = "cannot read the preview";
+}
+
+/* ================================================================
+ * State
+ * ================================================================ */
+
+static struct {
+    /* The list of models */
+    std::atomic<int> list_state{ 0 };       /* 0 not read, 1 reading, 2 read, 3 failed */
+    std::thread list_worker;
+    std::vector<Entry> entries;
+    std::string list_error;
+    int show = 0;                           /* 0 everything, 1 the game's, 2 workshop addons */
+    char filter[128] = "";
+    std::string filter_was = "\x01";
+    int show_was = -1;
+    std::vector<int> matches;
+    Node tree;
+
+    /* The model looked at */
+    std::string selected;
+    int skin = 0;
+    std::vector<int> body;
+    std::atomic<int> state{ 0 };            /* 0 idle, 1 reading, 2 read */
+    bool want = false;
+    std::thread worker;
+    Loaded next, cur;
+    bool have = false;
+
+    /* Its preview */
+    SDL_Renderer* renderer = nullptr;
+    SDL_Texture* target = nullptr;
+    int tw = 0, th = 0;
+    float yaw = 0.5f, pitch = 0.15f, dist = 0;
+    bool dirty = true;
+
+    /* Bringing it in */
+    std::set<std::string> anims;
+    char anim_filter[64] = "";
+    char name[64] = "";
+    int tex = 2;
+    std::atomic<int> bring_state{ 0 };      /* 0 idle, 1 working, 2 done, 3 failed */
+    std::thread bring_worker;
+    std::string bring_log, bring_rel;
+} g;
+
+static const int TEX_SIZES[] = { 64, 128, 256, 512, 1024 };
+
+static void list_start() {
+    g.list_state = 1;
+    g.list_worker = std::thread([] {
+        std::string out, err;
+        struct stat st;
+        if (stat(tool().c_str(), &st)) {
+            g.list_error = "tools/gmod/gmod2glb is not built:  make -C tools/gmod";
+            g.list_state = 3;
+            return;
+        }
+        if (!run(q(tool()) + " --list", &out, &err)) {
+            g.list_error = err.empty() ? "gmod2glb --list failed" : err;
+            g.list_state = 3;
+            return;
+        }
+        size_t at = 0;
+        while (at < out.size()) {
+            size_t nl = out.find('\n', at);
+            if (nl == std::string::npos) nl = out.size();
+            std::vector<std::string> f = fields(out.substr(at, nl - at));
+            at = nl + 1;
+            if (f[0].empty()) continue;
+            std::string from = f.size() > 1 ? f[1] : "";
+            g.entries.push_back({ f[0], from, !from.compare(0, 9, "workshop/") || !from.compare(0, 7, "addons/") });
+        }
+        g.list_state = 2;
+    });
+}
+
+static void textures_free(Loaded& L) {
+    for (Mat& m : L.mats)
+        if (m.tex) { SDL_DestroyTexture(m.tex); m.tex = nullptr; }
+}
+
+static void request() {
+    if (g.selected.empty()) return;
+    if (g.state == 1) { g.want = true; return; }
+    if (g.worker.joinable()) g.worker.join();
+    g.want = false;
+    g.state = 1;
+    std::string path = g.selected;
+    int skin = g.skin;
+    std::vector<int> body = g.body;
+    g.worker = std::thread([path, skin, body] {
+        g.next = Loaded();
+        load(path, skin, body, g.next);
+        g.state = 2;
+    });
+}
+
+static void select(const std::string& path) {
+    if (path == g.selected) return;
+    g.selected = path;
+    g.skin = 0;
+    g.body.clear();
+    g.anims.clear();
+    snprintf(g.name, sizeof(g.name), "%s", base_name(path).c_str());
+    g.dist = 0;
+    request();
+}
+
+/* A finished read: its textures made, shown */
+static void poll() {
+    if (g.state != 2) return;
+    g.worker.join();
+    g.state = 0;
+    textures_free(g.cur);
+    g.cur = std::move(g.next);
+    g.next = Loaded();
+    g.have = true;
+    g.dirty = true;
+    if (!g.cur.error.empty()) ed_log("Garry's Mod: %s: %s", g.cur.path.c_str(), g.cur.error.c_str());
+    if (g.renderer)
+        for (Mat& m : g.cur.mats) {
+            if (m.rgba.empty() || !m.pw) continue;
+            /* The alpha of an opaque material's texture is a mask for something
+             * else (shine, mostly): it is drawn solid */
+            if (!(m.flags & (ALPHATEST | TRANSLUCENT | ADDITIVE)))
+                for (size_t i = 3; i < m.rgba.size(); i += 4) m.rgba[i] = 255;
+            m.tex = SDL_CreateTexture(g.renderer, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STATIC, m.pw, m.ph);
+            if (!m.tex) continue;
+            SDL_UpdateTexture(m.tex, nullptr, m.rgba.data(), m.pw * 4);
+            SDL_SetTextureScaleMode(m.tex, SDL_SCALEMODE_LINEAR);
+            SDL_SetTextureBlendMode(m.tex, m.flags & ADDITIVE ? SDL_BLENDMODE_ADD
+                                           : m.flags & (ALPHATEST | TRANSLUCENT) ? SDL_BLENDMODE_BLEND : SDL_BLENDMODE_NONE);
+            std::vector<uint8_t>().swap(m.rgba);
+        }
+    if (g.want) request();
+}
+
+/* ================================================================
+ * The preview: the model's triangles as they are, far ones first (SDL's
+ * renderer has no depth buffer), lit from beside the camera
+ * ================================================================ */
+
+static void render_preview(int w, int h) {
+    SDL_Renderer* r = g.renderer;
+    if (!r || w < 8 || h < 8) return;
+    if (!g.target || g.tw != w || g.th != h) {
+        if (g.target) SDL_DestroyTexture(g.target);
+        g.target = SDL_CreateTexture(r, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET, w, h);
+        g.tw = w;
+        g.th = h;
+        g.dirty = true;
+    }
+    if (!g.target || !g.dirty) return;
+    g.dirty = false;
+    const Loaded& L = g.cur;
+    SDL_Texture* old = SDL_GetRenderTarget(r);
+    SDL_SetRenderTarget(r, g.target);
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
+    SDL_SetRenderDrawColor(r, 38, 41, 48, 255);
+    SDL_RenderClear(r);
+    size_t nv = L.pos.size() / 3;
+    if (nv) {
+        if (g.dist <= 0) g.dist = L.radius * 2.6f;
+        float cp = cosf(g.pitch), sp = sinf(g.pitch), cy = cosf(g.yaw), sy = sinf(g.yaw);
+        float eye[3] = { L.centre[0] + g.dist * cp * sy, L.centre[1] + g.dist * sp, L.centre[2] + g.dist * cp * cy };
+        float fw[3] = { -cp * sy, -sp, -cp * cy };
+        float rt[3] = { -fw[2], 0, fw[0] };     /* forward x up */
+        float rl = sqrtf(rt[0] * rt[0] + rt[2] * rt[2]);
+        rt[0] /= rl; rt[2] /= rl;
+        float up[3] = { rt[1] * fw[2] - rt[2] * fw[1], rt[2] * fw[0] - rt[0] * fw[2], rt[0] * fw[1] - rt[1] * fw[0] };
+        float lt[3];
+        for (int k = 0; k < 3; k++) lt[k] = -fw[k] + up[k] * 0.6f - rt[k] * 0.4f;
+        float ll = sqrtf(lt[0] * lt[0] + lt[1] * lt[1] + lt[2] * lt[2]);
+        for (float& x : lt) x /= ll;
+        float focal = (h * 0.5f) / tanf(20.0f * 3.14159265f / 180.0f);
+
+        std::vector<float> sx(nv), syv(nv), sz(nv), shade(nv);
+        for (size_t i = 0; i < nv; i++) {
+            const float* p = &L.pos[i * 3];
+            float d[3] = { p[0] - eye[0], p[1] - eye[1], p[2] - eye[2] };
+            float x = d[0] * rt[0] + d[1] * rt[1] + d[2] * rt[2];
+            float y = d[0] * up[0] + d[1] * up[1] + d[2] * up[2];
+            float z = d[0] * fw[0] + d[1] * fw[1] + d[2] * fw[2];
+            sz[i] = z;
+            float iz = z > 1e-4f ? 1.0f / z : 0;
+            sx[i] = w * 0.5f + x * iz * focal;
+            syv[i] = h * 0.5f - y * iz * focal;
+            const float* n = &L.nrm[i * 3];
+            float l = n[0] * lt[0] + n[1] * lt[1] + n[2] * lt[2];
+            shade[i] = 0.42f + 0.58f * (l > 0 ? l : 0);
+        }
+        struct Tri { float z; int mesh; uint32_t at; };
+        std::vector<Tri> solid, blend;
+        float near_z = L.radius * 0.01f;
+        for (size_t mi = 0; mi < L.meshes.size(); mi++) {
+            const PMesh& m = L.meshes[mi];
+            uint8_t flags = m.mat >= 0 && m.mat < (int)L.mats.size() ? L.mats[m.mat].flags : 0;
+            for (uint32_t t = 0; t + 2 < m.idx.size(); t += 3) {
+                uint32_t a = m.idx[t], b = m.idx[t + 1], c = m.idx[t + 2];
+                if (sz[a] < near_z || sz[b] < near_z || sz[c] < near_z) continue;
+                /* Front faces (counter-clockwise, y up) turn clockwise with y down */
+                float cr = (sx[b] - sx[a]) * (syv[c] - syv[a]) - (syv[b] - syv[a]) * (sx[c] - sx[a]);
+                if (cr >= 0 && !(flags & TWO_SIDED)) continue;
+                Tri tri = { sz[a] + sz[b] + sz[c], (int)mi, t };
+                ((flags & (TRANSLUCENT | ADDITIVE)) ? blend : solid).push_back(tri);
+            }
+        }
+        auto far_first = [](const Tri& x, const Tri& y) { return x.z > y.z; };
+        std::sort(solid.begin(), solid.end(), far_first);
+        std::sort(blend.begin(), blend.end(), far_first);
+        SDL_SetRenderTextureAddressMode(r, SDL_TEXTURE_ADDRESS_WRAP, SDL_TEXTURE_ADDRESS_WRAP);
+        std::vector<SDL_Vertex> batch;
+        int batch_mat = -2;
+        auto flush = [&]() {
+            if (batch.empty()) return;
+            SDL_Texture* t = batch_mat >= 0 && batch_mat < (int)L.mats.size() ? L.mats[batch_mat].tex : nullptr;
+            SDL_RenderGeometry(r, t, batch.data(), (int)batch.size(), nullptr, 0);
+            batch.clear();
+        };
+        for (const std::vector<Tri>* list : { &solid, &blend })
+            for (const Tri& tri : *list) {
+                const PMesh& m = L.meshes[tri.mesh];
+                if (m.mat != batch_mat) { flush(); batch_mat = m.mat; }
+                bool textured = m.mat >= 0 && m.mat < (int)L.mats.size() && L.mats[m.mat].tex;
+                for (int k = 0; k < 3; k++) {
+                    uint32_t i = m.idx[tri.at + k];
+                    float s = shade[i] * (textured ? 1.0f : 0.7f);
+                    SDL_Vertex v;
+                    v.position = { sx[i], syv[i] };
+                    v.color = { s, s, s, 1.0f };
+                    v.tex_coord = { L.uv[i * 2], L.uv[i * 2 + 1] };
+                    batch.push_back(v);
+                }
+            }
+        flush();
+        SDL_SetRenderTextureAddressMode(r, SDL_TEXTURE_ADDRESS_AUTO, SDL_TEXTURE_ADDRESS_AUTO);
+    }
+    SDL_SetRenderTarget(r, old);
+}
+
+/* ================================================================
+ * Bringing it in: gmod2glb into assets/gmod/<name>/, then the Model tab
+ * ================================================================ */
+
+static std::string bring_rel() { return std::string("gmod/") + g.name + "/" + g.name + ".glb"; }
+
+static void bring_in() {
+    if (g.bring_state == 1 || !g.have || g.name[0] == 0) return;
+    if (g.bring_worker.joinable()) g.bring_worker.join();
+    std::string rel = bring_rel(), glb = ed.project + "assets/" + rel;
+    std::string cmd = "mkdir -p " + q(glb.substr(0, glb.find_last_of('/'))) + " && " + q(tool()) + " " + q(g.cur.path) +
+                      " -o " + q(glb) + " --tex " + std::to_string(TEX_SIZES[g.tex]);
+    if (g.skin) cmd += " --skin " + std::to_string(g.skin);
+    if (!g.body.empty()) {
+        std::string b;
+        for (size_t i = 0; i < g.body.size(); i++) b += (i ? "," : "") + std::to_string(g.body[i]);
+        cmd += " --body " + b;
+    }
+    if (!g.anims.empty()) {
+        std::string a;
+        for (const std::string& n : g.anims) a += (a.empty() ? "" : ",") + n;
+        cmd += " --anims " + q(a);
+    }
+    g.bring_rel = rel;
+    g.bring_state = 1;
+    g.bring_worker = std::thread([cmd] {
+        std::string out, err;
+        bool ok = run(cmd, &out, &err);
+        g.bring_log = out + err;
+        g.bring_state = ok ? 2 : 3;
+    });
+}
+
+static void bring_poll() {
+    int s = g.bring_state;
+    if (s < 2) return;
+    g.bring_worker.join();
+    g.bring_state = 0;
+    std::string log = g.bring_log;
+    while (!log.empty() && log.back() == '\n') log.pop_back();
+    if (s == 3) {
+        ed_log("Garry's Mod: could not bring in %s", g.bring_rel.c_str());
+        ed_log("%s", log.c_str());
+        return;
+    }
+    ed_log("Garry's Mod: brought in assets/%s", g.bring_rel.c_str());
+    ed_scan_assets();
+    model_open(g.bring_rel);
+    ed_run("assets");
+}
+
+/* ================================================================
+ * The tab
+ * ================================================================ */
+
+static void build_tree() {
+    g.tree = Node();
+    for (int i = 0; i < (int)g.entries.size(); i++) {
+        const Entry& e = g.entries[i];
+        if ((g.show == 1 && e.workshop) || (g.show == 2 && !e.workshop)) continue;
+        Node* n = &g.tree;
+        size_t at = 0;
+        for (;;) {
+            size_t s = e.path.find('/', at);
+            if (s == std::string::npos) break;
+            n = &n->dirs[e.path.substr(at, s - at)];
+            at = s + 1;
+        }
+        n->files.push_back(i);
+    }
+}
+
+static void entry_row(int i, bool full) {
+    const Entry& e = g.entries[i];
+    std::string label = (full ? e.path : base_name(e.path)) + "##" + e.path;
+    if (ImGui::Selectable(label.c_str(), e.path == g.selected)) select(e.path);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s\n%s", e.path.c_str(), e.from.c_str());
+}
+
+static void tree_node(const Node& n, int depth = 0) {
+    for (auto& kv : n.dirs) {
+        if (depth == 0) ImGui::SetNextItemOpen(true, ImGuiCond_Once);
+        if (ImGui::TreeNodeEx(kv.first.c_str(), ImGuiTreeNodeFlags_SpanAvailWidth)) {
+            tree_node(kv.second, depth + 1);
+            ImGui::TreePop();
+        }
+    }
+    for (int i : n.files) {
+        ImGui::Indent(ImGui::GetStyle().IndentSpacing * 0.5f);
+        entry_row(i, false);
+        ImGui::Unindent(ImGui::GetStyle().IndentSpacing * 0.5f);
+    }
+}
+
+static void browser() {
+    if (g.list_state == 0) list_start();
+    if (g.list_state == 1) { ImGui::TextDisabled("Reading Garry's Mod..."); return; }
+    if (g.list_state == 3) {
+        if (g.list_worker.joinable()) g.list_worker.join();
+        ImGui::TextColored(ImColor(ui::WARN), "%s", g.list_error.c_str());
+        if (ImGui::Button("Try again")) { g.list_state = 0; g.entries.clear(); }
+        return;
+    }
+    if (g.list_worker.joinable()) g.list_worker.join();
+
+    ImGui::SetNextItemWidth(-ImGui::GetFontSize() * 7.5f);
+    ImGui::InputTextWithHint("##gf", ICON_SEARCH "  Search", g.filter, sizeof(g.filter));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(-1);
+    const char* shows[] = { "Everything", "The game's", "Addons" };
+    ImGui::Combo("##show", &g.show, shows, 3);
+    if (g.show != g.show_was) { build_tree(); g.filter_was = "\x01"; g.show_was = g.show; }
+    if (g.filter_was != g.filter) {
+        g.filter_was = g.filter;
+        g.matches.clear();
+        std::string f = g.filter;
+        for (char& c : f) c = (char)tolower((unsigned char)c);
+        if (!f.empty())
+            for (int i = 0; i < (int)g.entries.size(); i++) {
+                const Entry& e = g.entries[i];
+                if ((g.show == 1 && e.workshop) || (g.show == 2 && !e.workshop)) continue;
+                if (e.path.find(f) != std::string::npos) g.matches.push_back(i);
+            }
+    }
+    ImGui::BeginChild("list", ImVec2(0, 0), ImGuiChildFlags_Borders);
+    if (g.filter[0]) {
+        ImGuiListClipper clip;
+        clip.Begin((int)g.matches.size());
+        while (clip.Step())
+            for (int k = clip.DisplayStart; k < clip.DisplayEnd; k++) entry_row(g.matches[k], true);
+        if (g.matches.empty()) ImGui::TextDisabled("No model matches");
+    } else {
+        tree_node(g.tree);
+    }
+    ImGui::EndChild();
+}
+
+static void preview_view() {
+    ImVec2 avail = ImGui::GetContentRegionAvail(), top = ImGui::GetCursorScreenPos();
+    if (!g.have) {
+        ImGui::TextDisabled(g.state == 1 ? "Reading..." : "Pick a model to see it as the game has it");
+        return;
+    }
+    int w = (int)avail.x, h = (int)avail.y;
+    render_preview(w, h);
+    if (!g.target) return;
+    ImGui::Image((ImTextureID)(intptr_t)g.target, ImVec2((float)w, (float)h));
+    if (ImGui::IsItemHovered()) {
+        ImGuiIO& io = ImGui::GetIO();
+        if (ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0) || ImGui::IsMouseDragging(ImGuiMouseButton_Right, 0)) {
+            g.yaw -= io.MouseDelta.x * 0.01f;
+            g.pitch = fmaxf(-1.5f, fminf(1.5f, g.pitch + io.MouseDelta.y * 0.01f));
+            g.dirty = true;
+        }
+        if (io.MouseWheel != 0) { g.dist *= powf(0.88f, io.MouseWheel); g.dirty = true; }
+    }
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    char b[96];
+    snprintf(b, sizeof(b), "As in the game: %d triangles%s", g.cur.tris, g.state == 1 ? "   reading..." : "");
+    dl->AddText(ImVec2(top.x + 8, top.y + 6), IM_COL32(200, 204, 212, 220), b);
+    dl->AddText(ImVec2(top.x + 8, top.y + h - ImGui::GetFontSize() - 6), IM_COL32(200, 204, 212, 160), "drag to turn, wheel to zoom");
+}
+
+static const char* const PLAYER_BASICS[] = { "@idle_all_01", "a_WalkN", "a_RunN", "@cidle_all", "a_CwalkN", "@jump_passive" };
+
+static void details() {
+    if (!g.have) return;
+    const Loaded& L = g.cur;
+    ImGui::TextUnformatted(base_name(L.path).c_str());
+    ImGui::TextDisabled("%s", L.path.c_str());
+    ImGui::TextDisabled("from %s", L.from.c_str());
+    if (!L.error.empty()) { ImGui::TextColored(ImColor(ui::ERROR), "%s", L.error.c_str()); }
+    ImGui::Text("%d triangles, %d vertices, %d bones", L.tris, L.verts, L.bones);
+
+    /* Its looks */
+    bool changed = false;
+    if (L.skins > 1) {
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8);
+        changed |= ImGui::SliderInt("Skin", &g.skin, 0, L.skins - 1);
+    }
+    for (size_t i = 0; i < L.body.size(); i++) {
+        const auto& part = L.body[i];
+        if (part.second.size() < 2) continue;
+        if (g.body.size() <= i) g.body.resize(i + 1, 0);
+        int& c = g.body[i];
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 12);
+        if (ImGui::BeginCombo(part.first.c_str(), part.second[std::min((size_t)c, part.second.size() - 1)].c_str())) {
+            for (int k = 0; k < (int)part.second.size(); k++)
+                if (ImGui::Selectable(part.second[k].c_str(), k == c)) { c = k; changed = true; }
+            ImGui::EndCombo();
+        }
+    }
+    if (changed) request();
+
+    if (ui::component(ICON_IMAGE, "Textures")) {
+        if (ImGui::BeginTable("tex", 3, ImGuiTableFlags_SizingStretchProp)) {
+            for (const Mat& m : L.mats) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                if (m.tex) {
+                    float s = ImGui::GetFontSize() * 2.2f;
+                    ImGui::Image((ImTextureID)(intptr_t)m.tex, ImVec2(s * (m.ph ? (float)m.pw / m.ph : 1), s));
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::BeginTooltip();
+                        ImGui::Image((ImTextureID)(intptr_t)m.tex, ImVec2((float)m.pw, (float)m.ph));
+                        ImGui::EndTooltip();
+                    }
+                }
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(m.name.c_str());
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s\n%s", m.vmt.c_str(), m.texture.c_str());
+                ImGui::TableNextColumn();
+                if (m.w) ImGui::TextDisabled("%d x %d %s", m.w, m.h, m.note.c_str());
+                else ImGui::TextColored(ImColor(ui::WARN), "%s", m.note.c_str());
+            }
+            ImGui::EndTable();
+        }
+    }
+
+    if (!L.anims.empty() && ui::component(ICON_PLAY, "Animations", false)) {
+        std::string files;
+        for (const std::string& f : L.anim_files) files += (files.empty() ? "" : ", ") + base_name(f);
+        ImGui::TextDisabled("%zu, from %s. %zu chosen", L.anims.size(), files.c_str(), g.anims.size());
+        if (ImGui::SmallButton("None")) g.anims.clear();
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Player basics"))
+            for (const char* n : PLAYER_BASICS)
+                if (std::find(L.anims.begin(), L.anims.end(), n) != L.anims.end()) g.anims.insert(n);
+        ui::tooltip("Idle, walk, run, crouch, crouch walk, jump");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputTextWithHint("##af", ICON_SEARCH "  Search", g.anim_filter, sizeof(g.anim_filter));
+        std::string f = g.anim_filter;
+        for (char& c : f) c = (char)tolower((unsigned char)c);
+        std::vector<int> shown;
+        for (int i = 0; i < (int)L.anims.size(); i++) {
+            std::string n = L.anims[i];
+            for (char& c : n) c = (char)tolower((unsigned char)c);
+            if (f.empty() || n.find(f) != std::string::npos) shown.push_back(i);
+        }
+        ImGui::BeginChild("anims", ImVec2(0, ImGui::GetFontSize() * 10), ImGuiChildFlags_Borders);
+        ImGuiListClipper clip;
+        clip.Begin((int)shown.size());
+        while (clip.Step())
+            for (int k = clip.DisplayStart; k < clip.DisplayEnd; k++) {
+                const std::string& n = L.anims[shown[k]];
+                bool on = g.anims.count(n);
+                if (ImGui::Checkbox(n.c_str(), &on)) { if (on) g.anims.insert(n); else g.anims.erase(n); }
+            }
+        ImGui::EndChild();
+        ImGui::TextWrapped("Player models share one set: bring the animations in with one of them, then have the others "
+                           "play its clips (Clips from, in the Inspector).");
+    }
+
+    ImGui::Separator();
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 10);
+    ImGui::InputText("Name", g.name, sizeof(g.name), ImGuiInputTextFlags_CharsNoBlank);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5);
+    const char* sizes[] = { "64", "128", "256", "512", "1024" };
+    ImGui::Combo("Textures at most", &g.tex, sizes, 5);
+    struct stat st;
+    bool exists = g.name[0] && !stat((ed.project + "assets/" + bring_rel()).c_str(), &st);
+    ImGui::BeginDisabled(g.bring_state == 1 || !g.name[0] || !L.error.empty());
+    if (ImGui::Button(g.bring_state == 1 ? "Bringing in..." : exists ? ICON_PLUS "  Bring in again (replace)" : ICON_PLUS "  Bring in"))
+        bring_in();
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::TextDisabled("to assets/%s", bring_rel().c_str());
+}
+
+void gmod_window(void* sdl_renderer) {
+    g.renderer = (SDL_Renderer*)sdl_renderer;
+    poll();
+    bring_poll();
+    /* With the Console when the saved layout is older than this tab */
+    if (ImGuiWindow* con = ImGui::FindWindowByName(WIN_CONSOLE))
+        if (con->DockId) ImGui::SetNextWindowDockID(con->DockId, ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin(WIN_GMOD)) { ImGui::End(); return; }
+    float fs = ImGui::GetFontSize();
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    float list_w = std::max(fs * 14, avail.x * 0.28f);
+    float side_w = std::max(fs * 22, avail.x * 0.34f);
+    float view_w = std::max(fs * 8, avail.x - list_w - side_w - 2 * ImGui::GetStyle().ItemSpacing.x);
+    ImGui::BeginChild("browser", ImVec2(list_w, 0));
+    browser();
+    ImGui::EndChild();
+    ImGui::SameLine();
+    ImGui::BeginChild("preview", ImVec2(view_w, 0));
+    preview_view();
+    ImGui::EndChild();
+    ImGui::SameLine();
+    ImGui::BeginChild("details", ImVec2(0, 0));
+    details();
+    ImGui::EndChild();
+    ImGui::End();
+}
+
+bool gmod_busy() { return g.list_state == 1 || g.state == 1 || g.want || g.bring_state == 1; }
+
+void gmod_open(const std::string& mdl) {
+    select(mdl);
+    if (ImGuiWindow* w = ImGui::FindWindowByName(WIN_GMOD)) ImGui::FocusWindow(w);
+}
+
+void gmod_shutdown() {
+    for (std::thread* t : { &g.list_worker, &g.worker, &g.bring_worker })
+        if (t->joinable()) t->join();
+    textures_free(g.cur);
+    if (g.target) SDL_DestroyTexture(g.target);
+}

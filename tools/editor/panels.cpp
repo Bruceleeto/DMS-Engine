@@ -285,6 +285,26 @@ static void inspect_object(DCSceneObject& o) {
                 set_model(o, std::string((const char*)p->Data, p->DataSize).c_str());
             ImGui::EndDragDropTarget();
         }
+        if (o.m && o.m->skeleton) {
+            ui::row_label("Clips from");
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::BeginCombo("##anims", o.anims[0] ? o.anims : "its own")) {
+                std::string pick;
+                bool chose = false;
+                if (ImGui::Selectable("its own", !o.anims[0])) chose = true;
+                for (auto& m : ed.models)
+                    if (m != o.model && ImGui::Selectable((std::string(ICON_MODEL "  ") + m).c_str(), m == o.anims)) { pick = m; chose = true; }
+                ImGui::EndCombo();
+                if (chose && pick != o.anims) {
+                    ed_edited();
+                    snprintf(o.anims, sizeof(o.anims), "%s", pick.c_str());
+                    /* Loaded again, with its own clips or the other's */
+                    dc_scene_reload_model(ed.scene, o.model);
+                }
+            }
+            ui::tooltip("Another model's animations, played on this one's bones by name: a set of player models "
+                        "shares one set of clips");
+        }
         if (o.m) {
             DCBounds b = dc_model_bounds(o.m, nullptr);
             uint32_t verts = 0;

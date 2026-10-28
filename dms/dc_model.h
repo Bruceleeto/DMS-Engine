@@ -253,6 +253,18 @@ void dc_model_anim_restart(DMSModel* model);
  */
 int dc_model_anim_index(const DMSModel* model, const char* name);
 
+/* Plays from's clips instead of its own (which it frees), matched bone to
+ * bone by name: one set of clips in RAM for every model on the same skeleton,
+ * as Garry's Mod's player models share theirs. A bone from does not have
+ * keeps its rest pose. from must outlive it, and must have clips of its own.
+ * False (and nothing changed) if no bone matches or from has no clips.
+ *
+ *     DMSModel* anims = dc_model_load("/cd/player/kleiner.dms");  // with the clips
+ *     DMSModel* alyx  = dc_model_load("/cd/player/alyx.dms");     // without
+ *     dc_model_share_anims(alyx, anims);
+ */
+bool dc_model_share_anims(DMSModel* model, const DMSModel* from);
+
 /* ================================================================
  * Bounds
  * ================================================================ */

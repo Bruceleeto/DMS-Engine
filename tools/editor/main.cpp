@@ -390,6 +390,10 @@ static void restore(const Snapshot& s) {
     }
     std::copy(s.objects.begin(), s.objects.end(), sc->objects);
     sc->object_count = n;
+    /* Each object's model as the scene has it now (one may have been reloaded
+     * since): found by path in its list, not read again */
+    for (int i = 0; i < n; i++) sc->objects[i].m = nullptr;
+    dc_scene_load_models(sc);
     sc->background = s.head.background;
     sc->fog = s.head.fog;
     sc->fog_rgb = s.head.fog_rgb;
@@ -607,6 +611,7 @@ static void default_layout(ImGuiID dock) {
     ImGui::DockBuilderDockWindow(WIN_CONSOLE, bottom);
     ImGui::DockBuilderDockWindow(WIN_PROJECT, bottom);
     ImGui::DockBuilderDockWindow(WIN_VRAM, bottom);
+    ImGui::DockBuilderDockWindow(WIN_GMOD, bottom);
     ImGui::DockBuilderDockWindow(WIN_SCENE, mid);
     ImGui::DockBuilderDockWindow(WIN_GAME, mid);
     ImGui::DockBuilderDockWindow(WIN_MODEL, mid);
@@ -834,6 +839,7 @@ int main(int argc, char** argv) {
     const char* select = nullptr;
     const char* import = nullptr;
     const char* model = nullptr;
+    const char* gmod = nullptr;
     bool play = false;
     int frames = 3;
     for (int i = 1; i < argc; i++) {
@@ -844,11 +850,13 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--select") && i + 1 < argc) select = argv[++i];
         else if (!strcmp(argv[i], "--play")) play = true;
         else if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
+        else if (!strcmp(argv[i], "--gmod") && i + 1 < argc) gmod = argv[++i];
         else if (!strcmp(argv[i], "--import-empties") && i + 1 < argc) import = argv[++i];
         else if (argv[i][0] != '-') project = argv[i];
         else {
             fprintf(stderr, "Usage: %s <project> [--scene scenes/main.json] [--shot out.png | --ui-shot out.png]"
-                            " [--frames N] [--select Name] [--play] [--model dir/name.glb] [--import-empties Object]\n", argv[0]);
+                            " [--frames N] [--select Name] [--play] [--model dir/name.glb] [--gmod models/x.mdl]"
+                            " [--import-empties Object]\n", argv[0]);
             return 2;
         }
     }
@@ -962,6 +970,7 @@ int main(int argc, char** argv) {
         job_poll();
         ed_import_poll();
         if (model && ImGui::GetFrameCount() == 2) model_open(model);
+        if (gmod && ImGui::GetFrameCount() == 2) gmod_open(gmod);
         play_poll();
         watch_file();
 
@@ -991,6 +1000,7 @@ int main(int argc, char** argv) {
         panel_console();
         model_window(renderer);
         panel_vram();
+        gmod_window(renderer);
 
         char title[256];
         snprintf(title, sizeof(title), "DMS Editor - %s%s - %s", ed.scene_rel.c_str(), ed.dirty ? " *" : "", ed.project.c_str());
@@ -1002,7 +1012,7 @@ int main(int argc, char** argv) {
         ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), renderer);
         /* A ui shot waits for a played game's first frames */
         const DMSEmbed* g = play_shared();
-        bool waiting = (play && (play_state() == PlayState::Building || (g && g->frame < 30))) || model_busy();
+        bool waiting = (play && (play_state() == PlayState::Building || (g && g->frame < 30))) || model_busy() || gmod_busy();
         if (ui_shot && ++frame_no >= frames && !waiting) {
             SDL_Surface* s = SDL_RenderReadPixels(renderer, nullptr);
             SDL_Surface* rgb = s ? SDL_ConvertSurface(s, SDL_PIXELFORMAT_RGB24) : nullptr;
@@ -1020,6 +1030,7 @@ int main(int argc, char** argv) {
 
     play_shutdown();
     model_shutdown();
+    gmod_shutdown();
     ImGui_ImplSDLRenderer3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();

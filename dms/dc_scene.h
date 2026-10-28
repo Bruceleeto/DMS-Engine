@@ -50,6 +50,9 @@
 typedef struct {
     char       name[32];
     char       model[96];   /* under the scene's root */
+    char       anims[96];   /* "" or a model whose clips this one plays, by bone
+                             * name (dc_model_share_anims): one set of clips for
+                             * every model on the same skeleton */
     shz_vec3_t pos;
     shz_vec3_t rot;         /* degrees about x, y, z */
     shz_vec3_t scale;
@@ -90,8 +93,12 @@ typedef struct {
 /* Read a scene and load its models. NULL if the file is missing or not a
  * scene; a model that won't load leaves its object's m NULL (not drawn). */
 DCScene* dc_scene_load(const char* path, const char* root);
-/* The scene to play: the one the editor has open when its Play runs the
- * game (DMS_SCENE, Linux only), else the one named, both under root. */
+/* The scene to play, under root: the one the editor has open when its Play
+ * runs the game (DMS_SCENE, Linux only); else the one it had open when it
+ * last sent the game to a Dreamcast or Flycast (root's DC_START_SCENE, a
+ * line naming it, written then: delete it to start the named one again);
+ * else the one named. */
+#define DC_START_SCENE "start_scene.txt"
 DCScene* dc_scene_play(const char* root, const char* scene);
 /* The model of the object of that name (NULL if none) */
 DMSModel* dc_scene_model(DCScene* scene, const char* name);
@@ -119,6 +126,11 @@ void dc_scene_object_rot(const DCSceneObject* obj, float rot[9]);
 DCSceneObject* dc_scene_add(DCScene* scene, const char* name, const char* model);
 void dc_scene_remove(DCScene* scene, int index);
 void dc_scene_load_models(DCScene* scene);
+/* Read a model the scene has (path as its objects name it) again from its
+ * file, as after it is converted anew; every object with it gets the new one.
+ * False if the scene has no such model or the new one won't load (the old
+ * one stays). */
+bool dc_scene_reload_model(DCScene* scene, const char* path);
 
 /* Markers: an object with no model (model[0] == 0) */
 static inline bool dc_scene_is_marker(const DCSceneObject* obj) { return !obj->model[0]; }

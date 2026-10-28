@@ -419,13 +419,9 @@ static void apply() {
         if (!ok) return;
         built_load();
         ed_scan_assets();
-        /* The scene's copy of the model is the old one until the scene is read again */
-        if (!ed.dirty) {
-            Selection keep = ed.sel;
-            if (ed_open(ed.scene_rel)) ed.sel = keep;
-        } else {
-            ed_log("Save and reload the scene (File > Reload) to see the new %s in it", mv.src.c_str());
-        }
+        /* The scene's objects with it get the new one, unsaved edits and all */
+        if (ed.scene && dc_scene_reload_model(ed.scene, built_rel(mv.src).c_str()))
+            ed_log("Reloaded %s in the scene", built_rel(mv.src).c_str());
     });
 }
 

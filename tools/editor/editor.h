@@ -153,3 +153,10 @@ void model_window(void* renderer);
 void model_open(const std::string& src);
 void model_shutdown();
 bool model_busy();               /* converting a preview */
+
+/* gmod.cpp: the Garry's Mod tab, the game's models as they are, brought in
+ * (as a .glb under assets/gmod/) when asked */
+void gmod_window(void* renderer);
+void gmod_open(const std::string& mdl);     /* models/... as the game has it */
+void gmod_shutdown();
+bool gmod_busy();

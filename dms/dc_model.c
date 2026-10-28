@@ -2834,34 +2834,39 @@ static void draw_cel(DMSModel* model, shz_vec3_t pos, float scale, float yaw,
  * ================================================================ */
 
 static void update_skeleton(DMSSkeleton* sk, float delta_time) {
-    if (!sk || sk->animCount == 0) return;
+    if (!sk) return;
 
-    DMSAnimation* anim = &sk->animations[sk->currentAnim];
-    if (anim->frameCount < 2 || anim->duration <= 0.0f) return;
+    /* No clips (or a one-frame one): held still, in the rest pose or that frame */
+    DMSAnimation* anim = sk->animCount ? &sk->animations[sk->currentAnim] : NULL;
+    int   frame = 0, next = 0;
+    float alpha = 0.0f;
+    if (anim && anim->frameCount >= 2 && anim->duration > 0.0f) {
+        /* Advance time, loop */
+        sk->currentTime += delta_time;
+        while (sk->currentTime >= anim->duration) {
+            sk->currentTime -= anim->duration;
+            sk->loops++;
+        }
+        while (sk->currentTime < 0.0f)
+            sk->currentTime += anim->duration;
 
-    /* Advance time, loop */
-    sk->currentTime += delta_time;
-    while (sk->currentTime >= anim->duration) {
-        sk->currentTime -= anim->duration;
-        sk->loops++;
+        /* Compute interpolation frame + alpha */
+        float progress = sk->currentTime * shz_invf_fsrra(anim->duration);
+        float frame_f  = progress * (float)(anim->frameCount - 1);
+        frame = (int)frame_f;
+        next  = frame + 1;
+        if (next >= anim->frameCount) next = 0;
+        alpha = frame_f - (float)frame;
     }
-    while (sk->currentTime < 0.0f)
-        sk->currentTime += anim->duration;
-
-    /* Compute interpolation frame + alpha */
-    float progress = sk->currentTime * shz_invf_fsrra(anim->duration);
-    float frame_f  = progress * (float)(anim->frameCount - 1);
-    int   frame    = (int)frame_f;
-    int   next     = frame + 1;
-    if (next >= anim->frameCount) next = 0;
-    float alpha    = frame_f - (float)frame;
 
     /* Interpolate each bone's local pose and build world matrices */
     for (int i = 0; i < sk->boneCount; i++) {
         DMSBone* bone = &sk->bones[i];
 
-        DMSTransform* curr = &anim->framePoses[frame * sk->boneCount + i];
-        DMSTransform* nxt  = &anim->framePoses[next  * sk->boneCount + i];
+        /* Shared clips are another skeleton's: this bone's there, by name */
+        int j = !anim ? -1 : sk->animBone ? sk->animBone[i] : i;
+        DMSTransform* curr = j >= 0 ? &anim->framePoses[frame * anim->boneCount + j] : &bone->bindPose;
+        DMSTransform* nxt  = j >= 0 ? &anim->framePoses[next  * anim->boneCount + j] : &bone->bindPose;
 
         bone->localPose.translation =
             shz_vec3_lerp(curr->translation, nxt->translation, alpha);
@@ -2959,6 +2964,36 @@ void dc_model_anim_restart(DMSModel* model) {
 int dc_model_get_anim(DMSModel* model) {
     if (!model || !model->skeleton) return -1;
     return model->skeleton->currentAnim;
+}
+
+bool dc_model_share_anims(DMSModel* model, const DMSModel* from) {
+    if (!model || !model->skeleton || !from || !from->skeleton || model == from) return false;
+    if (from->skeleton->animBone) return false;     /* its clips are borrowed too */
+    DMSSkeleton* sk = model->skeleton;
+    const DMSSkeleton* fs = from->skeleton;
+    int* map = malloc(sk->boneCount * sizeof(int));
+    if (!map) return false;
+    int matched = 0;
+    for (int i = 0; i < sk->boneCount; i++) {
+        map[i] = -1;
+        for (int k = 0; k < fs->boneCount; k++)
+            if (!strcmp(sk->bones[i].name, fs->bones[k].name)) { map[i] = k; break; }
+        if (map[i] >= 0) matched++;
+    }
+    if (!matched || !fs->animCount) { free(map); return false; }
+    /* Its own clips go: it has the other's now */
+    if (!sk->animBone) {
+        for (int i = 0; i < sk->animCount; i++) free(sk->animations[i].framePoses);
+        free(sk->animations);
+    }
+    free(sk->animBone);
+    sk->animBone = map;
+    sk->animations = fs->animations;
+    sk->animCount = fs->animCount;
+    sk->currentAnim = 0;
+    sk->currentTime = 0.0f;
+    sk->loops = 0;
+    return true;
 }
 
 int dc_model_anim_index(const DMSModel* model, const char* name) {
@@ -4404,7 +4439,8 @@ void dc_model_free(DMSModel* model) {
     if (model->skeleton) {
         DMSSkeleton* sk = model->skeleton;
         if (sk->bones) free(sk->bones);
-        if (sk->animations) {
+        free(sk->animBone);
+        if (sk->animations && !sk->animBone) {
             for (int i = 0; i < sk->animCount; i++) {
                 if (sk->animations[i].framePoses)
                     free(sk->animations[i].framePoses);
