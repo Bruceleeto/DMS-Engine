@@ -17,6 +17,7 @@
 #include "ImGuizmo.h"
 #include "png.h"
 #include "pvr_host.h"
+#include <filesystem>
 #include <SDL3/SDL.h>
 #include <dirent.h>
 #include <fcntl.h>
@@ -261,6 +262,7 @@ static bool write_file(const std::string& path, const char* text) {
  * ================================================================ */
 
 static void set_scene(DCScene* s) {
+    view_surfaces_forget();
     if (ed.scene) dc_scene_free(ed.scene);
     ed.scene = s;
     ed.sel = Selection();
@@ -467,10 +469,12 @@ std::string ed_unique_name(const char* base) {
     }
 }
 
-/* In front of the view, on the ground if the view looks down at it */
+/* In front of the view: on what it looks at, or on the ground if it looks
+ * down at it */
 static shz_vec3_t drop_point() {
     float sy = sinf(ed.cam.yaw), cy = cosf(ed.cam.yaw), sp = sinf(ed.cam.pitch), cp = cosf(ed.cam.pitch);
-    shz_vec3_t f = shz_vec3_init(sy * cp, -sp, cy * cp);
+    shz_vec3_t f = shz_vec3_init(sy * cp, -sp, cy * cp), hit;
+    if (view_ray_scene(ed.cam.pos, f, 40.0f, -1, &hit)) return hit;
     float d = 6.0f;
     if (f.y < -0.05f && -ed.cam.pos.y / f.y < 40.0f && ed.cam.pos.y > 0.0f) d = -ed.cam.pos.y / f.y;
     return shz_vec3_init(ed.cam.pos.x + f.x * d, ed.cam.pos.y + f.y * d, ed.cam.pos.z + f.z * d);
@@ -619,9 +623,56 @@ static void default_layout(ImGuiID dock) {
 }
 
 static char new_name[96] = "scenes/new.json";
+static char new_project_name[64] = "";
+static std::string new_project_error;
+
+/* The editor again, on another project (it keeps one a run) */
+static void switch_project(const std::string& dir) {
+    if (play_state() != PlayState::Stopped) play_stop();
+    if (ed.dirty) ed_save();
+    ed_log("Opening %s", dir.c_str());
+    if (const char* ini = ImGui::GetIO().IniFilename) ImGui::SaveIniSettingsToDisk(ini);
+    execl("/proc/self/exe", "dms-editor", dir.c_str(), (char*)nullptr);
+    ed_log("Cannot start the editor on %s", dir.c_str());
+}
+
+/* Every project the build knows: examples/x and games/x with a Makefile */
+static std::vector<std::string> projects() {
+    namespace fs = std::filesystem;
+    std::vector<std::string> out;
+    std::error_code ec;
+    for (const char* top : { "games", "examples" })
+        for (const auto& d : fs::directory_iterator(ed.root + top, ec))
+            if (fs::exists(d.path() / "Makefile", ec)) out.push_back(std::string(top) + "/" + d.path().filename().string());
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+/* games/<name>, a copy of examples/freecam (its game code, its scene), then
+ * opened. An error, or "" */
+static std::string new_project(const std::string& name) {
+    namespace fs = std::filesystem;
+    if (name.empty()) return "Give it a name";
+    for (char c : name)
+        if (!isalnum((unsigned char)c) && c != '_' && c != '-') return "Letters, digits, - and _ only";
+    std::string from = ed.root + "examples/freecam/", to = ed.root + "games/" + name + "/";
+    std::error_code ec;
+    if (fs::exists(to, ec)) return "games/" + name + " is there already";
+    fs::create_directories(to, ec);
+    for (const char* f : { "Makefile", "main.c" }) fs::copy_file(from + f, to + f, ec);
+    if (!ec) fs::copy(from + "assets", to + "assets", fs::copy_options::recursive, ec);
+    if (ec) return "Cannot copy examples/freecam: " + ec.message();
+    if (FILE* f = fopen((to + "README.md").c_str(), "w")) {
+        fprintf(f, "# %s\n\nMade from examples/freecam: a free camera through whichever scene is open in the\n"
+                   "editor. Add things to `assets/` and the scene, then make `main.c` a game.\n", name.c_str());
+        fclose(f);
+    }
+    switch_project(to);
+    return "Cannot start the editor on games/" + name;
+}
 
 static void menu_bar(bool* quit) {
-    bool open_new = false;
+    bool open_new = false, open_project = false;
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8, 7));
     if (!ImGui::BeginMainMenuBar()) { ImGui::PopStyleVar(); return; }
     if (ui::font_bold) ImGui::PushFont(ui::font_bold, 0.0f);
@@ -629,6 +680,13 @@ static void menu_bar(bool* quit) {
     if (ui::font_bold) ImGui::PopFont();
     ImGui::Spacing();
     if (ImGui::BeginMenu("File")) {
+        if (ImGui::MenuItem(ICON_PLUS "  New Project...")) open_project = true;
+        if (ImGui::BeginMenu(ICON_FOLDER_OPEN "  Open Project")) {
+            for (const std::string& p : projects())
+                if (ImGui::MenuItem(p.c_str(), nullptr, ed.root + p + "/" == ed.project)) switch_project(ed.root + p + "/");
+            ImGui::EndMenu();
+        }
+        ImGui::Separator();
         if (ImGui::MenuItem(ICON_PLUS "  New Scene...")) open_new = true;
         if (ImGui::BeginMenu(ICON_FOLDER_OPEN "  Open Scene", !ed.scenes.empty())) {
             for (auto& s : ed.scenes)
@@ -679,6 +737,23 @@ static void menu_bar(bool* quit) {
     }
     ImGui::EndMainMenuBar();
     ImGui::PopStyleVar();
+
+    if (open_project) {
+        new_project_error.clear();
+        ImGui::OpenPopup("New project");
+    }
+    if (ImGui::BeginPopupModal("New project", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextDisabled("A free camera through an empty scene, to add things to");
+        ImGui::SetNextItemWidth(280);
+        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+        bool enter = ImGui::InputText("##name", new_project_name, sizeof(new_project_name), ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::TextDisabled("games/%s", new_project_name[0] ? new_project_name : "...");
+        if (!new_project_error.empty()) ImGui::TextColored(ImColor(ui::ERROR), "%s", new_project_error.c_str());
+        if (ImGui::Button("Create", ImVec2(136, 0)) || enter) new_project_error = new_project(new_project_name);
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(136, 0))) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
 
     if (open_new) ImGui::OpenPopup("New scene");
     if (ImGui::BeginPopupModal("New scene", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {

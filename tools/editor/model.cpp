@@ -420,6 +420,7 @@ static void apply() {
         built_load();
         ed_scan_assets();
         /* The scene's objects with it get the new one, unsaved edits and all */
+        view_surfaces_forget();
         if (ed.scene && dc_scene_reload_model(ed.scene, built_rel(mv.src).c_str()))
             ed_log("Reloaded %s in the scene", built_rel(mv.src).c_str());
     });

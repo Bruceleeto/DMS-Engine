@@ -257,9 +257,10 @@ static void inspect_object(DCSceneObject& o) {
         if (ImGui::Button(ICON_REFRESH "  Reset")) { ed_edited(); o.rot = shz_vec3_init(0, 0, 0); o.scale = shz_vec3_init(1, 1, 1); }
         ImGui::SameLine();
         if (ImGui::Button(ICON_LAYERS "  Drop to ground") && o.m) {
-            DCBounds b = dc_model_bounds(o.m, nullptr);
-            if (b.min.y <= b.max.y) { ed_edited(); o.pos.y = -b.min.y * o.scale.y; }
+            ed_edited();
+            view_drop_to_ground(ed.sel.index);
         }
+        ui::tooltip("Down onto what is under it");
         if (o.m && o.m->skeleton && (o.rot.x != 0.0f || o.rot.z != 0.0f))
             ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "Skinned: only the turn about y is drawn");
     }
@@ -299,6 +300,7 @@ static void inspect_object(DCSceneObject& o) {
                     ed_edited();
                     snprintf(o.anims, sizeof(o.anims), "%s", pick.c_str());
                     /* Loaded again, with its own clips or the other's */
+                    view_surfaces_forget();
                     dc_scene_reload_model(ed.scene, o.model);
                 }
             }

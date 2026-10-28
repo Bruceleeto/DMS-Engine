@@ -116,6 +116,10 @@ void view_matrices(const DCCamera& cam, float view[16], float proj[16]);
 bool view_project(const DCCamera& cam, shz_vec3_t p, float* x, float* y);
 /* Where a window point over the scene view meets the ground; false if not over it */
 bool view_ground_at(float x, float y, shz_vec3_t* out);
+/* Rays against the scene's models' triangles; forget them when the models go */
+bool view_ray_scene(shz_vec3_t o, shz_vec3_t d, float max, int skip, shz_vec3_t* hit);
+bool view_drop_to_ground(int index);
+void view_surfaces_forget();
 
 /* play.cpp: the game, built for Linux, running in the Game tab */
 enum class PlayState { Stopped, Building, Running, Paused };

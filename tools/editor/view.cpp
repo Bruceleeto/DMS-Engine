@@ -9,6 +9,10 @@
 #include "ui.h"
 #include <math.h>
 #include <float.h>
+#include <map>
+extern "C" {
+#include "dms/collision.h"
+}
 
 static const float NEAR = 0.1f;
 static const float DEG = 3.14159265f / 180.0f;
@@ -294,14 +298,77 @@ static void pick(const DCCamera& c, float fx, float fy) {
     ed.sel = hit;
 }
 
-/* Where a ray meets the ground, or a way ahead if it doesn't */
-static shz_vec3_t ground_point(const DCCamera& c, float fx, float fy) {
-    shz_vec3_t d = ray_dir(c, fx, fy);
+/* ================================================================
+ * The scene's surfaces: rays against the models' own triangles (a level
+ * is not a box), each model's built once, in its own space
+ * ================================================================ */
+
+static std::map<DMSModel*, ColWorld*> g_cols;
+
+void view_surfaces_forget() {
+    for (auto& kv : g_cols) col_free(kv.second);
+    g_cols.clear();
+}
+
+/* The nearest of the scene's surfaces along o + d t (t up to max), but for
+ * object skip's; false if none */
+bool view_ray_scene(shz_vec3_t o, shz_vec3_t d, float max, int skip, shz_vec3_t* hit) {
+    if (!ed.scene) return false;
+    float best = max;
+    bool any = false;
+    for (int i = 0; i < ed.scene->object_count; i++) {
+        const DCSceneObject& ob = ed.scene->objects[i];
+        float tb;
+        if (i == skip || ob.hidden || !ob.m || dc_scene_is_marker(&ob) || !ray_box(o, d, ob, &tb)) continue;
+        auto it = g_cols.find(ob.m);
+        if (it == g_cols.end()) it = g_cols.emplace(ob.m, col_build(ob.m, shz_vec3_init(0, 0, 0), 1.0f)).first;
+        if (!it->second) continue;
+        /* into its space as ray_box does: the same t along the ray */
+        float r[9];
+        dc_scene_object_rot(&ob, r);
+        shz_vec3_t p = sub(o, ob.pos);
+        shz_vec3_t lo = shz_vec3_init((r[0] * p.x + r[1] * p.y + r[2] * p.z) / ob.scale.x,
+                                      (r[3] * p.x + r[4] * p.y + r[5] * p.z) / ob.scale.y,
+                                      (r[6] * p.x + r[7] * p.y + r[8] * p.z) / ob.scale.z);
+        shz_vec3_t ld = shz_vec3_init((r[0] * d.x + r[1] * d.y + r[2] * d.z) / ob.scale.x,
+                                      (r[3] * d.x + r[4] * d.y + r[5] * d.z) / ob.scale.y,
+                                      (r[6] * d.x + r[7] * d.y + r[8] * d.z) / ob.scale.z);
+        ColRayHit h = col_raycast(it->second, lo, ld, best);
+        if (h.hit && h.t < best) {
+            best = h.t;
+            any = true;
+        }
+    }
+    if (any) *hit = add(o, mul(d, best));
+    return any;
+}
+
+/* Where a ray meets the scene (or the ground, height 0, in an empty one),
+ * or a way ahead if it meets neither */
+static shz_vec3_t ground_point(const DCCamera& c, float fx, float fy, int skip = -1) {
+    shz_vec3_t d = ray_dir(c, fx, fy), hit;
+    if (view_ray_scene(c.pos, d, 400.0f, skip, &hit)) return hit;
     if (d.y < -0.01f && c.pos.y > 0.0f) {
         float t = -c.pos.y / d.y;
         if (t < 200.0f) return add(c.pos, mul(d, t));
     }
     return add(c.pos, mul(d, 8.0f));
+}
+
+/* Object i straight down onto what is under it (its lowest point on it);
+ * onto height 0 if nothing is */
+bool view_drop_to_ground(int i) {
+    DCSceneObject& o = ed.scene->objects[i];
+    shz_vec3_t k[8];
+    if (!object_box(o, k)) return false;
+    float low = FLT_MAX;
+    shz_vec3_t mid = shz_vec3_init(0, 0, 0);
+    for (const shz_vec3_t& c : k) { low = fminf(low, c.y); mid = add(mid, mul(c, 0.125f)); }
+    shz_vec3_t from = shz_vec3_init(mid.x, low + 0.05f, mid.z), hit;
+    float y = 0.0f;
+    if (view_ray_scene(from, shz_vec3_init(0, -1, 0), 10000.0f, i, &hit)) y = hit.y;
+    o.pos.y += y - low;
+    return true;
 }
 
 bool view_ground_at(float x, float y, shz_vec3_t* out) {
@@ -548,7 +615,8 @@ void view_window() {
             std::string model((const char*)p->Data, p->DataSize);
             ed_add_model(model);
             if (ed.sel.kind == SelKind::Object)
-                ed.scene->objects[ed.sel.index].pos = ground_point(ed.cam, (mp.x - at.x) / g_scale, (mp.y - at.y) / g_scale);
+                ed.scene->objects[ed.sel.index].pos =
+                    ground_point(ed.cam, (mp.x - at.x) / g_scale, (mp.y - at.y) / g_scale, ed.sel.index);
         }
         /* from the Library: imported, then put here */
         if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload("DMS_LIBRARY")) {
