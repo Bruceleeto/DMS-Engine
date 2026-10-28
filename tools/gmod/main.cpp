@@ -1,4 +1,4 @@
-/* gmod2glb: Garry's Mod models and maps (and the HL2, CS:S and TF2 installed beside it, and
+/* gmod2glb: Garry's Mod models and maps (and the HL2, CS:S, TF2 and Portal installed beside it, and
  * workshop addons) to .glb, which strippy makes .dms of.
  *
  *   gmod2glb --list [text]             the models whose path has text in it
@@ -426,6 +426,15 @@ static bool map_info(Vfs& vfs, const std::string& path, const Options& opt, cons
         std::string err;
         int fw = 0, fh = 0;
         bool ok = texture_of(vfs, vmt, opt.tex, mat, im, err, &fw, &fh);
+        /* Water and glass have no texture of their own: a see-through tint */
+        if (!ok && (mat.shader == "water" || mat.shader == "refract")) {
+            bool water = mat.shader == "water";
+            im.w = im.h = 1;
+            im.rgba = water ? std::vector<uint8_t>{ 64, 97, 115, 153 } : std::vector<uint8_t>{ 191, 217, 230, 64 };
+            mat.translucent = true;
+            ok = true;
+            err.clear();
+        }
         if (print)
             printf("mat\t%s\t%s\t%s\t%d\t%d\t%s\n", vmt_base(vmt).c_str(), vmt.c_str(), mat.basetexture.c_str(), fw, fh,
                    ok ? "" : err.c_str());
@@ -545,6 +554,9 @@ static bool write_world(const Vfs& vfs, const Bsp& b, const std::string& out, in
             else if (mat.alphatest) json += ",\"alphaMode\":\"MASK\"";
         } else if (mat.shader == "water") {
             json += ",\"pbrMetallicRoughness\":{\"baseColorFactor\":[0.25,0.38,0.45,0.6],\"metallicFactor\":0,\"roughnessFactor\":1}"
+                    ",\"alphaMode\":\"BLEND\"";
+        } else if (mat.shader == "refract") {     /* glass that bends what is behind it: faint */
+            json += ",\"pbrMetallicRoughness\":{\"baseColorFactor\":[0.75,0.85,0.9,0.25],\"metallicFactor\":0,\"roughnessFactor\":1}"
                     ",\"alphaMode\":\"BLEND\"";
         } else {
             fprintf(stderr, "  %s: %s\n", gr.material.c_str(), err.c_str());

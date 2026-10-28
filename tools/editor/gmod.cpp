@@ -1,6 +1,6 @@
 /* The Garry's Mod tab: the models and maps of Garry's Mod (its addons and
  * workshop too) and of the other Source games installed beside it (Half-Life 2
- * and its episodes, Counter-Strike: Source, Team Fortress 2), as the games
+ * and its episodes, Counter-Strike: Source, Team Fortress 2, Portal), as the games
  * have them, untouched, and the
  * choices for bringing one into the project: its skin, its body parts, its
  * animations, how big its textures may be. Nothing is converted until asked:
@@ -78,15 +78,16 @@ static std::string base_name(const std::string& p) {
 namespace {
 
 /* Which game a file is from, by where it was found */
-enum Game { ALL, GMOD, HL2, CSS, TF2, ADDONS, GAMES };
+enum Game { ALL, GMOD, HL2, CSS, TF2, PORTAL, ADDONS, GAMES };
 static const char* const GAME_NAMES[GAMES] = { "Every game", "Garry's Mod", "Half-Life 2", "Counter-Strike: Source",
-                                               "Team Fortress 2", "Addons" };
+                                               "Team Fortress 2", "Portal", "Addons" };
 static Game game_of(const std::string& from) {
     auto starts = [&](const char* p) { return !from.compare(0, strlen(p), p); };
     if (starts("workshop/") || starts("addons/")) return ADDONS;
     if (starts("hl2") || starts("content_hl2")) return HL2;
     if (starts("cstrike") || starts("content_cstrike")) return CSS;
     if (starts("tf/") || from == "tf") return TF2;
+    if (starts("portal")) return PORTAL;
     return GMOD;
 }
 
