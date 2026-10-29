@@ -4,6 +4,7 @@
 #include <math.h>
 #include "nav.h"
 #include "dms/dc_engine.h"
+#include "dms/dc_file.h"
 
 /* The eight cells round one, each the other way round from its neighbour in
  * the list (d ^ 1), the straight ones first */
@@ -314,4 +315,141 @@ bool nav_random_spot(const Nav* nav, float min, float max, shz_vec3_t* out) {
         return true;
     }
     return false;
+}
+
+/* ---- In a file ----
+ * Off a disc it is the size that costs (a CD reads about 120 KB a second in
+ * Flycast), so it is kept small: a header (what it was built from, the
+ * grid's size), then each tile that has floor (its number, and a bit for
+ * each of its cells that is one), then each of those cells' links, then
+ * their floors in 1/128 m over the lowest. The cells are numbered again in
+ * that order, which nothing minds. Both ends are little endian. */
+
+#define NAV_MAGIC 0x3256414Eu   /* "NAV2" */
+#define NAV_Q     128.0f        /* floor steps a metre */
+#define NAV_SLOTS (NAV_TILE * NAV_TILE)
+#define NAV_TREC  (2 + NAV_SLOTS / 8)   /* a tile: its number, its bits */
+
+typedef struct {
+    uint32_t magic;
+    int32_t  tris, gx, gz;      /* the collision it was built over */
+    float    min_x, min_z, cell, radius;
+    int32_t  sx, sz;            /* the cell it was walked out from */
+    int32_t  w, h, n, used;
+    float    floor_lo;
+} NavFile;
+
+static void nav_key(NavFile* f, ColWorld* col, float cell, float radius, shz_vec3_t start) {
+    memset(f, 0, sizeof(*f));
+    f->magic = NAV_MAGIC;
+    f->tris = col->tri_count;
+    f->gx = col->gx;
+    f->gz = col->gz;
+    f->min_x = col->min_x;
+    f->min_z = col->min_z;
+    f->cell = cell;
+    f->radius = radius;
+    f->sx = (int)floorf((start.x - col->min_x) / cell);
+    f->sz = (int)floorf((start.z - col->min_z) / cell);
+}
+
+bool nav_save(const Nav* nav, ColWorld* col, float radius, shz_vec3_t start, const char* path) {
+    if (!nav->n || !col) return false;
+    NavFile f;
+    nav_key(&f, col, nav->cell, radius, start);
+    int tiles = nav->tw * nav->th;
+    f.w = nav->w; f.h = nav->h; f.n = nav->n;
+    f.floor_lo = nav->floor[0];
+    float hi = f.floor_lo;
+    for (int c = 0; c < nav->n; c++) {
+        if (nav->floor[c] < f.floor_lo) f.floor_lo = nav->floor[c];
+        if (nav->floor[c] > hi) hi = nav->floor[c];
+    }
+    if ((hi - f.floor_lo) * NAV_Q > 65535.0f || tiles > 65535) return false;
+    for (int t = 0; t < tiles; t++) f.used += nav->tiles[t] != NULL;
+
+    size_t n = nav->n, size = (size_t)f.used * NAV_TREC + n * 3;
+    uint8_t* buf = calloc(size, 1);
+    if (!buf) return false;
+    uint8_t *tp = buf, *lp = buf + (size_t)f.used * NAV_TREC, *fp16 = lp + n;
+    for (int t = 0; t < tiles; t++) {
+        const int32_t* cells = nav->tiles[t];
+        if (!cells) continue;
+        tp[0] = t & 0xFF; tp[1] = t >> 8;
+        for (int s = 0; s < NAV_SLOTS; s++) {
+            int c = cells[s];
+            if (c < 0) continue;
+            tp[2 + s / 8] |= 1 << (s % 8);
+            *lp++ = nav->links[c];
+            unsigned q = (unsigned)((nav->floor[c] - f.floor_lo) * NAV_Q + 0.5f);
+            *fp16++ = q & 0xFF; *fp16++ = q >> 8;
+        }
+        tp += NAV_TREC;
+    }
+    FILE* fp = fopen(path, "wb");
+    bool ok = fp && fwrite(&f, sizeof(f), 1, fp) == 1 && fwrite(buf, 1, size, fp) == size;
+    free(buf);
+    if (!fp) return false;
+    if (fclose(fp) || !ok) { remove(path); return false; }
+    return true;
+}
+
+int nav_load(Nav* nav, ColWorld* col, float cell, float radius, shz_vec3_t start, const char* path) {
+    memset(nav, 0, sizeof(*nav));
+    nav->goal = -1;
+    if (!col) return 0;
+    FILE* fp = dc_asset_fopen(path, "rb");
+    if (!fp) return 0;
+    uint64_t t0 = dc_time_ms();
+    NavFile f, want;
+    nav_key(&want, col, cell, radius, start);
+    /* The collision is built the same on both, but its sums may not come out
+     * to the last bit the same on the SH4 */
+    if (fread(&f, sizeof(f), 1, fp) != 1 || f.magic != want.magic || f.tris != want.tris || f.gx != want.gx ||
+        f.gz != want.gz || fabsf(f.min_x - want.min_x) > 1e-3f || fabsf(f.min_z - want.min_z) > 1e-3f ||
+        f.cell != want.cell || f.radius != want.radius || f.sx != want.sx || f.sz != want.sz ||
+        f.n <= 0 || f.w <= 0 || f.h <= 0 || f.w > 65535 || f.h > 65535 || f.used <= 0) {
+        fclose(fp);
+        return 0;
+    }
+    nav->w = f.w; nav->h = f.h; nav->n = f.n;
+    nav->tw = (f.w + NAV_TILE - 1) / NAV_TILE;
+    nav->th = (f.h + NAV_TILE - 1) / NAV_TILE;
+    nav->cell = cell;
+    nav->x0 = col->min_x;
+    nav->z0 = col->min_z;
+    int tiles = nav->tw * nav->th;
+    size_t n = f.n, size = (size_t)f.used * NAV_TREC + n * 3;
+    uint8_t* buf = malloc(size);
+    bool ok = buf && fread(buf, 1, size, fp) == size;
+    fclose(fp);
+    ok = ok && (nav->tiles = calloc(tiles, sizeof(int32_t*))) &&
+         (nav->cx = malloc(n * sizeof(uint16_t))) && (nav->cz = malloc(n * sizeof(uint16_t))) &&
+         (nav->floor = malloc(n * sizeof(float))) && (nav->links = malloc(n)) &&
+         (nav->dist = malloc(n * sizeof(uint16_t))) && (nav->queue = malloc(n * sizeof(int))) &&
+         (nav->queued = calloc(n, 1));
+
+    /* Each tile's cells, numbered in turn */
+    const uint8_t *tp = buf, *lp = buf + (size_t)f.used * NAV_TREC, *fp16 = lp + n;
+    size_t c = 0;
+    for (int k = 0; ok && k < f.used; k++, tp += NAV_TREC) {
+        int t = tp[0] | tp[1] << 8;
+        if (t >= tiles || nav->tiles[t] || !(nav->tiles[t] = malloc(NAV_SLOTS * sizeof(int32_t)))) { ok = false; break; }
+        int bx = t % nav->tw * NAV_TILE, bz = t / nav->tw * NAV_TILE;
+        for (int s = 0; s < NAV_SLOTS; s++) {
+            if (!(tp[2 + s / 8] & (1 << (s % 8)))) { nav->tiles[t][s] = -1; continue; }
+            if (c == n) { ok = false; break; }
+            nav->tiles[t][s] = (int32_t)c;
+            nav->cx[c] = (uint16_t)(bx + s % NAV_TILE);
+            nav->cz[c] = (uint16_t)(bz + s / NAV_TILE);
+            nav->links[c] = lp[c];
+            nav->floor[c] = f.floor_lo + (fp16[c * 2] | fp16[c * 2 + 1] << 8) / NAV_Q;
+            nav->dist[c] = NAV_FAR;
+            c++;
+        }
+    }
+    free(buf);
+    if (!ok || c != n) { nav_free(nav); return 0; }
+    printf("nav: %d cells from %s (%u ms)\n", nav->n, path, (unsigned)(dc_time_ms() - t0));
+    return nav->n;
 }

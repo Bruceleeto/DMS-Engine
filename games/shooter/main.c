@@ -537,7 +537,15 @@ int main(int argc, char* argv[]) {
     float start_yaw = camera.yaw;
     /* Where the infected can walk: what can be walked to from here. The
      * spawn marker is at your feet. */
-    if (!nav_build(&nav, col, 0.75f, Z_RADIUS, start)) { printf("shooter: nowhere to walk\n"); return 1; }
+    if (!nav_load(&nav, col, 0.75f, Z_RADIUS, start, ASSETS "scenes/main.nav")) {
+        if (!nav_build(&nav, col, 0.75f, Z_RADIUS, start)) { printf("shooter: nowhere to walk\n"); return 1; }
+#ifdef DMS_HOST
+        /* Kept for the console, which then need not work it out (make host once after the map changes) */
+        if (nav_save(&nav, col, Z_RADIUS, start, ASSETS "scenes/main.nav")) printf("nav: saved for the console\n");
+#else
+        printf("nav: built here; run the PC build once to keep it in scenes/main.nav\n");
+#endif
+    }
 
     Gun gun = { .m = dc_model_load(ASSETS "gmod/smg1/smg1.dms") };
     if (!gun.m) { printf("shooter: no gmod/smg1/smg1.dms (see README)\n"); return 1; }

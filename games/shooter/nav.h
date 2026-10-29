@@ -51,6 +51,13 @@ typedef struct {
 int  nav_build(Nav* nav, ColWorld* col, float cell, float radius, shz_vec3_t start);
 void nav_free(Nav* nav);
 
+/* The same grid kept in a file, so the console need not work it out at boot
+ * (8 s on a big map). The file says what it was built from (the collision,
+ * the cell, the radius, the cell started from); nav_load() takes it only if
+ * that is what it is given now, else 0 and it is built again. */
+bool nav_save(const Nav* nav, ColWorld* col, float radius, shz_vec3_t start, const char* path);
+int  nav_load(Nav* nav, ColWorld* col, float cell, float radius, shz_vec3_t start, const char* path);
+
 /* The cell a place is in, or -1 off the grid or on no floor. y picks the
  * floor nearest. */
 int nav_cell(const Nav* nav, shz_vec3_t p);
