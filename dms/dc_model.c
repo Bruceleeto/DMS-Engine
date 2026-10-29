@@ -2351,6 +2351,7 @@ static void draw_skinned_list(DMSModel* model, shz_vec3_t pos, float scale,
          * block anything: it is left out rather than drawn in its own colours */
         if (g_glow_only && !(mesh->material_flags & DMS_MAT_GLOW)) continue;
         if (model->vol_on == m + 1) continue;   /* drawn by the volume path */
+        if (mesh->hidden) continue;
 
         if (!dr) {
             dc_list_begin(target_list);
@@ -3727,6 +3728,18 @@ int dc_model_see_through(DMSModel* model, const char* material, uint8_t alpha) {
 
     if (!changed)
         printf("DMS: see-through: no mesh wears the material '%s'\n", material);
+    return changed;
+}
+
+int dc_model_hide(DMSModel* model, const char* material, bool hidden) {
+    if (!model || !model->material_names || !material) return 0;
+    int changed = 0;
+    for (uint32_t m = 0; m < model->mesh_count; m++)
+        if (!strcasecmp(model->material_names[m], material)) {
+            model->meshes[m].hidden = hidden;
+            changed++;
+        }
+    if (!changed) printf("DMS: hide: no mesh wears the material '%s'\n", material);
     return changed;
 }
 

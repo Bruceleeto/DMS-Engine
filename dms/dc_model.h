@@ -24,6 +24,12 @@ void dc_model_materials(const DMSModel* model);
  * meshes it changed. */
 int dc_model_see_through(DMSModel* model, const char* material, uint8_t alpha);
 
+/* Everything wearing this Blender material not drawn (and not skinned), or
+ * drawn again. Free to flip every frame: a second look kept in the model, an
+ * x-ray skeleton under the skin. Animated models only. Returns how many
+ * meshes it changed. */
+int dc_model_hide(DMSModel* model, const char* material, bool hidden);
+
 /* The texture on everything wearing this Blender material slides along by
  * itself: u and v are how many texture widths a second, u across and v down
  * (negative goes the other way). Water, lava, a conveyor belt, a screen of

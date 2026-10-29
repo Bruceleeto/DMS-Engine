@@ -22,6 +22,7 @@
 #include <zlib.h>
 
 #include "bsp.h"
+#include "../converter/meshoptimizer/src/meshoptimizer.h"
 #include "glb.h"
 #include <sys/stat.h>
 
@@ -68,6 +69,9 @@ struct Options {
     float light = 1;        /* a map: its light this many times brighter */
     float ambient = 0;      /* a map: no corner darker than this (0..1) */
     MdlPick pick;
+    std::vector<std::string> merge;     /* models put on this one's bones of the same name (GMod's c_arms) */
+    float merge_keep = 1;               /* of their triangles, this share kept (meshoptimizer) */
+    int merge_tex = 0;                  /* their textures no wider than this; 0: --tex, -1: none (plain white) */
 };
 
 /* A material's base texture, its biggest level no wider than max; full_w,
@@ -83,11 +87,98 @@ static bool texture_of(const Vfs& vfs, const std::string& vmt, int max, Material
     return vtf_decode(vtf, max, im, &err);
 }
 
+/* ================================================================
+ * Bonemerge: another model's triangles onto this one's bones of the same
+ * name, as GMod puts its c_arms on a c_ weapon. Each vertex is taken into
+ * its bones' space as the other model has them and back out as this one
+ * does, so it sits where the game would draw it.
+ * ================================================================ */
+
+/* p (3x4, model to bone) applied, and undone (it is a rotation and a move) */
+static Vec3 apply34(const float* p, Vec3 v, bool move) {
+    float w = move ? 1.0f : 0.0f;
+    return { p[0] * v.x + p[1] * v.y + p[2] * v.z + p[3] * w, p[4] * v.x + p[5] * v.y + p[6] * v.z + p[7] * w,
+             p[8] * v.x + p[9] * v.y + p[10] * v.z + p[11] * w };
+}
+static Vec3 undo34(const float* p, Vec3 v, bool move) {
+    if (move) { v.x -= p[3]; v.y -= p[7]; v.z -= p[11]; }
+    return { p[0] * v.x + p[4] * v.y + p[8] * v.z, p[1] * v.x + p[5] * v.y + p[9] * v.z, p[2] * v.x + p[6] * v.y + p[10] * v.z };
+}
+
+static bool bonemerge(const Vfs& vfs, Mdl& m, const std::string& path, float keep) {
+    Mdl o;
+    std::string why;
+    if (!mdl_load(vfs, path, o, &why)) { fprintf(stderr, "%s: %s\n", path.c_str(), why.c_str()); return false; }
+    std::map<std::string, int> bone_of;
+    for (size_t i = 0; i < m.bones.size(); i++) bone_of[m.bones[i].name] = (int)i;
+    /* Each of its bones: ours of the same name, or its nearest parent's that is */
+    std::vector<int> to(o.bones.size(), -1), via(o.bones.size(), -1);
+    size_t matched = 0;
+    for (size_t i = 0; i < o.bones.size(); i++) {
+        int b = (int)i;
+        while (b >= 0 && !bone_of.count(o.bones[b].name)) b = o.bones[b].parent;
+        if (b >= 0) { to[i] = bone_of[o.bones[b].name]; via[i] = b; matched += b == (int)i; }
+    }
+    if (!matched) { fprintf(stderr, "%s: no bone of the same name as %s's\n", path.c_str(), m.path.c_str()); return false; }
+
+    uint32_t first = (uint32_t)m.vertices.size();
+    for (MdlVertex v : o.vertices) {
+        Vec3 p{}, n{};
+        float sum = 0;
+        for (int k = 0; k < v.bones && k < 3; k++) {
+            int ob = v.bone[k], ub = to[ob];
+            if (ub < 0) { v.bone[k] = 0; v.weight[k] = 0; continue; }   /* a bone we have none like */
+            Vec3 lp = apply34(o.bones[via[ob]].pose_to_bone, v.pos, true);
+            Vec3 ln = apply34(o.bones[via[ob]].pose_to_bone, v.normal, false);
+            Vec3 wp = undo34(m.bones[ub].pose_to_bone, lp, true), wn = undo34(m.bones[ub].pose_to_bone, ln, false);
+            float w = v.weight[k];
+            p.x += wp.x * w; p.y += wp.y * w; p.z += wp.z * w;
+            n.x += wn.x * w; n.y += wn.y * w; n.z += wn.z * w;
+            v.bone[k] = (uint8_t)ub;
+            sum += w;
+        }
+        if (sum > 0) {
+            v.pos = { p.x / sum, p.y / sum, p.z / sum };
+            float l = sqrtf(n.x * n.x + n.y * n.y + n.z * n.z);
+            if (l > 0) v.normal = { n.x / l, n.y / l, n.z / l };
+        } else {
+            v.bones = 1; v.bone[0] = 0; v.weight[0] = 1;
+        }
+        m.vertices.push_back(v);
+    }
+    int mat0 = (int)m.materials.size();
+    m.materials.insert(m.materials.end(), o.materials.begin(), o.materials.end());
+    size_t tris = 0, had = 0;
+    for (MdlMesh me : o.meshes) {
+        me.material += mat0;
+        had += me.indices.size() / 3;
+        /* Fewer triangles, where it is wanted: the shape kept, seams and all */
+        if (keep < 1.0f && me.indices.size() >= 72) {
+            std::vector<uint32_t> out(me.indices.size());
+            size_t target = (size_t)(me.indices.size() / 3 * keep) * 3;
+            size_t n = meshopt_simplify(out.data(), me.indices.data(), me.indices.size(), &o.vertices[0].pos.x,
+                                        o.vertices.size(), sizeof(MdlVertex), target < 3 ? 3 : target, 0.05f, 0, nullptr);
+            if (n) { out.resize(n); me.indices = out; }
+        }
+        for (uint32_t& i : me.indices) i += first;
+        tris += me.indices.size() / 3;
+        m.meshes.push_back(me);
+    }
+    printf("  merged %s: %zu of its %zu bones, %zu triangles", path.c_str(), matched, o.bones.size(), tris);
+    if (tris != had) printf(" (of %zu)", had);
+    printf("\n");
+    return true;
+}
+
 static bool convert(const Vfs& vfs, const std::string& path, const std::string& out, const Options& opt) {
     Mdl m;
     std::string why;
     bool ok = opt.anims_only ? mdl_load_skeleton(vfs, path, m, &why) : mdl_load(vfs, path, m, &why, opt.pick);
     if (!ok) { fprintf(stderr, "%s: %s\n", path.c_str(), why.c_str()); return false; }
+    /* Materials from here on are the merged models' */
+    int merged_from = (int)m.materials.size();
+    if (!opt.anims_only)
+        for (const std::string& mp : opt.merge) if (!bonemerge(vfs, m, mp, opt.merge_keep)) return false;
 
     std::vector<AnimSource> all;
     std::set<std::string> seen;
@@ -155,7 +246,10 @@ static bool convert(const Vfs& vfs, const std::string& path, const std::string& 
             std::string json = "{\"name\":\"" + esc(base) + "\"";
             Image im;
             std::string err;
-            if (texture_of(vfs, vmt, opt.tex, mat, im, err)) {
+            int tex = me.material >= merged_from && opt.merge_tex ? opt.merge_tex : opt.tex;
+            if (tex < 0) {
+                /* Plain: white, for the game to colour */
+            } else if (texture_of(vfs, vmt, tex, mat, im, err)) {
                 {
                     bool alpha = mat.alphatest || mat.translucent;
                     std::vector<uint8_t> p = png(im, alpha);
@@ -702,6 +796,8 @@ static void usage(const char* self) {
             "usage: %s [--gmod dir] [--no-workshop] --list [text]\n"
             "       %s [--gmod dir] --anims model.mdl\n"
             "       %s [--gmod dir] model.mdl -o out.glb [--tex 256] [--anims name,prefix*,all] [--anims-only]\n"
+            "           [--merge models/weapons/c_arms_hev.mdl]   (on its bones of the same name: GMod's hands)\n"
+            "           [--merge-keep 0.2] [--merge-tex 128]   (of what is merged: a share of its triangles, smaller textures, -1 plain white)\n"
             "       %s [--gmod dir] --info model.mdl|maps/x.bsp [--preview out.bin] [--tex 512]\n"
             "       %s [--gmod dir] maps/x.bsp --assets <project>/assets [--name x] [--tex 128] [--no-props]\n"
             "           [--simplify 0.02]   (fewer triangles: how far shape (metres) and light (0..1) may move)\n"
@@ -739,6 +835,9 @@ int main(int argc, char** argv) {
         else if (a == "--player" && i + 1 < argc) player = argv[++i];
         else if (a == "--player-scale" && i + 1 < argc) player_scale = (float)atof(argv[++i]);
         else if (a == "--anims-only") opt.anims_only = true;
+        else if (a == "--merge" && i + 1 < argc) opt.merge.push_back(argv[++i]);
+        else if (a == "--merge-keep" && i + 1 < argc) opt.merge_keep = (float)atof(argv[++i]);
+        else if (a == "--merge-tex" && i + 1 < argc) opt.merge_tex = atoi(argv[++i]);
         else if (a == "--info") do_info = true;
         else if (a == "--preview" && i + 1 < argc) preview = argv[++i];
         else if (a == "--skin" && i + 1 < argc) opt.pick.skin = atoi(argv[++i]);

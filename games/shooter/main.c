@@ -14,6 +14,7 @@
 #include "dms/dc_particles.h"
 #include "dms/dc_beam.h"
 #include "dms/dc_corona.h"
+#include "dms/dc_bolt.h"
 #include "dms/collision.h"
 #include "nav.h"
 #include "ragdoll.h"
@@ -26,7 +27,8 @@
 /* A first person shooter: Half-Life 2's SMG in your hands on Civilization
  * Defense, and Left 4 Dead's infected coming at you in waves. B fires (left
  * Ctrl or the mouse on a PC), Y reloads (R), A jumps (Space) and starts again
- * once you are dead, Start quits.
+ * once you are dead, the L trigger swaps to the stun gun and back (Q), Start
+ * quits.
  *
  * The gun is drawn with a camera of its own that never moves, after the
  * world: Source's view models are made with the eye at their origin, looking
@@ -37,6 +39,15 @@
 #define SPARE     180
 #define FIRE_GAP  0.075f        /* seconds between shots, about 13 a second */
 
+/* The stun gun: a few shots a cartridge, an arc to what it hits */
+#define TASER_MAG    3
+#define TASER_SPARE  30
+#define TASER_GAP    0.5f
+#define TASER_RANGE  10.0f      /* metres the arc reaches */
+#define TASER_STUN   1.6f       /* seconds one stands stunned, then drops dead */
+#define TASER_ZAP    0.18f      /* seconds the arc shows */
+#define TASER_RGB    0x5A8CFF
+
 typedef enum { GUN_DRAW, GUN_IDLE, GUN_FIRE, GUN_RELOAD } GunState;
 
 typedef struct {
@@ -46,7 +57,30 @@ typedef struct {
     float wait;                 /* until the next shot can go */
     float kick;                 /* the view jolting up after a shot */
     int mag, spare;
+    int mag_size, spare_size;
+    float gap, jolt;            /* between shots; how far one lifts the view */
+    int muzzle;                 /* the bone shots leave from, or -1 */
+    shz_vec3_t lens;            /* its torch, from the muzzle */
+    bool lamp;                  /* the torch is part of it: its lens glows */
 } Gun;
+
+/* A view model and its clips; NULL if it is not there. muzzle: its bone
+ * shots leave from */
+static bool gun_load(Gun* g, const char* path, const char* idle, const char* fire, const char* draw,
+                     const char* reload, const char* muzzle) {
+    g->m = dc_model_load(path);
+    if (!g->m) return false;
+    g->a_idle   = dc_model_anim_index(g->m, idle);
+    g->a_fire   = dc_model_anim_index(g->m, fire);
+    g->a_draw   = dc_model_anim_index(g->m, draw);
+    g->a_reload = dc_model_anim_index(g->m, reload);
+    g->muzzle = -1;
+    const DMSSkeleton* sk = g->m->skeleton;
+    for (int i = 0; sk && i < sk->boneCount; i++)
+        if (!strcmp(sk->bones[i].name, muzzle)) g->muzzle = i;
+    if (g->muzzle < 0) printf("shooter: %s has no %s bone\n", path, muzzle);
+    return true;
+}
 
 static void gun_play(Gun* g, GunState s, int anim) {
     g->state = s;
@@ -64,7 +98,7 @@ static bool gun_update(Gun* g, const DCInput* inp, DCCamera* cam, float dt) {
     case GUN_RELOAD:
         if (dc_model_anim_done(g->m)) {
             if (g->state == GUN_RELOAD) {
-                int take = MAG - g->mag;
+                int take = g->mag_size - g->mag;
                 if (take > g->spare) take = g->spare;
                 g->mag += take;
                 g->spare -= take;
@@ -76,14 +110,14 @@ static bool gun_update(Gun* g, const DCInput* inp, DCCamera* cam, float dt) {
     case GUN_FIRE:
         if (fire && g->mag > 0 && g->wait <= 0.0f) {
             gun_play(g, GUN_FIRE, g->a_fire);
-            g->wait = FIRE_GAP;
+            g->wait = g->gap;
             g->mag--;
-            g->kick += 0.012f;
+            g->kick += g->jolt;
             shot = true;
         } else if (g->state == GUN_FIRE && !fire && dc_model_anim_done(g->m)) {
             gun_play(g, GUN_IDLE, g->a_idle);
         }
-        if (inp && dc_input_pressed(inp, CONT_Y) && g->mag < MAG && g->spare > 0)
+        if (inp && dc_input_pressed(inp, CONT_Y) && g->mag < g->mag_size && g->spare > 0)
             gun_play(g, GUN_RELOAD, g->a_reload);
         else if (fire && g->mag == 0 && g->spare > 0 && g->wait <= 0.0f)
             gun_play(g, GUN_RELOAD, g->a_reload);
@@ -136,6 +170,9 @@ typedef struct {
     float speed;
     int health;
     float flash;                /* red while hit */
+    float stun;                 /* stunned this much longer: stands there jerking */
+    bool xray;                  /* showing its skeleton, not its skin */
+    float xray_t;               /* till it flips again */
     float timer;                /* dead: until it goes; attacking: to the next hit */
     shz_vec3_t goal;            /* where it is heading next (nav_steer) */
     float repath;               /* until it looks again */
@@ -150,6 +187,18 @@ typedef struct {
 } Zombie;
 
 static Zombie zombies[ZOMBIES];
+
+/* Its skin, and the skeleton under it (Garry's Mod's, put on the same bones
+ * when it was brought in: see README); one or the other is drawn */
+static const char* Z_SKIN[] = { "common_police_male_head_02", "common_male_upper_01", "common_male_lower_01" };
+#define Z_BONES "skeleton"
+
+static void z_look(Zombie* z, bool xray) {
+    if (z->xray == xray) return;
+    z->xray = xray;
+    for (int i = 0; i < (int)(sizeof(Z_SKIN) / sizeof(Z_SKIN[0])); i++) dc_model_hide(z->m, Z_SKIN[i], xray);
+    dc_model_hide(z->m, Z_BONES, !xray);
+}
 static int a_run, a_attack, a_idle, a_death[N_DEATHS];
 static Nav nav;
 
@@ -157,6 +206,17 @@ static float frand(float lo, float hi) { return lo + (hi - lo) * (float)rand() /
 
 static void z_play(Zombie* z, int anim) {
     if (dc_model_get_anim(z->m) != anim) dc_model_set_anim(z->m, anim);
+}
+
+/* One of them killed by a shot along d */
+static void z_kill(Zombie* z, shz_vec3_t d) {
+    z->state = Z_DEAD;
+    z->timer = Z_DEAD_TIME;
+    z->death = rand() % N_DEATHS;
+    z->limp = z->rd.tracked = false;
+    z->knock = shz_vec3_scale(d, Z_KNOCK);
+    z_play(z, a_death[z->death]);
+    dc_model_anim_restart(z->m);
 }
 
 /* Somewhere it can get to you from, not too close */
@@ -170,7 +230,7 @@ static bool z_spawn(Zombie* z, shz_vec3_t you) {
     z->wz = cosf(z->yaw);
     z->speed = Z_SPEED + frand(-0.4f, 0.4f);
     z->health = Z_HEALTH;
-    z->flash = z->timer = z->repath = z->stuck = 0.0f;
+    z->flash = z->timer = z->repath = z->stuck = z->stun = 0.0f;
     z_play(z, a_run);
     return true;
 }
@@ -191,6 +251,18 @@ static int z_update(Zombie* z, ColWorld* col, shz_vec3_t you, float dt) {
     float dx = you.x - z->pos.x, dz = you.z - z->pos.z;
     float dist = sqrtf(dx * dx + dz * dz);
     float rate = 1.0f;
+
+    /* Stunned: where it stands, its clip jerking on in fits, then it drops
+     * dead where it is */
+    if ((z->state == Z_RUN || z->state == Z_ATTACK) && z->stun > 0.0f) {
+        z->stun -= dt;
+        if (z->stun <= 0.0f) {
+            z_kill(z, shz_vec3_init(0.0f, 0.0f, 0.0f));
+            return 0;
+        }
+        dc_model_animate(z->m, frand(0.0f, 1.0f) < 0.35f ? dt * 3.0f : 0.0f);
+        return 0;
+    }
 
     switch (z->state) {
     case Z_FREE:
@@ -358,10 +430,10 @@ typedef struct {
     DCParticles *flash, *smoke;     /* in the gun's space */
     DCParticles *sparks, *dust;     /* the world */
     DCParticles *blood, *drops;
-    int muzzle;                     /* the gun's muzzle bone, or -1 */
+    DCParticles *zap;               /* the stun gun's arc meeting something */
 } Fx;
 
-static Fx fx_init(const DMSModel* gun) {
+static Fx fx_init(void) {
     Fx f;
     f.flash = dc_particles_create(16, &(DCParticleOpts){
         .speed = { 0, 0, 0.6f }, .speed_spread = { 0.15f, 0.15f, 0.3f },
@@ -388,18 +460,17 @@ static Fx fx_init(const DMSModel* gun) {
         .speed_spread = { 1.2f, 1.2f, 1.2f }, .gravity = 9.8f,
         .life = 0.5f, .life_spread = 0.15f, .size = 0.035f, .size_spread = 0.015f,
         .start = 0x900805, .end = 0x500302, .smoke = true });
-    f.muzzle = -1;
-    const DMSSkeleton* sk = gun->skeleton;
-    for (int i = 0; sk && i < sk->boneCount; i++)
-        if (!strcmp(sk->bones[i].name, "ValveBiped.muzzle")) f.muzzle = i;
-    if (f.muzzle < 0) printf("shooter: the gun has no muzzle bone, no flash\n");
+    f.zap = dc_particles_create(96, &(DCParticleOpts){
+        .speed_spread = { 2.8f, 2.8f, 2.8f }, .gravity = 6.0f,
+        .life = 0.18f, .life_spread = 0.08f, .size = 0.03f, .size_spread = 0.01f, .grow = 0.3f,
+        .start = 0xF0F6FF, .middle = 0x6A9CFF, .end = 0x101850 });
     return f;
 }
 
 /* A shot leaving the gun */
-static void fx_fire(Fx* f, const DMSModel* gun) {
-    if (f->muzzle < 0) return;
-    const shz_mat4x4_t* w = &gun->skeleton->bones[f->muzzle].worldPose;
+static void fx_fire(Fx* f, const Gun* gun) {
+    if (gun->muzzle < 0) return;
+    const shz_mat4x4_t* w = &gun->m->skeleton->bones[gun->muzzle].worldPose;
     shz_vec3_t p = shz_vec3_init(w->elem2D[3][0], w->elem2D[3][1], w->elem2D[3][2]);
     dc_particles_move(f->flash, p);
     dc_particles_burst(f->flash, 4);
@@ -418,10 +489,25 @@ static float wrap_pi(float a) {
     while (a < -3.14159265f) a += 6.2831853f;
     return a;
 }
-static shz_vec3_t torch_lens(const Fx* f, const DMSModel* gun) {
-    if (f->muzzle < 0) return shz_vec3_init(-0.16f, -0.17f, 0.72f);
-    const shz_mat4x4_t* w = &gun->skeleton->bones[f->muzzle].worldPose;
-    return shz_vec3_init(w->elem2D[3][0], w->elem2D[3][1] - 0.05f, w->elem2D[3][2] - 0.16f);
+static shz_vec3_t gun_tip(const Gun* gun) {
+    if (gun->muzzle < 0) return shz_vec3_init(-0.16f, -0.12f, 0.88f);
+    const shz_mat4x4_t* w = &gun->m->skeleton->bones[gun->muzzle].worldPose;
+    return shz_vec3_init(w->elem2D[3][0], w->elem2D[3][1], w->elem2D[3][2]);
+}
+static shz_vec3_t torch_lens(const Gun* gun) {
+    return shz_vec3_add(gun_tip(gun), gun->lens);
+}
+
+/* A place in the gun's space as it is seen in the world: where it is on the
+ * screen (the gun's camera sees wider), at that depth */
+static shz_vec3_t gun_to_world(const DCCamera* cam, const DCCamera* gun_cam, shz_vec3_t p) {
+    float wide = tanf(cam->fov * 0.5f * 0.0174533f) / tanf(gun_cam->fov * 0.5f * 0.0174533f);
+    shz_sincos_t cy = shz_sincosf(cam->yaw), cp = shz_sincosf(cam->pitch);
+    shz_vec3_t f = shz_vec3_init(cy.sin * cp.cos, -cp.sin, cy.cos * cp.cos);
+    shz_vec3_t right = shz_vec3_init(-cy.cos, 0.0f, cy.sin);
+    shz_vec3_t up = shz_vec3_init(cy.sin * cp.sin, cp.cos, cy.cos * cp.sin);
+    return shz_vec3_add(cam->pos, shz_vec3_add(shz_vec3_scale(f, p.z),
+        shz_vec3_add(shz_vec3_scale(right, -p.x * wide), shz_vec3_scale(up, p.y * wide))));
 }
 
 /* Where the torch lands, a glow: the light coming back off what it hits */
@@ -433,21 +519,12 @@ static __attribute__((noinline)) float torch_spot(ColWorld* col, shz_vec3_t eye,
     return spot.t;
 }
 
-/* The shaft, from the lens: where the lens is on the screen (the gun's
- * camera sees wider), at that depth in the world, aimed to meet the middle
- * of the view 12m out, or where the light lands if that is nearer, and
- * ending there: not through the wall */
+/* The shaft, from the lens as it is seen in the world, aimed to meet the
+ * middle of the view 12m out, or where the light lands if that is nearer,
+ * and ending there: not through the wall */
 static __attribute__((noinline)) void torch_shaft(const DCCamera* cam, const DCCamera* gun_cam,
-                                                  const Fx* fx, const DMSModel* gun_m, shz_vec3_t dir,
-                                                  float hit) {
-    shz_vec3_t lens = torch_lens(fx, gun_m);
-    float wide = tanf(cam->fov * 0.5f * 0.0174533f) / tanf(gun_cam->fov * 0.5f * 0.0174533f);
-    shz_sincos_t cy = shz_sincosf(cam->yaw), cp = shz_sincosf(cam->pitch);
-    shz_vec3_t f = shz_vec3_init(cy.sin * cp.cos, -cp.sin, cy.cos * cp.cos);
-    shz_vec3_t right = shz_vec3_init(-cy.cos, 0.0f, cy.sin);
-    shz_vec3_t up = shz_vec3_init(cy.sin * cp.sin, cp.cos, cy.cos * cp.sin);
-    shz_vec3_t from = shz_vec3_add(cam->pos, shz_vec3_add(shz_vec3_scale(f, lens.z),
-        shz_vec3_add(shz_vec3_scale(right, -lens.x * wide), shz_vec3_scale(up, lens.y * wide))));
+                                                  const Gun* gun, shz_vec3_t dir, float hit) {
+    shz_vec3_t from = gun_to_world(cam, gun_cam, torch_lens(gun));
     shz_vec3_t aim = shz_vec3_add(cam->pos, shz_vec3_scale(dir, hit < 12.0f ? hit : 12.0f));
     shz_vec3_t to = shz_vec3_sub(aim, from);
     float reach = sqrtf(shz_vec3_dot(to, to)) + (hit < 12.0f ? 0.0f : 4.0f);
@@ -459,14 +536,14 @@ static __attribute__((noinline)) void torch_shaft(const DCCamera* cam, const DCC
  * aim (the light's picture is the screen's middle), the glow where it lands
  * and the shaft from the lens. In pieces: all inlined into one function it
  * was more than GCC 15 could compile (an internal compiler error). */
-static void torch_draw(const DCCamera* cam, const DCCamera* gun_cam, const Fx* fx,
-                       const DMSModel* gun_m, ColWorld* col, float torch_yaw, float torch_pitch) {
+static void torch_draw(const DCCamera* cam, const DCCamera* gun_cam, const Gun* gun,
+                       ColWorld* col, float torch_yaw, float torch_pitch) {
     shz_sincos_t y = shz_sincosf(torch_yaw), p = shz_sincosf(torch_pitch);
     shz_vec3_t dir = shz_vec3_init(y.sin * p.cos, -p.sin, y.cos * p.cos);
     dc_beam_dark(TORCH_DARK, 1.0f);
     dc_beam(cam->pos, dir, TORCH_SPREAD, TORCH_REACH);
     float hit = torch_spot(col, cam->pos, dir);
-    torch_shaft(cam, gun_cam, fx, gun_m, dir, hit);
+    torch_shaft(cam, gun_cam, gun, dir, hit);
 }
 
 
@@ -505,6 +582,73 @@ static void fx_blood(Fx* f, shz_vec3_t p, shz_vec3_t d, float dist) {
     dc_particles_burst(f->drops, 6);
     dc_particles_aim(f->drops, shz_vec3_add(shz_vec3_scale(d, -1.0f), shz_vec3_init(0, 0.8f, 0)));
     dc_particles_burst(f->drops, 3);
+}
+
+/* ---- The stun gun ----
+ *
+ * The arc jumps from its tip to what is in the crosshair, as far as it
+ * reaches: one of them stands stunned a moment, crackling, and drops dead; a wall spits
+ * sparks, and in the air it fizzles out at its end. */
+
+typedef struct {
+    float time;                 /* the arc shows this much longer */
+    shz_vec3_t to;              /* where it lands */
+    bool landed;                /* on something, not in the air */
+} Zap;
+
+/* Shot along d from the eye; whether it got one (it drops once the stun is over) */
+static bool taser_shot(Zap* zap, Fx* fx, ColWorld* col, shz_vec3_t eye, shz_vec3_t d) {
+    ColRayHit wall;
+    float t;
+    int i = z_shot(col, eye, d, &wall, &t);
+    zap->time = TASER_ZAP;
+    zap->landed = true;
+    if (i >= 0 && t <= TASER_RANGE) {
+        Zombie* z = &zombies[i];
+        zap->to = shz_vec3_add(eye, shz_vec3_scale(d, t));
+        bool got = z->stun <= 0.0f;     /* not one already going down */
+        if (got) { z->stun = TASER_STUN; z->xray_t = 0.0f; }   /* its bones show at once */
+        dc_particles_move(fx->zap, zap->to);
+        dc_particles_aim(fx->zap, shz_vec3_scale(d, -1.0f));
+        dc_particles_burst(fx->zap, 10);
+        return got;
+    }
+    if (wall.hit && wall.t <= TASER_RANGE) {
+        zap->to = shz_vec3_add(wall.pos, shz_vec3_scale(d, -0.02f));
+        dc_particles_scale(fx->zap, fx_far(wall.t));
+        dc_particles_move(fx->zap, zap->to);
+        dc_particles_aim(fx->zap, shz_vec3_scale(wall.normal, 1.5f));
+        dc_particles_burst(fx->zap, 14);
+        return false;
+    }
+    zap->to = shz_vec3_add(eye, shz_vec3_scale(d, TASER_RANGE));
+    zap->landed = false;
+    return false;
+}
+
+/* The arc, and the crackle over those stunned */
+static __attribute__((noinline)) void taser_draw(Zap* zap, const DCCamera* cam, const DCCamera* gun_cam,
+                                                 const Gun* gun, float dt) {
+    if (zap->time > 0.0f) {
+        zap->time -= dt;
+        shz_vec3_t from = gun_to_world(cam, gun_cam, gun_tip(gun));
+        /* Two wires, as the gun has two darts; in the air it frays at its end */
+        shz_vec3_t to = zap->to;
+        for (int k = 0; k < 2; k++) {
+            if (!zap->landed) to = shz_vec3_add(zap->to, shz_vec3_init(frand(-0.6f, 0.6f), frand(-0.6f, 0.6f), frand(-0.6f, 0.6f)));
+            dc_bolt(from, to, TASER_RGB, k ? 0.006f : 0.009f, k ? 0.06f : 0.035f);
+        }
+    }
+    for (int i = 0; i < ZOMBIES; i++) {
+        Zombie* z = &zombies[i];
+        if (z->stun <= 0.0f || (z->state != Z_RUN && z->state != Z_ATTACK)) continue;
+        for (int k = 0; k < 2; k++) {
+            float a = frand(0.0f, 6.2832f);
+            shz_vec3_t p = shz_vec3_add(z->pos, shz_vec3_init(sinf(a) * Z_RADIUS * 0.8f, frand(0.4f, 1.7f), cosf(a) * Z_RADIUS * 0.8f));
+            shz_vec3_t q = shz_vec3_add(p, shz_vec3_init(frand(-0.3f, 0.3f), frand(-0.5f, 0.5f), frand(-0.3f, 0.3f)));
+            dc_bolt(p, q, TASER_RGB, 0.006f, 0.25f);
+        }
+    }
 }
 
 int main(int argc, char* argv[]) {
@@ -547,17 +691,29 @@ int main(int argc, char* argv[]) {
 #endif
     }
 
-    Gun gun = { .m = dc_model_load(ASSETS "gmod/smg1/smg1.dms") };
-    if (!gun.m) { printf("shooter: no gmod/smg1/smg1.dms (see README)\n"); return 1; }
-    gun.a_idle   = dc_model_anim_index(gun.m, "@idle01");
-    gun.a_fire   = dc_model_anim_index(gun.m, "@fire01");
-    gun.a_draw   = dc_model_anim_index(gun.m, "@draw");
-    gun.a_reload = dc_model_anim_index(gun.m, "@reload");
+    /* The SMG, and the stun gun if it was brought in (see README) */
+    Gun guns[2] = {
+        { .mag_size = MAG, .spare_size = SPARE, .gap = FIRE_GAP, .jolt = 0.012f,
+          .lens = { 0.0f, -0.05f, -0.16f } },
+        /* The stun gun's light is under its nose, as a real one's is */
+        { .mag_size = TASER_MAG, .spare_size = TASER_SPARE, .gap = TASER_GAP, .jolt = 0.03f,
+          .lens = { 0.0f, -0.017f, -0.005f }, .lamp = true },
+    };
+    if (!gun_load(&guns[0], ASSETS "gmod/smg1/smg1.dms", "@idle01", "@fire01", "@draw", "@reload", "ValveBiped.muzzle")) {
+        printf("shooter: no gmod/smg1/smg1.dms (see README)\n");
+        return 1;
+    }
+    int guns_n = gun_load(&guns[1], ASSETS "gmod/taser/taser.dms", "@idle", "@fire", "@draw", "@reload", "t.shot") ? 2 : 1;
+    int held = 0;
+    bool swap_was = false;
+    Zap zap = { 0 };
 
     for (int i = 0; i < ZOMBIES; i++) {
         zombies[i].m = dc_model_load(ASSETS "gmod/infected/infected.dms");
         if (!zombies[i].m) { printf("shooter: no gmod/infected/infected.dms (see README)\n"); return 1; }
         if (i) dc_model_share_anims(zombies[i].m, zombies[0].m);
+        zombies[i].xray = true;
+        z_look(&zombies[i], false);
     }
     a_run    = dc_model_anim_index(zombies[0].m, "a_Run_01");
     a_attack = dc_model_anim_index(zombies[0].m, "@Melee_03");
@@ -571,7 +727,7 @@ int main(int argc, char* argv[]) {
     dc_camera_init(&gun_cam);
     gun_cam.fov = 54.0f;
     dc_camera_update(&gun_cam);
-    Fx fx = fx_init(gun.m);
+    Fx fx = fx_init();
 
     int health = 0, wave = 0, to_spawn = 0, kills = 0;
     bool torch = true;          /* X switches it */
@@ -585,13 +741,25 @@ int main(int argc, char* argv[]) {
         const DCInput* inp = dc_input_get(0);
         if (inp && (inp->buttons & CONT_START)) break;
         if (inp && dc_input_pressed(inp, CONT_X)) torch = !torch;
-        /* B fires and the R trigger too, on a pad */
+        /* B fires and the R trigger too, on a pad; the L trigger swaps guns
+         * (and so does not run) */
         DCInput in;
+        bool swap = false;
         if (inp) {
             in = *inp;
             if (in.rtrig > 0.5f) in.buttons |= CONT_B;
+            swap = in.ltrig > 0.5f;
+            in.ltrig = 0.0f;
             inp = &in;
         }
+        Gun* gun = &guns[held];
+        if (swap && !swap_was && guns_n > 1 && health > 0) {
+            held = (held + 1) % guns_n;
+            gun = &guns[held];
+            gun->wait = 0.0f;
+            gun_play(gun, GUN_DRAW, gun->a_draw);
+        }
+        swap_was = swap;
 
         if (restart) {
             restart = false;
@@ -600,9 +768,9 @@ int main(int argc, char* argv[]) {
             camera.yaw = player.yaw = start_yaw;
             torch_yaw = start_yaw; torch_pitch = 0.0f;
             camera.pitch = 0.0f;
-            gun.mag = MAG;
-            gun.spare = SPARE;
-            gun_play(&gun, GUN_DRAW, gun.a_draw);
+            for (int g = 0; g < guns_n; g++) { guns[g].mag = guns[g].mag_size; guns[g].spare = guns[g].spare_size; }
+            gun_play(gun, GUN_DRAW, gun->a_draw);
+            zap.time = 0.0f;
             for (int i = 0; i < ZOMBIES; i++) { zombies[i].state = Z_FREE; zombies[i].again = false; }
             health = 100;
             wave = kills = to_spawn = 0;
@@ -612,13 +780,17 @@ int main(int argc, char* argv[]) {
         bool alive = health > 0;
         if (alive) {
             dc_player_update(&player, &camera, inp, col, dt);
-            if (gun_update(&gun, inp, &camera, dt)) {
+            if (gun_update(gun, inp, &camera, dt)) {
                 shz_sincos_t y = shz_sincosf(camera.yaw), p = shz_sincosf(camera.pitch);
                 shz_vec3_t d = shz_vec3_init(y.sin * p.cos, -p.sin, y.cos * p.cos);
+                if (held == 1) {
+                    if (taser_shot(&zap, &fx, col, camera.pos, d)) kills++;
+                    hit_mark = 0.15f;
+                } else {
                 ColRayHit wall;
                 float t;
                 int i = z_shot(col, camera.pos, d, &wall, &t);
-                fx_fire(&fx, gun.m);
+                fx_fire(&fx, gun);
                 if (i < 0 && wall.hit) fx_wall(&fx, &wall, d, wall.t);
                 if (i >= 0) {
                     Zombie* z = &zombies[i];
@@ -627,15 +799,10 @@ int main(int argc, char* argv[]) {
                     z->flash = 0.1f;
                     hit_mark = 0.15f;
                     if (z->health <= 0) {
-                        z->state = Z_DEAD;
-                        z->timer = Z_DEAD_TIME;
-                        z->death = rand() % N_DEATHS;
-                        z->limp = z->rd.tracked = false;
-                        z->knock = shz_vec3_scale(d, Z_KNOCK);
-                        z_play(z, a_death[z->death]);
-                        dc_model_anim_restart(z->m);
-                        kills++;
+                        if (z->stun <= 0.0f) kills++;   /* a stunned one was counted when zapped */
+                        z_kill(z, d);
                     }
+                }
                 }
             }
         } else if (inp && dc_input_pressed(inp, CONT_A)) {
@@ -680,7 +847,7 @@ int main(int argc, char* argv[]) {
         torch_yaw += wrap_pi(camera.yaw - torch_yaw) * lag;
         torch_pitch += (camera.pitch - torch_pitch) * lag;
         if (torch && alive)
-            torch_draw(&camera, &gun_cam, &fx, gun.m, col, torch_yaw, torch_pitch);
+            torch_draw(&camera, &gun_cam, gun, col, torch_yaw, torch_pitch);
         else
             dc_beam_dark(alive ? TORCH_DARK * 0.4f : TORCH_DARK, 1.0f);
         dc_scene_draw(scene);
@@ -690,16 +857,34 @@ int main(int argc, char* argv[]) {
             /* The model faces +z, and dc_draw_ex's yaw turns +z to (-sin, cos)
              * where z->yaw goes to (sin, cos): drawn at -yaw, it faces the way
              * it goes. A limp one's bones are already where it lies. */
-            dc_draw_ex(z->m, &(DCDrawOpts){ .pos = z->pos, .yaw = -z->yaw,
-                                            .tint = z->flash > 0.0f ? 0xFF5050 : 0 });
+            uint32_t tint = z->flash > 0.0f ? 0xFF5050 : 0;
+            /* Stunned, it flickers between its skin and its bones lit up,
+             * a few frames of each, as the current goes through it */
+            bool zapped = z->stun > 0.0f && z->state != Z_DEAD;
+            if (zapped) {
+                z->xray_t -= dt;
+                if (z->xray_t <= 0.0f) {
+                    z_look(z, !z->xray);
+                    z->xray_t = z->xray ? frand(0.04f, 0.09f) : frand(0.03f, 0.12f);
+                }
+                tint = z->xray ? 0xB8D4FF : (rand() & 1) ? 0x90B0FF : 0;
+            } else {
+                z_look(z, false);
+            }
+            dc_draw_ex(z->m, &(DCDrawOpts){ .pos = z->pos, .yaw = -z->yaw, .tint = tint });
         }
+        if (alive) taser_draw(&zap, &camera, &gun_cam, gun, dt);
         dc_particles_draw(fx.sparks);
         dc_particles_draw(fx.dust);
         dc_particles_draw(fx.blood);
         dc_particles_draw(fx.drops);
+        dc_particles_draw(fx.zap);
         if (alive) {
             dc_set_camera(&gun_cam);
-            dc_draw(gun.m, shz_vec3_init(0.0f, 0.0f, 0.0f));
+            dc_draw(gun->m, shz_vec3_init(0.0f, 0.0f, 0.0f));
+            /* The tip lit while it arcs */
+            if (zap.time > 0.0f) dc_corona(2, gun_tip(gun), TASER_RGB, 0.12f, DC_CORONA_OWN_CAMERA);
+            if (torch && gun->lamp) dc_corona(3, torch_lens(gun), 0xFFF2DC, 0.07f, DC_CORONA_OWN_CAMERA);
 
             dc_particles_draw(fx.smoke);
             dc_particles_draw(fx.flash);
@@ -710,7 +895,7 @@ int main(int argc, char* argv[]) {
         dc_draw_rect(319, 233, 2, 14, cross);
         dc_draw_rect(313, 239, 14, 2, cross);
         char text[64];
-        snprintf(text, sizeof(text), "%d / %d", gun.mag, gun.spare);
+        snprintf(text, sizeof(text), "%d / %d", gun->mag, gun->spare);
         dc_draw_text(text, 640 - 24 - dc_text_width(text, 24), 480 - 48, 24, DC_COLOR_YELLOW);
         snprintf(text, sizeof(text), "+ %d", health > 0 ? health : 0);
         dc_draw_text(text, 24, 480 - 48, 24, health > 30 ? DC_COLOR_YELLOW : DC_COLOR_RED);
@@ -730,10 +915,10 @@ int main(int argc, char* argv[]) {
         dc_frame_end();
     }
 
-    DCParticles* all[] = { fx.flash, fx.smoke, fx.sparks, fx.dust, fx.blood, fx.drops };
-    for (int i = 0; i < 6; i++) dc_particles_free(all[i]);
+    DCParticles* all[] = { fx.flash, fx.smoke, fx.sparks, fx.dust, fx.blood, fx.drops, fx.zap };
+    for (int i = 0; i < 7; i++) dc_particles_free(all[i]);
     for (int i = ZOMBIES - 1; i >= 0; i--) dc_model_free(zombies[i].m);
-    dc_model_free(gun.m);
+    for (int g = guns_n - 1; g >= 0; g--) dc_model_free(guns[g].m);
     nav_free(&nav);
     col_free(col);
     dc_scene_free(scene);

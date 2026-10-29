@@ -198,6 +198,7 @@ static cont_state_t* port1(void) {
     state.joyx = 100 * (keys[SDL_SCANCODE_RIGHT] - keys[SDL_SCANCODE_LEFT]);
     state.joyy = 100 * (keys[SDL_SCANCODE_DOWN] - keys[SDL_SCANCODE_UP]);
     state.rtrig = keys[SDL_SCANCODE_LSHIFT] ? 255 : 0;
+    state.ltrig = keys[SDL_SCANCODE_Q] ? 255 : 0;
     if (use_pads && !done) pad_read(pads[0], &state);
     if (!headless) SDL_Delay(1);
     return &state;

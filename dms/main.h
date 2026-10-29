@@ -129,6 +129,7 @@ typedef struct {
     uint32_t  colour;               /* packed meshes: the one colour every vertex has */
     uint8_t   packed;               /* 1: vertices are packed for the sun loops, see
                                      * dms_strip_end() and dc_model.c's DMSPacked */
+    uint8_t   hidden;               /* dc_model_hide(): not drawn (skinned models) */
     uint32_t  env_frame;            /* dc_frame_count() + 1 when its own pass last showed
                                      * the environment image (env_single) */
     float    scroll_u, scroll_v;    /* dc_model_scroll(): texture widths a second */
