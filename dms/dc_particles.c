@@ -174,6 +174,10 @@ void dc_particles_move(DCParticles* s, shz_vec3_t pos) {
     if (s) s->o.pos = pos;
 }
 
+void dc_particles_aim(DCParticles* s, shz_vec3_t speed) {
+    if (s) s->o.speed = speed;
+}
+
 void dc_particles_pause(DCParticles* s, bool paused) {
     if (s) s->paused = paused;
 }

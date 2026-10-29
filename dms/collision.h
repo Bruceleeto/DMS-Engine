@@ -69,6 +69,11 @@ shz_vec3_t   col_move(ColWorld* w, shz_vec3_t from, shz_vec3_t to, float radius)
  * thing whose underside is above the sphere's middle, like a desk, which
  * col_move would push down through the floor. */
 shz_vec3_t   col_move_walls(ColWorld* w, shz_vec3_t from, shz_vec3_t to, float radius);
+/* col_move_walls for something on its feet at feet_y that steps up to step
+ * high: a wall that, where it touches, is no higher than that (a kerb, a
+ * stair) is walked up instead of pushed off. Set its height from the floor
+ * after (col_ground). */
+shz_vec3_t   col_move_steps(ColWorld* w, shz_vec3_t to, float radius, float feet_y, float step);
 ColGroundHit col_ground(ColWorld* w, shz_vec3_t origin, float max_dist);
 ColRayHit  col_raycast(ColWorld* w, shz_vec3_t org, shz_vec3_t dir, float max_dist);
 /* Triangles whose bounds touch the sphere, each one once, for code that does
@@ -77,6 +82,12 @@ ColRayHit  col_raycast(ColWorld* w, shz_vec3_t org, shz_vec3_t dir, float max_di
 #define COL_QUERY_MAX 128
 int        col_query(ColWorld* w, shz_vec3_t centre, float radius, ColTri* out, int max);
 void       col_free(ColWorld* w);
+
+/* The grid cell a place is in (clamped to the grid), and a cell's
+ * triangles, up to max: for code that walks the grid its own way (a beam of
+ * light). A triangle is in every cell it touches. */
+void       col_cell_at(ColWorld* w, float x, float z, int* gx, int* gz);
+int        col_cell_tris(ColWorld* w, int gx, int gz, ColTri* out, int max);
 
 /* ================================================================ */
 #ifdef COLLISION_IMPLEMENTATION
@@ -547,7 +558,7 @@ static inline int col_ray_tri(const ColTri* ct, shz_vec3_t org,
  * ================================================================ */
 #define COL_MOVE_ITERS 3
 
-static shz_vec3_t col_move_ex(ColWorld* w, shz_vec3_t to, float radius, bool walls) {
+static shz_vec3_t col_move_ex(ColWorld* w, shz_vec3_t to, float radius, bool walls, float top_y) {
     if (!w) return to;
 
     float radius_sq = radius * radius;
@@ -578,6 +589,7 @@ static shz_vec3_t col_move_ex(ColWorld* w, shz_vec3_t to, float radius, bool wal
                         if (n.y * n.y * 2.0f > shz_mag_sqr3f(n.x, n.y, n.z)) continue;
                     }
                     shz_vec3_t closest = col_closest_on_tri(&ct, resolved);
+                    if (closest.y <= top_y) continue;   /* a step, walked up */
                     shz_vec3_t diff = shz_vec3_sub(resolved, closest);
                     if (walls) diff.y = 0.0f;
 
@@ -605,12 +617,16 @@ static shz_vec3_t col_move_ex(ColWorld* w, shz_vec3_t to, float radius, bool wal
 
 shz_vec3_t col_move(ColWorld* w, shz_vec3_t from, shz_vec3_t to, float radius) {
     (void)from;
-    return col_move_ex(w, to, radius, false);
+    return col_move_ex(w, to, radius, false, -1e30f);
 }
 
 shz_vec3_t col_move_walls(ColWorld* w, shz_vec3_t from, shz_vec3_t to, float radius) {
     (void)from;
-    return col_move_ex(w, to, radius, true);
+    return col_move_ex(w, to, radius, true, -1e30f);
+}
+
+shz_vec3_t col_move_steps(ColWorld* w, shz_vec3_t to, float radius, float feet_y, float step) {
+    return col_move_ex(w, to, radius, true, feet_y + step);
 }
 
 /* ================================================================
@@ -763,6 +779,19 @@ int col_query(ColWorld* w, shz_vec3_t centre, float radius, ColTri* out, int max
             }
         }
     }
+    return n;
+}
+
+void col_cell_at(ColWorld* w, float x, float z, int* gx, int* gz) {
+    *gx = col_cell_x(w, x);
+    *gz = col_cell_z(w, z);
+}
+
+int col_cell_tris(ColWorld* w, int gx, int gz, ColTri* out, int max) {
+    const ColCell* cell = col_find_cell(w, gx, gz);
+    if (!cell) return 0;
+    int n = (int)cell->count < max ? (int)cell->count : max;
+    for (int i = 0; i < n; i++) col_tri_get(w, w->tri_refs[cell->start + i], &out[i]);
     return n;
 }
 

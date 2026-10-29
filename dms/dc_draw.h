@@ -59,9 +59,9 @@ typedef struct {
                              * The light on a stretched model is close, not
                              * exact: its normals are not re-made. */
     float        yaw;       /* radians, about y */
-    const float* rot;       /* turned any way, used instead of yaw (static models
-                             * only): 9 floats, 3 columns, where the model's x, y
-                             * and z axes point in the world. It is copied. */
+    const float* rot;       /* turned any way, used instead of yaw (and stretch):
+                             * 9 floats, 3 columns, where the model's x, y and z
+                             * axes point in the world. It is copied. */
     const DCShadow* shadow; /* also draw its shadow. It is copied. */
     bool         add;       /* added to what is behind it, so black adds nothing:
                              * flashes, glows, fire. Draw it after the solid things. */

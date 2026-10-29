@@ -28,6 +28,9 @@ typedef struct {
                             * PVR clips by 32 pixel tiles, so edges go on a
                             * multiple of 32 (two views 640x224 with a 32 pixel
                             * band between, not 640x240 each). */
+    float      far;        /* nothing past this far is drawn (whole meshes
+                            * culled, to save the vertex buffer: fog hides
+                            * the edge); 0, the default, is FAR_Z (1000) */
 
     /* Internal — rebuilt by dc_camera_update() */
     shz_mat4x4_t  _pv_matrix   __attribute__((aligned(32)));

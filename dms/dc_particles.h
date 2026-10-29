@@ -76,6 +76,9 @@ void dc_particles_draw(DCParticles* p);
 /* Where new ones are born from now on (an emitter that follows something) */
 void dc_particles_move(DCParticles* p, shz_vec3_t pos);
 
+/* Which way new ones go from now on (.speed): sparks off whatever was hit */
+void dc_particles_aim(DCParticles* p, shz_vec3_t speed);
+
 /* All at once: an explosion, a splash, a puff of dust. Works with .rate 0. */
 void dc_particles_burst(DCParticles* p, int how_many);
 

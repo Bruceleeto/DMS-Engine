@@ -102,6 +102,7 @@ int Vfs::mount_games(const std::string& common) {
         { "Half-Life 2/ep2", "hl2/ep2" },        { "Half-Life 2/lostcoast", "hl2/lostcoast" },
         { "Counter-Strike Source/cstrike", "cstrike" }, { "Team Fortress 2/tf", "tf" },
         { "Portal/portal", "portal" },
+        { "left 4 dead/left4dead", "l4d" },     { "left 4 dead/left4dead_dlc3", "l4d/dlc3" },
     };
     int n = 0;
     for (auto& g : GAMES) {

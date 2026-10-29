@@ -1,0 +1,14 @@
+{
+  "dms_scene": 1,
+  "background": "#8db4d8",
+  "camera": { "pos": [-313.741, -266.395, -219.05], "yaw": 270, "pitch": 0, "fov": 60 },
+  "lights": [],
+  "objects": [
+    { "name": "World", "model": "gmod/maps/intro/intro.dms",
+      "pos": [0, 0, 0], "rot": [0, 0, 0], "scale": [1, 1, 1],
+      "tint": "#ffffff", "add": false, "visible": true },
+    { "name": "Player", "model": "",
+      "pos": [-313.741, -267.995, -219.05], "rot": [0, 270, 0], "scale": [1, 1, 1],
+      "tint": "#ffffff", "add": false, "visible": true }
+  ]
+}

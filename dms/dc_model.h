@@ -225,6 +225,12 @@ int dc_model_entities(const DMSModel* model, const char* name,
  * Pass dt=0 to hold the current frame (paused). */
 void dc_model_animate(DMSModel* model, float dt);
 
+/* The bones posed by the game itself (each bone's worldPose, in the model's
+ * space: a ragdoll, say) instead of by a clip: their skinning and the
+ * model's bounds from them. Instead of dc_model_animate(), which would put
+ * the clip's pose back. */
+void dc_model_pose_from_bones(DMSModel* model);
+
 /* Set current animation by index. Resets time to 0. */
 void dc_model_set_anim(DMSModel* model, int anim_index);
 

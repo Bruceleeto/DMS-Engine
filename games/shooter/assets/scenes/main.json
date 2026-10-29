@@ -1,0 +1,66 @@
+{
+    "dms_scene": 1,
+    "background": "#000000",
+    "fog": {
+        "color": "#000000",
+        "near": 22,
+        "far": 38
+    },
+    "camera": {
+        "pos": [
+            364.134,
+            14.6302,
+            -386.283
+        ],
+        "yaw": 0,
+        "pitch": 0,
+        "fov": 60
+    },
+    "lights": [],
+    "objects": [
+        {
+            "name": "World",
+            "model": "gmod/maps/gm_tunnel/gm_tunnel.dms",
+            "pos": [
+                0,
+                0,
+                0
+            ],
+            "rot": [
+                0,
+                0,
+                0
+            ],
+            "scale": [
+                1,
+                1,
+                1
+            ],
+            "tint": "#ffffff",
+            "add": false,
+            "visible": true
+        },
+        {
+            "name": "Player",
+            "model": "",
+            "pos": [
+                364.134,
+                13.0302,
+                -386.283
+            ],
+            "rot": [
+                0,
+                0,
+                0
+            ],
+            "scale": [
+                1,
+                1,
+                1
+            ],
+            "tint": "#ffffff",
+            "add": false,
+            "visible": true
+        }
+    ]
+}

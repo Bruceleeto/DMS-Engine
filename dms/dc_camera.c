@@ -14,6 +14,7 @@ void dc_camera_init(DCCamera* cam) {
     cam->pitch = 0.0f;
     cam->fov = 60.0f;
     cam->view = (DCViewport){ 0 };
+    cam->far = 0.0f;
 }
 
 /* ================================================================
@@ -61,7 +62,7 @@ static void build_frustum(DCCamera* cam, float fov_rad, float aspect) {
     float d_bottom = -(world_bottom.x * p.x + world_bottom.y * p.y + world_bottom.z * p.z);
     float d_top    = -(world_top.x    * p.x + world_top.y    * p.y + world_top.z    * p.z);
     float d_near   = -(world_near.x   * p.x + world_near.y   * p.y + world_near.z   * p.z) - NEAR_Z;
-    float d_far    = -(world_far.x    * p.x + world_far.y    * p.y + world_far.z    * p.z) + FAR_Z;
+    float d_far    = -(world_far.x    * p.x + world_far.y    * p.y + world_far.z    * p.z) + (cam->far > 0.0f ? cam->far : FAR_Z);
 
     cam->_frustum.side_planes.elem2D[0][0] = world_left.x;
     cam->_frustum.side_planes.elem2D[1][0] = world_left.y;

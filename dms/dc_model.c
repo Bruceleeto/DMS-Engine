@@ -1713,6 +1713,8 @@ static void render_fast_flat(const DMSVertex* src, int count,
  * Render: clipped path (near-plane intersection)
  * ================================================================ */
 
+static void clip_submit(const DMSVertex* src, int count);
+
 static void render_clipped(const DMSVertex* src, int count,
                            pvr_dr_state_t* dr, int lit) {
     g_dr = dr;
@@ -1759,6 +1761,13 @@ static void render_clipped(const DMSVertex* src, int count,
         return;
     }
 
+    clip_submit(src, count);
+}
+
+/* The strips of a mesh already in g_clip_buffer, some of it behind the near
+ * plane: whole triangles go out as strips, the ones crossing it clipped, the
+ * ones behind it dropped. src gives the strip ends. */
+static void clip_submit(const DMSVertex* src, int count) {
     /* Walk triangle strips (some verts actually need clipping) */
     int idx = 0;
     while (idx < count) {
@@ -1944,6 +1953,42 @@ static void render_skinned(const DMSVertex* src, int count,
     else                skin_loop(src, count, sk, mvp, SKIN_PLAIN);
 }
 
+/* A skinned mesh crossing the near plane (a gun held in front of the eye, a
+ * character the camera is inside): skinned into g_clip_buffer as
+ * render_clipped transforms a static one, then clipped the same way. Slower
+ * than skin_loop, so only meshes that need it come here. */
+static void render_skinned_clipped(const DMSVertex* src, int count,
+                                   const DMSSkeleton* sk,
+                                   const shz_mat4x4_t* mvp,
+                                   pvr_dr_state_t* dr) {
+    if (count < 1 || !sk) return;
+    g_dr = dr;
+    int last_bone = -1;
+    for (int i = 0; i < count; i++) {
+        SHZ_PREFETCH(&src[i + 4]);
+        int bone_id = src[i].pad;
+        if (bone_id != last_bone) {
+            skin_bone(sk, bone_id, mvp, g_lit ? SKIN_LIT : SKIN_PLAIN);
+            last_bone = bone_id;
+        }
+        /* No -z: Z negation is baked into MVP scale */
+        shz_vec4_t t = shz_vec4_swizzle(shz_xmtrx_transform_vec4(
+            shz_vec4_init(src[i].x, src[i].y, src[i].z, 1.0f)), 1, 2, 3, 0);
+        ClipVertex* cv = &g_clip_buffer[i];
+        cv->x = t.x;
+        cv->y = t.y;
+        cv->z = t.z;
+        cv->w = t.w;
+        cv->u = src[i].u + g_uv_u;
+        cv->v = src[i].v + g_uv_v;
+        cv->argb = g_lit     ? shade(&src[i])
+                 : g_tint_on ? tint_argb(src[i].argb)
+                             : src[i].argb;
+        cv->flags = compute_outcode(cv);
+    }
+    clip_submit(src, count);
+}
+
 /* ================================================================
  * Mesh dispatch (per-mesh frustum cull + path selection)
  * ================================================================ */
@@ -1973,16 +2018,24 @@ static inline void send_header(pvr_dr_state_t* dr, const DMSMesh* mesh) {
 
 /* Skinned mesh: cull the whole animated bound, then skin + submit.
  * Returns 1 if the mesh was drawn, 0 if culled. */
+/* rot: 3 columns, where the model's axes point (dc_draw_ex's rot), used
+ * instead of yaw and stretch; NULL for those */
 static int draw_skinned_mesh(DMSMesh* mesh, DMSModel* model,
                              shz_vec3_t pos, float scale, float yaw, shz_vec3_t stretch,
-                             const DCCamera* cam, pvr_dr_state_t* dr) {
+                             const float* rot, const DCCamera* cam, pvr_dr_state_t* dr) {
     float bcx = model->anim_bound_cx * stretch.x;
+    float bcy = model->anim_bound_cy * stretch.y;
     float bcz = model->anim_bound_cz * stretch.z;
     float widest = stretch.x > stretch.y ? stretch.x : stretch.y;
     if (stretch.z > widest) widest = stretch.z;
 
     /* Rotate bounding sphere center to match model yaw */
-    if (yaw != 0.0f) {
+    if (rot) {
+        float cx = bcx, cy = bcy, cz = bcz;
+        bcx = rot[0] * cx + rot[3] * cy + rot[6] * cz;
+        bcy = rot[1] * cx + rot[4] * cy + rot[7] * cz;
+        bcz = rot[2] * cx + rot[5] * cy + rot[8] * cz;
+    } else if (yaw != 0.0f) {
         shz_sincos_t sc = shz_sincosf(yaw);
         float rx = bcx * sc.cos - bcz * sc.sin;
         float rz = bcx * sc.sin + bcz * sc.cos;
@@ -1991,18 +2044,18 @@ static int draw_skinned_mesh(DMSMesh* mesh, DMSModel* model,
     }
 
     shz_vec3_t wc = shz_vec3_init(pos.x + bcx * scale,
-                                  pos.y + model->anim_bound_cy * stretch.y * scale,
+                                  pos.y + bcy * scale,
                                   pos.z + bcz * scale);
     float wr = model->anim_bound_radius * scale * widest;
 
-    /* Skinned meshes have no clip path: cull if off-screen or crossing near */
-    if (dc_frustum_cull_sphere(cam, wc, wr) < 0 ||
-        dc_frustum_near_intersect(cam, wc, wr)) {
+    if (dc_frustum_cull_sphere(cam, wc, wr) < 0) {
         g_stats.meshes_culled++;
         return 0;
     }
+    /* Crossing the near plane: clipped, which counts what it sends */
+    int clip = dc_frustum_near_intersect(cam, wc, wr);
 
-    if (vtxbuf_full(mesh, 0))
+    if (vtxbuf_full(mesh, clip))
         return 0;
 
     g_stats.meshes_drawn++;
@@ -2017,7 +2070,7 @@ static int draw_skinned_mesh(DMSMesh* mesh, DMSModel* model,
     float cols[9] = { sc.cos * stretch.x, 0.0f, sc.sin * stretch.x,
                       0.0f, stretch.y, 0.0f,
                       -sc.sin * stretch.z, 0.0f, sc.cos * stretch.z };
-    light_to_model(pos, scale, cols);
+    light_to_model(pos, scale, rot ? rot : cols);
     lights_at(mesh->bound_cx, mesh->bound_cy, mesh->bound_cz);
     if (g_glow_only) g_lit = 0;
     g_rim_on = 0;
@@ -2025,8 +2078,19 @@ static int draw_skinned_mesh(DMSMesh* mesh, DMSModel* model,
     /* Build MVP with Z negation baked into scale */
     shz_xmtrx_load_4x4((shz_mat4x4_t*)dc_camera_get_pv(cam));
     shz_xmtrx_translate(pos.x - cam->pos.x, pos.y - cam->pos.y, -(pos.z - cam->pos.z));
-    if (yaw != 0.0f) shz_xmtrx_rotate_y(yaw);
-    shz_xmtrx_scale_3x3(scale * stretch.x, scale * stretch.y, -scale * stretch.z);
+    if (rot) {
+        /* As draw_blocks_list: the z row and z column flip sign */
+        alignas(32) shz_mat4x4_t rm;
+        rm.elem2D[0][0] =  rot[0]; rm.elem2D[0][1] =  rot[1]; rm.elem2D[0][2] = -rot[2]; rm.elem2D[0][3] = 0.0f;
+        rm.elem2D[1][0] =  rot[3]; rm.elem2D[1][1] =  rot[4]; rm.elem2D[1][2] = -rot[5]; rm.elem2D[1][3] = 0.0f;
+        rm.elem2D[2][0] = -rot[6]; rm.elem2D[2][1] = -rot[7]; rm.elem2D[2][2] =  rot[8]; rm.elem2D[2][3] = 0.0f;
+        rm.elem2D[3][0] = 0.0f;    rm.elem2D[3][1] = 0.0f;    rm.elem2D[3][2] = 0.0f;    rm.elem2D[3][3] = 1.0f;
+        shz_xmtrx_apply_4x4(&rm);
+        shz_xmtrx_scale_3x3(scale, scale, -scale);
+    } else {
+        if (yaw != 0.0f) shz_xmtrx_rotate_y(yaw);
+        shz_xmtrx_scale_3x3(scale * stretch.x, scale * stretch.y, -scale * stretch.z);
+    }
 
     alignas(32) shz_mat4x4_t mvp;
     shz_xmtrx_store_4x4(&mvp);
@@ -2034,7 +2098,8 @@ static int draw_skinned_mesh(DMSMesh* mesh, DMSModel* model,
     g_stats.verts_xformed += mesh->vertex_count;
     uv_scroll_set(mesh);
     int zone = dc_zone_enter(DC_ZONE_SKIN);
-    render_skinned(mesh->vertices, mesh->vertex_count, model->skeleton, &mvp, dr);
+    if (clip) render_skinned_clipped(mesh->vertices, mesh->vertex_count, model->skeleton, &mvp, dr);
+    else      render_skinned(mesh->vertices, mesh->vertex_count, model->skeleton, &mvp, dr);
     dc_zone_leave(zone);
     g_stats.verts_skin += mesh->vertex_count;
     return 1;
@@ -2270,7 +2335,8 @@ static void draw_blocks_list(DMSModel* model, shz_vec3_t pos, float scale,
 
 /* Skinned models: one mesh at a time */
 static void draw_skinned_list(DMSModel* model, shz_vec3_t pos, float scale,
-                              float yaw, shz_vec3_t stretch, const DCCamera* cam, int target_list) {
+                              float yaw, shz_vec3_t stretch, const float* rot,
+                              const DCCamera* cam, int target_list) {
     pvr_dr_state_t* dr = NULL;
 
     for (uint32_t m = 0; m < model->mesh_count; m++) {
@@ -2290,7 +2356,7 @@ static void draw_skinned_list(DMSModel* model, shz_vec3_t pos, float scale,
             dc_list_begin(target_list);
             dr = dc_dr_state();
         }
-        draw_skinned_mesh(mesh, model, pos, scale, yaw, stretch, cam, dr);
+        draw_skinned_mesh(mesh, model, pos, scale, yaw, stretch, rot, cam, dr);
     }
 }
 
@@ -2299,7 +2365,7 @@ void dc_model_draw_list_rotated(DMSModel* model, shz_vec3_t pos, float scale,
     if (!model || model->mesh_count == 0) return;
 
     if (model->skeleton)
-        draw_skinned_list(model, pos, scale, yaw, shz_vec3_init(1.0f, 1.0f, 1.0f), cam, target_list);
+        draw_skinned_list(model, pos, scale, yaw, shz_vec3_init(1.0f, 1.0f, 1.0f), NULL, cam, target_list);
     else {
         draw_blocks_list(model, pos, scale, yaw, NULL, cam, target_list);
         if (!g_add) {
@@ -2321,12 +2387,16 @@ void dc_model_draw_list_stretched(DMSModel* model, shz_vec3_t pos, float scale, 
     if (stretch.x == 0.0f) stretch.x = 1.0f;
     if (stretch.y == 0.0f) stretch.y = 1.0f;
     if (stretch.z == 0.0f) stretch.z = 1.0f;
-    draw_skinned_list(model, pos, scale, yaw, stretch, cam, target_list);
+    draw_skinned_list(model, pos, scale, yaw, stretch, NULL, cam, target_list);
 }
 
 void dc_model_draw_list_oriented(DMSModel* model, shz_vec3_t pos, float scale,
                                  const float rot[9], const DCCamera* cam, int target_list) {
-    if (!model || model->mesh_count == 0 || model->skeleton) return;
+    if (!model || model->mesh_count == 0) return;
+    if (model->skeleton) {
+        draw_skinned_list(model, pos, scale, 0.0f, shz_vec3_init(1.0f, 1.0f, 1.0f), rot, cam, target_list);
+        return;
+    }
 
     draw_blocks_list(model, pos, scale, 0.0f, rot, cam, target_list);
     if (!g_add) {
@@ -2924,6 +2994,17 @@ static void update_bounds_from_skeleton(DMSModel* model) {
     model->anim_bound_radius = r;
 }
 
+void dc_model_pose_from_bones(DMSModel* model) {
+    DMSSkeleton* sk = model ? model->skeleton : NULL;
+    if (!sk) return;
+    for (int i = 0; i < sk->boneCount; i++) {
+        DMSBone* bone = &sk->bones[i];
+        shz_xmtrx_load_4x4(&bone->worldPose);
+        shz_xmtrx_apply_store_4x4(&bone->skinMatrix, &bone->inverseBindMatrix);
+    }
+    update_bounds_from_skeleton(model);
+}
+
 void dc_model_animate(DMSModel* model, float dt) {
     if (!model || !model->skeleton) return;
 
@@ -3429,9 +3510,9 @@ DMSModel* dc_model_load(const char* filename) {
             model->max_bind_radius = model->meshes[m].bound_radius;
     }
 
-    /* Clip buffer (shared, grows to the largest mesh ever loaded). Animated
-     * models have no clip path, but the volume paths transform through this
-     * too, so they need one: without it they wrote every vertex to address 0. */
+    /* Clip buffer (shared, grows to the largest mesh ever loaded), animated
+     * ones too: they are clipped through it near the camera, and the volume
+     * paths transform through it. */
     clip_buffer_reserve(max_verts);
 
     /* ---- Embedded textures & PVR headers ---- */
@@ -4399,6 +4480,13 @@ void dc_model_compile_header(const DMSMesh* mesh, pvr_poly_hdr_t* out, int pvrfo
 
     /* Table fog on every model; dc_set_fog decides whether there is any */
     cxt.gen.fog_type = PVR_FOG_TABLE;
+
+    /* Solid ones can be darkened outside dc_beam()'s beams: a modifier volume
+     * in the opaque modifier list, "cheap shadow" (dims by one scale) */
+    if (dc_beams_enabled() && pvr_list != PVR_LIST_TR_POLY) {
+        cxt.fmt.modifier = PVR_MODIFIER_ENABLE;
+        cxt.gen.modifier_mode = PVR_MODIFIER_CHEAP_SHADOW;
+    }
 
     if (alpha_mode == 2) {
         cxt.txr.env = PVR_TXRENV_MODULATEALPHA;

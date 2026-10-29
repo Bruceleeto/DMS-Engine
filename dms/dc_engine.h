@@ -21,6 +21,12 @@ typedef struct {
      * before any model exists, so it cannot be worked out. Costs ~525KB of
      * texture RAM. */
     bool  volumes;
+    /* This app calls dc_beam() (dc_beam.h): solid models are drawn so that a
+     * modifier volume can darken them, and the opaque modifier list gets tile
+     * bins (full size: the sheet the beams are cut from crosses every tile,
+     * and smaller bins overflowed and hung the PVR). Costs ~525KB of
+     * texture RAM. Set before any model is loaded. */
+    bool  beams;
 } DCInitParams;
 
 /* Init PVR, timing, internal state. Zero-init params for defaults. */
@@ -29,6 +35,9 @@ void dc_init(DCInitParams params);
 /* Engine use (dc_model_volume): whether dc_init() was given .volumes = true,
  * and so whether the translucent modifier list has tile bins to write into. */
 bool dc_volumes_enabled(void);
+
+/* Engine use (dc_beam, model headers): whether dc_init() was given .beams = true */
+bool dc_beams_enabled(void);
 
 /* Free engine resources, pvr_shutdown(). */
 void dc_shutdown(void);

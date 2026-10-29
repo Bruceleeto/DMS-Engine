@@ -27,6 +27,9 @@
 /* flags for dc_corona() */
 #define DC_CORONA_FLARE (1u << 0)   /* a lens flare when looked at: discs from the
                                      * light through the middle of the screen */
+#define DC_CORONA_OWN_CAMERA (1u << 1) /* seen only by the camera set when
+                                     * dc_corona() is called: a lamp on a gun
+                                     * drawn with its own camera */
 
 /* Lit this frame. id: any number, the same for the same light each frame.
  * pos: where, in the world. rgb: 0xRRGGBB. size: how wide, in world units.

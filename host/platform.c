@@ -192,6 +192,9 @@ static cont_state_t* port1(void) {
     if (keys[SDL_SCANCODE_D]) state.buttons |= CONT_DPAD_RIGHT;
     if (keys[SDL_SCANCODE_SPACE]) state.buttons |= CONT_A;
     if (keys[SDL_SCANCODE_R]) state.buttons |= CONT_Y;
+    /* Fire in a shooter: left Ctrl or the left mouse button */
+    if (keys[SDL_SCANCODE_LCTRL] || (SDL_GetMouseState(NULL, NULL) & SDL_BUTTON_LMASK))
+        state.buttons |= CONT_B;
     state.joyx = 100 * (keys[SDL_SCANCODE_RIGHT] - keys[SDL_SCANCODE_LEFT]);
     state.joyy = 100 * (keys[SDL_SCANCODE_DOWN] - keys[SDL_SCANCODE_UP]);
     state.rtrig = keys[SDL_SCANCODE_LSHIFT] ? 255 : 0;

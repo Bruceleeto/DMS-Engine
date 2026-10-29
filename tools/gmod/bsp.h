@@ -39,7 +39,11 @@ struct Bsp {
 };
 
 /* Reads the map and mounts its packed-in files (its own materials) in vfs */
-bool bsp_load(Vfs& vfs, const std::string& path, Bsp& out, std::string* why = nullptr);
+/* light: the map's light made this many times brighter (a game that darkens
+ * it again outside a torch's beam, say). ambient: no corner darker than
+ * this (0..1, on the screen), so a torch lighting it has something to show. */
+bool bsp_load(Vfs& vfs, const std::string& path, Bsp& out, std::string* why = nullptr, float light = 1.0f,
+              float ambient = 0.0f);
 
 /* Fewer triangles where it doesn't show: the pieces the map was cut into
  * (by its tree, by its lightmaps' size) joined back up, as long as the

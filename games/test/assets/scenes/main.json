@@ -1,0 +1,14 @@
+{
+  "dms_scene": 1,
+  "background": "#202830",
+  "camera": { "pos": [0, 1.6, 6], "yaw": 180, "pitch": 0, "fov": 60 },
+  "lights": [
+    { "name": "Sun", "pos": [-0.4, -1, -0.3], "sun": true,
+      "color": "#ffffff", "range": 500, "ambient": 0.35, "bands": 0 }
+  ],
+  "objects": [
+    { "name": "Ground", "model": "@cube",
+      "pos": [0, -0.05, 0], "rot": [0, 0, 0], "scale": [20, 0.1, 20],
+      "tint": "#5a6470", "add": false, "visible": true }
+  ]
+}

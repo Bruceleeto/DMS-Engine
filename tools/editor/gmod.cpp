@@ -38,7 +38,8 @@ static bool run(const std::string& cmd, std::string* out, std::string* err = nul
     mkdir((ed.root + "build/editor").c_str(), 0755);
     mkdir(dir.c_str(), 0755);
     std::string e = err ? " 2>" + q(ef) : " 2>/dev/null";
-    FILE* p = popen((cmd + e).c_str(), "r");
+    /* At most 3 GB each: a converter gone wrong fails, not the machine */
+    FILE* p = popen(("ulimit -v 3000000; " + cmd + e).c_str(), "r");
     if (!p) return false;
     char buf[4096];
     size_t n;
@@ -78,9 +79,9 @@ static std::string base_name(const std::string& p) {
 namespace {
 
 /* Which game a file is from, by where it was found */
-enum Game { ALL, GMOD, HL2, CSS, TF2, PORTAL, ADDONS, GAMES };
+enum Game { ALL, GMOD, HL2, CSS, TF2, PORTAL, L4D, ADDONS, GAMES };
 static const char* const GAME_NAMES[GAMES] = { "Every game", "Garry's Mod", "Half-Life 2", "Counter-Strike: Source",
-                                               "Team Fortress 2", "Portal", "Addons" };
+                                               "Team Fortress 2", "Portal", "Left 4 Dead", "Addons" };
 static Game game_of(const std::string& from) {
     auto starts = [&](const char* p) { return !from.compare(0, strlen(p), p); };
     if (starts("workshop/") || starts("addons/")) return ADDONS;
@@ -88,6 +89,7 @@ static Game game_of(const std::string& from) {
     if (starts("cstrike") || starts("content_cstrike")) return CSS;
     if (starts("tf/") || from == "tf") return TF2;
     if (starts("portal")) return PORTAL;
+    if (starts("l4d")) return L4D;
     return GMOD;
 }
 

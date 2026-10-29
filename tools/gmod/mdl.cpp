@@ -170,6 +170,12 @@ bool mdl_load(const Vfs& vfs, const std::string& path, Mdl& out, std::string* wh
                 size_t sg = xme + ri(vtx, xme + 4) + (size_t)g * sg_size;
                 int nv = ri(vtx, sg), vo = ri(vtx, sg + 4), nidx = ri(vtx, sg + 8), io = ri(vtx, sg + 12);
                 int nstrip = ri(vtx, sg + 16), so = ri(vtx, sg + 20);
+                /* Counts that run past the end of the file are a misread (or
+                 * a broken file): a stop, not billions of triangles */
+                if (nv < 0 || nidx < 0 || nstrip < 0 ||
+                    sg + vo + (size_t)nv * 9 > vtx.size() || sg + io + (size_t)nidx * 2 > vtx.size() ||
+                    sg + so + (size_t)nstrip * strip_size > vtx.size())
+                    return fail(".vtx strip group out of range");
                 std::vector<int> local(nv);
                 for (int k = 0; k < nv; k++) {
                     int orig = rd<uint16_t>(vtx, sg + vo + (size_t)k * 9 + 4);
@@ -192,6 +198,7 @@ bool mdl_load(const Vfs& vfs, const std::string& path, Mdl& out, std::string* wh
                 for (int s = 0; s < nstrip; s++) {
                     size_t st = sg + so + (size_t)s * strip_size;
                     int sn = ri(vtx, st), sio = ri(vtx, st + 4);
+                    if (sn < 0 || sio < 0 || (size_t)sio + sn > (size_t)nidx) return fail(".vtx strip out of range");
                     uint8_t flags = vtx[st + 18];
                     if (flags & 2) {
                         for (int k = 0; k + 2 < sn; k++) {
@@ -261,6 +268,52 @@ static Quat euler_quat(Vec3 a) {
     return q;
 }
 
+static Quat quat48(const uint8_t* d) {
+    uint16_t x, y, zw;
+    memcpy(&x, d, 2); memcpy(&y, d + 2, 2); memcpy(&zw, d + 4, 2);
+    Quat q;
+    q.x = ((int)x - 32768) * (1.0f / 32768.0f);
+    q.y = ((int)y - 32768) * (1.0f / 32768.0f);
+    q.z = ((int)(zw & 0x7fff) - 16384) * (1.0f / 16384.0f);
+    q.w = sqrtf(std::max(0.0f, 1.0f - q.x * q.x - q.y * q.y - q.z * q.z));
+    if (zw & 0x8000) q.w = -q.w;
+    return q;
+}
+
+/* The layout Left 4 Dead brought in: frame by bone instead of bone by frame.
+ * A header (where the constants and the frames are, how long a frame is),
+ * a flags byte a bone, then what does not change, once, and each frame's
+ * values, both bone after bone, a rotation before a position. A bone with
+ * neither keeps its rest pose. */
+static void decode_frame_anim(const Mdl& m, const uint8_t* p, const uint8_t* end, int frame,
+                              Vec3* pos, Quat* rot) {
+    enum { CONST_POS = 1, CONST_ROT = 2, ANIM_POS = 4, ANIM_ROT = 8, FULLANIM_POS = 16 };
+    if (p + 24 > end) return;
+    int constants, frames, length;
+    memcpy(&constants, p, 4); memcpy(&frames, p + 4, 4); memcpy(&length, p + 8, 4);
+    size_t nb = m.bones.size();
+    const uint8_t* bf = p + 24;
+    const uint8_t* c = p + constants;
+    const uint8_t* fd = p + frames + (size_t)frame * length;
+    for (size_t i = 0; i < nb; i++) {
+        uint8_t f = bf[i];
+        if (f & ANIM_ROT) { if (fd + 6 <= end) rot[i] = quat48(fd); fd += 6; }
+        else if (f & CONST_ROT) { if (c + 6 <= end) rot[i] = quat48(c); c += 6; }
+        if (f & ANIM_POS) {
+            uint16_t h[3];
+            if (fd + 6 <= end) { memcpy(h, fd, 6); pos[i] = { half(h[0]), half(h[1]), half(h[2]) }; }
+            fd += 6;
+        } else if (f & CONST_POS) {
+            uint16_t h[3];
+            if (c + 6 <= end) { memcpy(h, c, 6); pos[i] = { half(h[0]), half(h[1]), half(h[2]) }; }
+            c += 6;
+        } else if (f & FULLANIM_POS) {
+            if (fd + 12 <= end) memcpy(&pos[i], fd, 12);
+            fd += 12;
+        }
+    }
+}
+
 bool mdl_decode_anim(const Mdl& m, const std::string& name, MdlAnim& out) {
     const auto& b = m.raw;
     int n = ri(b, H_NUMLOCALANIM), ai = ri(b, H_LOCALANIMINDEX);
@@ -306,6 +359,10 @@ bool mdl_decode_anim(const Mdl& m, const std::string& name, MdlAnim& out) {
             int start = ri(b, blocks + (size_t)blk * 8);
             p = m.ani.data() + start + idx;
             end = m.ani.data() + m.ani.size();
+        }
+        if (flags & 0x0040) {                   /* STUDIO_FRAMEANIM (Left 4 Dead on) */
+            decode_frame_anim(m, p, end, local, pos, rot);
+            continue;
         }
         while (p + 4 <= end) {
             uint8_t bone = p[0], af = p[1];

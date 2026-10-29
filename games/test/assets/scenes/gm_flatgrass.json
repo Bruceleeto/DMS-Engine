@@ -1,0 +1,11 @@
+{
+  "dms_scene": 1,
+  "background": "#8db4d8",
+  "camera": { "pos": [14.6304, -310.49, -13.0048], "yaw": 0, "pitch": 0, "fov": 60 },
+  "lights": [],
+  "objects": [
+    { "name": "Player", "model": "",
+      "pos": [14.6304, -312.09, -13.0048], "rot": [0, 0, 0], "scale": [1, 1, 1],
+      "tint": "#ffffff", "add": false, "visible": true }
+  ]
+}

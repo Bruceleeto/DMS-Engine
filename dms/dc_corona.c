@@ -34,6 +34,7 @@ typedef struct {
     float      fade;        /* 0 to 1, how lit it is shown */
     uint32_t   asked;       /* the frame it was last asked for */
     uint32_t   flags;
+    const DCCamera* cam;    /* DC_CORONA_OWN_CAMERA: the one it is seen by */
     bool       used;
 } Corona;
 
@@ -252,6 +253,7 @@ static void coronas_draw_cb(void* user) {
     for (int i = 0; i < CORONAS; i++) {
         const Corona* c = &g_coronas[i];
         if (c->used && c->size > 0.0f &&
+            (!(c->flags & DC_CORONA_OWN_CAMERA) || c->cam == cam) &&
             dc_frustum_cull_sphere(cam, c->pos, c->size * 1.71f) >= 0)
             seen[n_seen++] = (uint8_t)i;
     }
@@ -399,5 +401,6 @@ void dc_corona(uint32_t id, shz_vec3_t pos, uint32_t rgb, float size, uint32_t f
     c->rgb = rgb;
     c->size = size;
     c->flags = flags;
+    c->cam = dc_get_camera();
     c->asked = dc_frame_count();
 }

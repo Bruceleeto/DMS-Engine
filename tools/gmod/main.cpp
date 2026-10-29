@@ -1,4 +1,4 @@
-/* gmod2glb: Garry's Mod models and maps (and the HL2, CS:S, TF2 and Portal installed beside it, and
+/* gmod2glb: Garry's Mod models and maps (and the HL2, CS:S, TF2, Portal and Left 4 Dead installed beside it, and
  * workshop addons) to .glb, which strippy makes .dms of.
  *
  *   gmod2glb --list [text]             the models whose path has text in it
@@ -65,6 +65,8 @@ struct Options {
     std::vector<std::string> anims;
     bool anims_only = false;
     float simplify = 0;     /* a map: bsp_simplify's error, 0 none */
+    float light = 1;        /* a map: its light this many times brighter */
+    float ambient = 0;      /* a map: no corner darker than this (0..1) */
     MdlPick pick;
 };
 
@@ -402,7 +404,7 @@ static uint8_t mat_flags(const Material& m) {
 static bool map_info(Vfs& vfs, const std::string& path, const Options& opt, const std::string& preview) {
     Bsp b;
     std::string why;
-    if (!bsp_load(vfs, path, b, &why)) { fprintf(stderr, "%s: %s\n", path.c_str(), why.c_str()); return false; }
+    if (!bsp_load(vfs, path, b, &why, opt.light, opt.ambient)) { fprintf(stderr, "%s: %s\n", path.c_str(), why.c_str()); return false; }
     size_t unsimplified = opt.simplify > 0 ? bsp_simplify(b, opt.simplify) : 0;
     const VfsEntry* e = vfs.find(path);
     size_t world_verts = 0;
@@ -603,7 +605,7 @@ static bool bring_map(Vfs& vfs, const std::string& path, const std::string& asse
                       const std::string& player, float player_scale) {
     Bsp b;
     std::string why;
-    if (!bsp_load(vfs, path, b, &why)) { fprintf(stderr, "%s: %s\n", path.c_str(), why.c_str()); return false; }
+    if (!bsp_load(vfs, path, b, &why, opt.light, opt.ambient)) { fprintf(stderr, "%s: %s\n", path.c_str(), why.c_str()); return false; }
     size_t unsimplified = opt.simplify > 0 ? bsp_simplify(b, opt.simplify) : 0;
     if (name.empty()) name = b.name;
     std::string assets = assets_in;
@@ -703,20 +705,26 @@ static void usage(const char* self) {
             "       %s [--gmod dir] --info model.mdl|maps/x.bsp [--preview out.bin] [--tex 512]\n"
             "       %s [--gmod dir] maps/x.bsp --assets <project>/assets [--name x] [--tex 128] [--no-props]\n"
             "           [--simplify 0.02]   (fewer triangles: how far shape (metres) and light (0..1) may move)\n"
+            "           [--light 3]   (its light 3 times brighter: for a game that darkens it again)\n"
+            "           [--ambient 0.5]   (no corner darker than half: something for a torch to light)\n"
             "           [--player char/model.dms --player-scale 1]   (the scene's Player, at the map's start)\n"
+            "       %s [--gmod dir] --find text   (any file: sounds, materials...)\n"
+            "       %s [--gmod dir] sound/x.wav -o x.wav   (any other file, or one out as .mdl: as it is)\n"
             "  and --skin N, --body a,b,c (a choice per body part) for a model's other looks\n",
-            self, self, self, self, self);
+            self, self, self, self, self, self, self);
 }
 
 int main(int argc, char** argv) {
     std::string gmod, model, out, list, preview, assets, name, player;
     float player_scale = 1.0f;
     bool games = true;
+    bool do_find = false;
     bool do_list = false, list_anims = false, workshop = true, do_info = false, tex_set = false, props = true;
     Options opt;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--gmod" && i + 1 < argc) gmod = argv[++i];
+        else if (a == "--find" && i + 1 < argc) { do_find = true; list = argv[++i]; }
         else if (a == "--no-workshop") workshop = false;
         else if (a == "--list") { do_list = true; if (i + 1 < argc && argv[i + 1][0] != '-') list = argv[++i]; }
         else if (a == "-o" && i + 1 < argc) out = argv[++i];
@@ -725,6 +733,8 @@ int main(int argc, char** argv) {
         else if (a == "--name" && i + 1 < argc) name = argv[++i];
         else if (a == "--no-props") props = false;
         else if (a == "--no-games") games = false;
+        else if (a == "--light" && i + 1 < argc) opt.light = (float)atof(argv[++i]);
+        else if (a == "--ambient" && i + 1 < argc) opt.ambient = (float)atof(argv[++i]);
         else if (a == "--simplify" && i + 1 < argc) opt.simplify = (float)atof(argv[++i]);
         else if (a == "--player" && i + 1 < argc) player = argv[++i];
         else if (a == "--player-scale" && i + 1 < argc) player_scale = (float)atof(argv[++i]);
@@ -758,7 +768,26 @@ int main(int argc, char** argv) {
                 printf("%s\t%s\n", kv.first.c_str(), vfs.sources[kv.second.source].label.c_str());
         return 0;
     }
+    if (do_find) {
+        std::string l = Vfs::norm(list);
+        for (auto& kv : vfs.files)
+            if (kv.first.find(l) != std::string::npos)
+                printf("%s\t%s\n", kv.first.c_str(), vfs.sources[kv.second.source].label.c_str());
+        return 0;
+    }
     if (model.empty()) { usage(argv[0]); return 2; }
+    bool is_mdl = model.size() > 4 && !model.compare(model.size() - 4, 4, ".mdl");
+    auto ext = [](const std::string& p) { size_t d = p.rfind('.'); return d == std::string::npos ? std::string() : p.substr(d); };
+    bool is_bsp = ext(model) == ".bsp";
+    /* Anything not a model or a map, or out with its own ending: as it is */
+    if (!out.empty() && ((!is_mdl && !is_bsp) || ext(out) == ext(model))) {
+        std::vector<uint8_t> d;
+        if (!vfs.read(model, d)) { fprintf(stderr, "not found: %s\n", model.c_str()); return 1; }
+        FILE* f = fopen(out.c_str(), "wb");
+        if (!f || fwrite(d.data(), 1, d.size(), f) != d.size()) { fprintf(stderr, "cannot write %s\n", out.c_str()); return 1; }
+        fclose(f);
+        return 0;
+    }
     bool is_map = model.size() > 4 && !model.compare(model.size() - 4, 4, ".bsp");
     if (is_map && !tex_set) opt.tex = 128;     /* a map has a lot of them */
     if (is_map && do_info) return map_info(vfs, model, opt, preview) ? 0 : 1;

@@ -53,16 +53,22 @@ void dc_init(DCInitParams params) {
 
     /* One extra list costs ~525KB of texture RAM (128 bytes x 300 tiles x the
      * x7 overflow, doubled), and at vram_size 2300KB it overruns the 4MB half,
-     * so TR_MOD is asked for. OP_MOD stays off: volumes need the translucent
-     * list to blend with what is behind them, so nothing writes to it. */
+     * so TR_MOD is asked for. OP_MOD is only for dc_beam (.beams): the
+     * x-ray volumes need the translucent list to blend with what is behind. */
     pvr_init(&(pvr_init_params_t){
         { PVR_BINSIZE_32,                                    /* OP_POLY */
-          PVR_BINSIZE_0,                                     /* OP_MOD, unused */
+          PVR_BINSIZE_32,                                    /* OP_MOD */
           PVR_BINSIZE_32,                                    /* TR_POLY */
           params.volumes ? PVR_BINSIZE_32 : PVR_BINSIZE_0,   /* TR_MOD */
           PVR_BINSIZE_32 },                                  /* PT_POLY */
         params.vram_size, 0, 0, 0, 6
     });
+
+    /* .beams marks solid models "shadow"; the PVR reads those as one volume
+     * only in intensity mode, else as two volumes' worth of vertex data, which
+     * hangs the real chip. So the mode goes on now, before anything draws,
+     * at no darkening; dc_beam sets the scale */
+    if (params.beams) pvr_set_shadow_scale(true, 1.0f);
 
     dc_set_fog_off();
 
@@ -74,6 +80,10 @@ void dc_init(DCInitParams params) {
 
 bool dc_volumes_enabled(void) {
     return g_engine.params.volumes;
+}
+
+bool dc_beams_enabled(void) {
+    return g_engine.params.beams;
 }
 
 void dc_shutdown(void) {

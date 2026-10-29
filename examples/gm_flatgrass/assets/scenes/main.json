@@ -1,0 +1,20 @@
+{
+  "dms_scene": 1,
+  "background": "#8db4d8",
+  "camera": { "pos": [14.6304, -310.49, -13.0048], "yaw": 0, "pitch": 0, "fov": 60 },
+  "lights": [],
+  "objects": [
+    { "name": "World", "model": "gmod/maps/gm_flatgrass/gm_flatgrass.dms",
+      "pos": [0, 0, 0], "rot": [0, 0, 0], "scale": [1, 1, 1],
+      "tint": "#ffffff", "add": false, "visible": true },
+    { "name": "Alyx", "model": "gmod/alyx/alyx.dms",
+      "pos": [14.6, -312.09, -8], "rot": [0, 180, 0], "scale": [1, 1, 1],
+      "tint": "#ffffff", "add": false, "visible": true },
+    { "name": "Headcrab", "model": "gmod/headcrab/headcrab.dms",
+      "pos": [16.5, -312.09, -9.5], "rot": [0, 180, 0], "scale": [1, 1, 1],
+      "tint": "#ffffff", "add": false, "visible": true },
+    { "name": "companion_doll_1", "model": "gmod/maxofs2d/companion_doll.dms",
+      "pos": [0, -324.307, -24.9936], "rot": [0, 0, 0], "scale": [1, 1, 1],
+      "tint": "#ffffff", "add": false, "visible": true }
+  ]
+}

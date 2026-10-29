@@ -120,10 +120,11 @@ struct Reader {
 };
 }
 
-/* ColorRGBExp32 at byte offset o, to a 0..255 screen colour */
-static void luxel(const std::vector<uint8_t>& f, size_t o, float out[3]) {
+/* ColorRGBExp32 at byte offset o, to a 0..255 screen colour, the light
+ * made expo times brighter */
+static void luxel(const std::vector<uint8_t>& f, size_t o, float out[3], float expo) {
     int e = (int8_t)(o + 3 < f.size() ? f[o + 3] : 0);
-    float k = ldexpf(1.0f, e) / 255.0f;
+    float k = ldexpf(1.0f, e) / 255.0f * expo;
     for (int c = 0; c < 3; c++) {
         /* Overbright: the game's lightmaps are half what they light */
         float lin = (o + c < f.size() ? f[o + c] : 0) * k * 2.0f;
@@ -132,7 +133,7 @@ static void luxel(const std::vector<uint8_t>& f, size_t o, float out[3]) {
     }
 }
 
-bool bsp_load(Vfs& vfs, const std::string& path, Bsp& out, std::string* why) {
+bool bsp_load(Vfs& vfs, const std::string& path, Bsp& out, std::string* why, float light, float ambient) {
     auto fail = [&](const std::string& w) { if (why) *why = w; return false; };
     Reader R;
     out.path = Vfs::norm(path);
@@ -165,6 +166,22 @@ bool bsp_load(Vfs& vfs, const std::string& path, Bsp& out, std::string* why) {
     /* Some maps have only the HDR faces and light */
     int faces_lump = R.len[L_FACES] ? L_FACES : L_FACES_HDR;
     int light_lump = R.len[L_LIGHTING] ? L_LIGHTING : L_LIGHTING_HDR;
+    /* Light made only for HDR (Left 4 Dead's) is left for the game's
+     * tonemapper to bring up to what the eye sees, and is many times darker
+     * than a map's LDR light: brought up here as the tonemapper would, its
+     * mean to about a Half-Life 2 map's (0.2 to 0.5), up to 12 times */
+    float expo = 1.0f;
+    if (light_lump == L_LIGHTING_HDR && R.len[light_lump] >= 4) {
+        double sum = 0;
+        size_t n = 0, o = R.at(light_lump), len = R.len[light_lump];
+        for (size_t k = 0; k + 4 <= len; k += 4 * 7, n++) {
+            const uint8_t* c = &f[o + k];
+            float lin = (0.2126f * c[0] + 0.7152f * c[1] + 0.0722f * c[2]) * ldexpf(1.0f, (int8_t)c[3]) / 255.0f * 2.0f;
+            sum += std::min(lin, 4.0f);
+        }
+        if (n && sum > 0) expo = std::min(std::max(0.22f / (float)(sum / n), 1.0f), 12.0f);
+    }
+    expo *= light;
 
     /* Its own files (materials, mostly), over the game's */
     if (R.len[L_PAKFILE]) {
@@ -306,8 +323,15 @@ bool bsp_load(Vfs& vfs, const std::string& path, Bsp& out, std::string* why) {
             int us[4] = { u0, u1, u0, u1 }, vs[4] = { v0, v0, v1, v1 };
             float wt[4] = { (1 - fu) * (1 - fv), fu * (1 - fv), (1 - fu) * fv, fu * fv };
             for (int k = 0; k < 4; k++) {
-                luxel(f, R.at(light_lump) + (size_t)lightofs + ((size_t)vs[k] * w + us[k]) * 4, s[k]);
+                luxel(f, R.at(light_lump) + (size_t)lightofs + ((size_t)vs[k] * w + us[k]) * 4, s[k], expo);
                 for (int ch = 0; ch < 3; ch++) c[ch] += s[k][ch] * wt[k];
+            }
+            /* Lifted to the floor asked for, keeping its colour */
+            float most = std::max(c[0], std::max(c[1], c[2]));
+            float floor = ambient * 255.0f;
+            if (most < floor) {
+                float add = floor - most;
+                for (int ch = 0; ch < 3; ch++) c[ch] += add;
             }
             for (int ch = 0; ch < 3; ch++) rgba[ch] = (uint8_t)std::min(255.0f, c[ch]);
         };
