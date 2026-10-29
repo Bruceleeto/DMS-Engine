@@ -425,18 +425,21 @@ static shz_vec3_t torch_lens(const Fx* f, const DMSModel* gun) {
 }
 
 /* Where the torch lands, a glow: the light coming back off what it hits */
-static __attribute__((noinline)) void torch_spot(ColWorld* col, shz_vec3_t eye, shz_vec3_t dir) {
+static __attribute__((noinline)) float torch_spot(ColWorld* col, shz_vec3_t eye, shz_vec3_t dir) {
     ColRayHit spot = col_raycast(col, eye, dir, TORCH_REACH);
-    if (spot.hit)
-        dc_corona(1, shz_vec3_add(eye, shz_vec3_scale(dir, spot.t)), 0x806E58,
-                  0.5f + spot.t * 0.12f, DC_CORONA_OWN_CAMERA);
+    if (!spot.hit) return TORCH_REACH;
+    dc_corona(1, shz_vec3_add(eye, shz_vec3_scale(dir, spot.t)), 0x806E58,
+              0.5f + spot.t * 0.12f, DC_CORONA_OWN_CAMERA);
+    return spot.t;
 }
 
 /* The shaft, from the lens: where the lens is on the screen (the gun's
  * camera sees wider), at that depth in the world, aimed to meet the middle
- * of the view 12m out */
+ * of the view 12m out, or where the light lands if that is nearer, and
+ * ending there: not through the wall */
 static __attribute__((noinline)) void torch_shaft(const DCCamera* cam, const DCCamera* gun_cam,
-                                                  const Fx* fx, const DMSModel* gun_m, shz_vec3_t dir) {
+                                                  const Fx* fx, const DMSModel* gun_m, shz_vec3_t dir,
+                                                  float hit) {
     shz_vec3_t lens = torch_lens(fx, gun_m);
     float wide = tanf(cam->fov * 0.5f * 0.0174533f) / tanf(gun_cam->fov * 0.5f * 0.0174533f);
     shz_sincos_t cy = shz_sincosf(cam->yaw), cp = shz_sincosf(cam->pitch);
@@ -445,9 +448,11 @@ static __attribute__((noinline)) void torch_shaft(const DCCamera* cam, const DCC
     shz_vec3_t up = shz_vec3_init(cy.sin * cp.sin, cp.cos, cy.cos * cp.sin);
     shz_vec3_t from = shz_vec3_add(cam->pos, shz_vec3_add(shz_vec3_scale(f, lens.z),
         shz_vec3_add(shz_vec3_scale(right, -lens.x * wide), shz_vec3_scale(up, lens.y * wide))));
-    shz_vec3_t aim = shz_vec3_add(cam->pos, shz_vec3_scale(dir, 12.0f));
-    dc_beam_shaft(from, shz_vec3_sub(aim, from), 0.02f, TORCH_SPREAD * 0.75f, TORCH_SHAFT_START,
-                  16.0f, 0xFFE6BE, 0.9f);
+    shz_vec3_t aim = shz_vec3_add(cam->pos, shz_vec3_scale(dir, hit < 12.0f ? hit : 12.0f));
+    shz_vec3_t to = shz_vec3_sub(aim, from);
+    float reach = sqrtf(shz_vec3_dot(to, to)) + (hit < 12.0f ? 0.0f : 4.0f);
+    dc_beam_shaft(from, to, 0.02f, TORCH_SPREAD * 0.75f, TORCH_SHAFT_START,
+                  reach < 16.0f ? reach : 16.0f, 0xFFE6BE, 0.9f);
 }
 
 /* The torch, lit: the dark round its beam, the beam from the eye where you
@@ -460,8 +465,8 @@ static void torch_draw(const DCCamera* cam, const DCCamera* gun_cam, const Fx* f
     shz_vec3_t dir = shz_vec3_init(y.sin * p.cos, -p.sin, y.cos * p.cos);
     dc_beam_dark(TORCH_DARK, 1.0f);
     dc_beam(cam->pos, dir, TORCH_SPREAD, TORCH_REACH);
-    torch_spot(col, cam->pos, dir);
-    torch_shaft(cam, gun_cam, fx, gun_m, dir);
+    float hit = torch_spot(col, cam->pos, dir);
+    torch_shaft(cam, gun_cam, fx, gun_m, dir, hit);
 }
 
 
@@ -506,6 +511,7 @@ int main(int argc, char* argv[]) {
     /* The vertex buffer: this map wants under 1MB a frame; the 2MB default
      * (doubled) left too little texture RAM on the console */
     dc_init((DCInitParams){ .beams = true, .vram_size = 1280 * 1024 });
+    dc_beam_dust(0.35f);        /* motes in the torch's beam, faint */
     dc_draw2d_init();
 
     DCScene* scene = dc_scene_play(ASSETS, "scenes/main.json");

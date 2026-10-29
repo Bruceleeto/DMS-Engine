@@ -27,7 +27,7 @@
  * volumes), so over it each beam lays a picture of its light, multiplied in:
  * a hot spot in the middle, softly falling off into the dark by the rim. It
  * lines up with the edge exactly when from is where the camera is (a cone
- * seen from its tip is the same circle at every distance). 8KB of VRAM.
+ * seen from its tip is the same circle at every distance). 128KB of VRAM.
  * ================================================================ */
 
 /* Dark outside the beams this frame, seen by the camera set now: dark is
@@ -57,9 +57,15 @@ void dc_beam(shz_vec3_t from, shz_vec3_t dir, float half_angle, float length);
  * spreading half_angle radians either side, fading out by length. rgb
  * 0xRRGGBB, strength 0..1 how bright it gets. Nothing nearer the lamp than
  * start: it fades in from there (so the bit by a held torch, filling the
- * view, is left out). Its sides fade as they turn edge on, so it reads as
- * lit haze, not a cone. Up to 4 a frame, after dc_beam_dark(). */
+ * view, is left out). Drawn as soft glows along its middle facing the
+ * camera, so it reads as lit haze, thickest down the middle, not a cone.
+ * 8KB of VRAM. Up to 4 a frame, after dc_beam_dark(). */
 void dc_beam_shaft(shz_vec3_t from, shz_vec3_t dir, float r0, float half_angle, float start,
                    float length, uint32_t rgb, float strength);
+
+/* Dust in the air, seen only in the shafts: motes fixed in the world that
+ * the light catches as it sweeps through them, twinkling. amount 0 (none,
+ * the default) to 1 (as bright as the shaft) or more. 512 bytes of VRAM. */
+void dc_beam_dust(float amount);
 
 #endif /* DC_BEAM_H */

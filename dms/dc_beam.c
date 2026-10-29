@@ -10,15 +10,15 @@
 #include <stdio.h>
 #include <stdalign.h>
 #include <string.h>
+#include <stdlib.h>
+#include <malloc.h>
 
 #define BEAMS    4
 #define SIDES    32             /* round a cone */
-#define SHAFT_SIDES 24          /* round a shaft */
 #define PAST     0.15f          /* a cone starts this far past the sheet */
-#define GLOW     64             /* the light across a beam: a picture this wide */
+#define GLOW     256            /* the light across a beam: a picture this wide */
 #define GLOW_AT  0.1f           /* drawn this far past the sheet */
 #define GLOW_OVER 5.0f          /* its square this many times the light's: the whole view */
-#define RINGS    7              /* along a shaft */
 
 typedef struct {
     shz_vec3_t from, dir;
@@ -214,34 +214,53 @@ static bool glow_make(float dark) {
     }
     g_glow_dark = dark;
 
-    static uint16_t px[GLOW * GLOW] __attribute__((aligned(32)));
+    /* Made once, so out of RAM only while it is */
+    uint16_t* px = memalign(32, GLOW * GLOW * 2);
+    if (!px) return false;
     for (int y = 0; y < GLOW; y++)
         for (int x = 0; x < GLOW; x++) {
             float fx = (x + 0.5f) / (GLOW / 2) - 1.0f, fy = (y + 0.5f) / (GLOW / 2) - 1.0f;
             float d = sqrtf(fx * fx + fy * fy);
-            /* Outside the rim the volume darkens: left as it is */
             /* Outside: the dark, as far as the picture is stretched */
-            float b = dark;
+            float f = 0.0f, hot = 0.0f;
             if (d < 1.0f) {
-                /* One smooth fall from the middle to the dark by the rim,
-                 * flat at both ends: no knee in it, which the eye takes for
-                 * a line round the light */
-                /* Bright across most of it, easing out by the rim */
+                /* The body: one smooth fall from the middle to the dark by
+                 * the rim, flat at both ends: no knee in it, which the eye
+                 * takes for a line round the light */
                 float s = clampf(d / 0.97f), u = s * s;
-                float f = 1.0f - u * u * (3.0f - 2.0f * u);
-                /* Streaks out from the middle, as a reflector throws */
+                float body = 1.0f - u * u * (3.0f - 2.0f * u);
+                /* A hot spot the reflector focuses, whiter than the rest */
+                hot = expf(-d * d * 12.0f);
+                /* Faint rings round it, a reflector's, and a darker band
+                 * just outside the hot spot */
+                float ring = 0.025f * expf(-(d - 0.55f) * (d - 0.55f) * 300.0f)
+                           - 0.02f * expf(-(d - 0.33f) * (d - 0.33f) * 200.0f);
+                /* Streaks out from the middle, faint, gone by the rim */
                 float a = atan2f(fy, fx);
-                f *= 1.0f + 0.12f * d * sinf(a * 7.0f) * sinf(a * 11.0f + 1.3f);
-                b = dark + (2.0f - dark) * f;
+                float streak = 0.05f * d * (1.0f - d) * sinf(a * 7.0f) * sinf(a * 11.0f + 1.3f);
+                f = 0.8f * body + 0.2f * hot + (ring + streak) * body * 4.0f;
+                if (f < 0.0f) f = 0.0f;
+                if (f > 1.0f) f = 1.0f;
             }
-            /* A warm light: a little less blue, in what it adds over the
-             * dark only, so the rim is as dark as outside in each colour */
-            float ex = b - dark;
-            float base = dark;
-            px[y * GLOW + x] = rgb565((base + ex) * 0.5f, (base + ex * 0.96f) * 0.5f,
-                                      (base + ex * 0.84f) * 0.5f);
+            /* What it adds over the dark: white in the hot spot, warmer out
+             * from it (the dark itself left grey, so the rim is outside's
+             * in each colour) */
+            float ex = (2.0f - dark) * f;
+            float warm = 1.0f - hot;
+            float r = dark + ex, gg = dark + ex * (1.0f - 0.07f * warm),
+                  bb = dark + ex * (1.0f - 0.22f * warm);
+            /* A pixel's own fraction of a step (5 bits are coarse): no bands
+             * round the light, only where it adds anything */
+            float dith = 0.0f;
+            if (ex > 0.02f) {
+                uint32_t h = (uint32_t)x * 73856093u ^ (uint32_t)y * 19349663u;
+                h ^= h >> 13; h *= 0x5bd1e995u; h ^= h >> 15;
+                dith = ((float)(h & 1023) / 1023.0f - 0.5f) * (2.0f / 31.0f);
+            }
+            px[y * GLOW + x] = rgb565(r * 0.5f + dith, gg * 0.5f + dith * 0.5f, bb * 0.5f + dith);
         }
-    pvr_txr_load(px, g_glow, sizeof px);
+    pvr_txr_load(px, g_glow, GLOW * GLOW * 2);
+    free(px);
     return true;
 }
 
@@ -475,83 +494,221 @@ static void glow_draw(void* user) {
  * particles are.
  * ================================================================ */
 
-static alignas(32) pvr_poly_hdr_t g_shaft_hdr;
+
+/* ================================================================
+ * Dust: motes fixed in the world, a few to a cell of a grid, drifting a
+ * little where they are. Only those in a shaft are drawn, as bright as it
+ * is there and brightest on its axis, twinkling, so the beam sweeping
+ * through the air lights up different ones as it goes.
+ * ================================================================ */
+
+#define MOTE      16            /* a mote's picture, this wide */
+#define DUST_CELL 0.7f          /* the grid's cells, metres */
+#define DUST_NEAR 0.8f          /* none nearer the lamp than this */
+#define DUST_FAR  6.0f          /* nor further */
+#define DUST_SIZE 0.012f        /* half a mote, metres */
+#define DUST_MOST 160           /* drawn a frame */
+
+static float g_dust;
+static pvr_ptr_t g_mote;
+static alignas(32) pvr_poly_hdr_t g_mote_hdr;
+
+void dc_beam_dust(float amount) { g_dust = amount < 0.0f ? 0.0f : amount; }
+
+static bool mote_make(void) {
+    if (g_mote) return true;
+    static bool failed;
+    if (failed) return false;
+    DC_VRAM_TAG_TEX("beam dust", MOTE, MOTE, "ARGB4444");
+    g_mote = pvr_mem_malloc(MOTE * MOTE * 2);
+    if (!g_mote) { failed = true; return false; }
+    alignas(32) static uint16_t px[MOTE * MOTE];
+    for (int y = 0; y < MOTE; y++)
+        for (int x = 0; x < MOTE; x++) {
+            float fx = (x + 0.5f) / (MOTE / 2) - 1.0f, fy = (y + 0.5f) / (MOTE / 2) - 1.0f;
+            float a = clampf(1.0f - (fx * fx + fy * fy));
+            px[y * MOTE + x] = (uint16_t)(((int)(a * a * 15.0f + 0.5f) << 12) | 0x0FFF);
+        }
+    pvr_txr_load(px, g_mote, sizeof px);
+    pvr_poly_cxt_t cxt;
+    pvr_poly_cxt_txr(&cxt, PVR_LIST_TR_POLY, PVR_TXRFMT_ARGB4444 | PVR_TXRFMT_NONTWIDDLED,
+                     MOTE, MOTE, g_mote, PVR_FILTER_BILINEAR);
+    cxt.gen.culling = PVR_CULLING_NONE;
+    cxt.txr.env = PVR_TXRENV_MODULATEALPHA;
+    cxt.blend.src = PVR_BLEND_SRCALPHA;
+    cxt.blend.dst = PVR_BLEND_ONE;
+    cxt.depth.write = PVR_DEPTHWRITE_DISABLE;
+    pvr_poly_compile(&g_mote_hdr, &cxt);
+    return true;
+}
+
+static uint32_t hash3(int x, int y, int z) {
+    uint32_t h = (uint32_t)x * 73856093u ^ (uint32_t)y * 19349663u ^ (uint32_t)z * 83492791u;
+    h ^= h >> 13; h *= 0x5bd1e995u; h ^= h >> 15;
+    return h;
+}
+
+static void dust_draw(const DCCamera* cam, const Shaft* s, pvr_dr_state_t* dr) {
+    float t = tanf(s->half), far = s->length < DUST_FAR ? s->length : DUST_FAR;
+    float now = (float)(dc_time_ms() % 1000000u) * 0.001f;
+    /* The cells round the part of the shaft with dust in it */
+    shz_vec3_t a = add(s->from, scale(s->dir, DUST_NEAR)), b = add(s->from, scale(s->dir, far));
+    float r = far * t;
+    int lo[3], hi[3];
+    float pa[3] = { a.x, a.y, a.z }, pb[3] = { b.x, b.y, b.z };
+    for (int i = 0; i < 3; i++) {
+        float mn = pa[i] < pb[i] ? pa[i] : pb[i], mx = pa[i] < pb[i] ? pb[i] : pa[i];
+        lo[i] = (int)floorf((mn - r) / DUST_CELL);
+        hi[i] = (int)floorf((mx + r) / DUST_CELL);
+    }
+    static alignas(32) DMSVertex q[DUST_MOST * 4];
+    int n = 0;
+    for (int gz = lo[2]; gz <= hi[2] && n < DUST_MOST; gz++)
+        for (int gy = lo[1]; gy <= hi[1] && n < DUST_MOST; gy++)
+            for (int gx = lo[0]; gx <= hi[0] && n < DUST_MOST; gx++) {
+                uint32_t h = hash3(gx, gy, gz);
+                if ((h & 3) == 0) continue;             /* not every cell has one */
+                float ph = (float)((h >> 8) & 1023) * (6.2831853f / 1024.0f);
+                float ox = (float)((h >> 2) & 63) / 63.0f, oy = (float)((h >> 18) & 63) / 63.0f,
+                      oz = (float)((h >> 24) & 63) / 63.0f;
+                /* Drifting slowly round where it lives */
+                shz_vec3_t p = shz_vec3_init(
+                    (gx + ox) * DUST_CELL + 0.12f * sinf(now * 0.23f + ph),
+                    (gy + oy) * DUST_CELL + 0.08f * sinf(now * 0.17f + ph * 1.7f),
+                    (gz + oz) * DUST_CELL + 0.12f * cosf(now * 0.19f + ph * 2.3f));
+                shz_vec3_t o = shz_vec3_sub(p, s->from);
+                float along = o.x * s->dir.x + o.y * s->dir.y + o.z * s->dir.z;
+                if (along < DUST_NEAR || along > far) continue;
+                float edge = along * t;
+                float off = (o.x * o.x + o.y * o.y + o.z * o.z) - along * along;
+                float in = off / (edge * edge);
+                if (in >= 1.0f) continue;
+                /* Brightest on the axis, in from nothing near the lamp, out
+                 * by the far end, catching the light now and then */
+                float fn = clampf((along - DUST_NEAR) / 1.0f), ff = 1.0f - along / far;
+                float tw = 0.35f + 0.65f * (0.5f + 0.5f * sinf(now * (0.9f + ox) + ph));
+                float lit = (1.0f - in) * (1.0f - in) * fn * fn * (3.0f - 2.0f * fn) * ff * tw * g_dust;
+                if (lit < 0.03f) continue;
+                /* Facing the camera */
+                shz_vec3_t to = unit(shz_vec3_sub(cam->pos, p));
+                shz_vec3_t ru = unit(cross(shz_vec3_init(0, 1, 0), to));
+                shz_vec3_t up = cross(to, ru);
+                uint32_t col = ((uint32_t)(clampf(lit) * 255.0f) << 24) | (s->rgb & 0xFFFFFF);
+                static const float cu[4] = { -1, 1, -1, 1 }, cv[4] = { -1, -1, 1, 1 };
+                DMSVertex* v = &q[n * 4];
+                for (int k = 0; k < 4; k++) {
+                    shz_vec3_t c = add(p, add(scale(ru, cu[k] * DUST_SIZE), scale(up, cv[k] * DUST_SIZE)));
+                    v[k].x = c.x; v[k].y = c.y; v[k].z = c.z;
+                    v[k].u = (cu[k] + 1.0f) * 0.5f;
+                    v[k].v = (cv[k] + 1.0f) * 0.5f;
+                    v[k].argb = col;
+                    v[k].flags = k == 3 ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
+                }
+                n++;
+            }
+    if (!n) return;
+    dc_send_hdr(dr, &g_mote_hdr);
+    shz_xmtrx_load_4x4((shz_mat4x4_t*)dc_camera_get_pv(cam));
+    shz_xmtrx_translate(-cam->pos.x, -cam->pos.y, cam->pos.z);
+    dc_model_submit_quads(q, n, dr);
+}
+
+/* The haze in a shaft: soft round glows along its middle, each facing the
+ * camera and as wide as the shaft there, added up. Seen from behind the
+ * lamp they pile into a soft streak from it into the light, thickest along
+ * the middle, as lit air is; a shell round it would show only its sides. */
+#define HAZE     64             /* a glow's picture, this wide */
+#define HAZES    10             /* glows along a shaft */
+
+static pvr_ptr_t g_haze;
+static alignas(32) pvr_poly_hdr_t g_haze_hdr;
+
+static bool haze_make(void) {
+    if (g_haze) return true;
+    static bool failed;
+    if (failed) return false;
+    DC_VRAM_TAG_TEX("beam haze", HAZE, HAZE, "ARGB4444");
+    g_haze = pvr_mem_malloc(HAZE * HAZE * 2);
+    if (!g_haze) { failed = true; printf("dc_beam: no VRAM for the haze\n"); return false; }
+    uint16_t* px = memalign(32, HAZE * HAZE * 2);
+    if (!px) { pvr_mem_free(g_haze); g_haze = NULL; failed = true; return false; }
+    for (int y = 0; y < HAZE; y++)
+        for (int x = 0; x < HAZE; x++) {
+            float fx = (x + 0.5f) / (HAZE / 2) - 1.0f, fy = (y + 0.5f) / (HAZE / 2) - 1.0f;
+            float r2 = fx * fx + fy * fy;
+            /* Soft all the way, nothing by the edge */
+            float a = r2 < 1.0f ? expf(-r2 * 3.0f) * (1.0f - r2) * (1.0f - r2) : 0.0f;
+            /* A pixel's own fraction of a step: 4 bits band */
+            uint32_t h = (uint32_t)x * 73856093u ^ (uint32_t)y * 19349663u;
+            h ^= h >> 13; h *= 0x5bd1e995u; h ^= h >> 15;
+            float q = a * 15.0f + (a > 0.0f ? (float)(h & 255) / 255.0f - 0.5f : 0.0f);
+            int ia = (int)(q + 0.5f);
+            ia = ia < 0 ? 0 : ia > 15 ? 15 : ia;
+            px[y * HAZE + x] = (uint16_t)((ia << 12) | 0x0FFF);
+        }
+    pvr_txr_load(px, g_haze, HAZE * HAZE * 2);
+    free(px);
+    pvr_poly_cxt_t cxt;
+    pvr_poly_cxt_txr(&cxt, PVR_LIST_TR_POLY, PVR_TXRFMT_ARGB4444 | PVR_TXRFMT_NONTWIDDLED,
+                     HAZE, HAZE, g_haze, PVR_FILTER_BILINEAR);
+    cxt.gen.culling = PVR_CULLING_NONE;
+    cxt.txr.env = PVR_TXRENV_MODULATEALPHA;
+    cxt.txr.uv_clamp = PVR_UVCLAMP_UV;
+    cxt.blend.src = PVR_BLEND_SRCALPHA;
+    cxt.blend.dst = PVR_BLEND_ONE;
+    cxt.depth.write = PVR_DEPTHWRITE_DISABLE;
+    pvr_poly_compile(&g_haze_hdr, &cxt);
+    return true;
+}
 
 static void shaft_draw(void* user) {
     (void)user;
     const DCCamera* cam = &g.shaft_cam;
-    static bool made;
-    if (!made) {
-        pvr_poly_cxt_t cxt;
-        pvr_poly_cxt_col(&cxt, PVR_LIST_TR_POLY);
-        cxt.gen.culling = PVR_CULLING_NONE;
-        cxt.gen.shading = PVR_SHADE_GOURAUD;
-        cxt.blend.src = PVR_BLEND_SRCALPHA;
-        cxt.blend.dst = PVR_BLEND_ONE;
-        cxt.depth.write = PVR_DEPTHWRITE_DISABLE;
-        pvr_poly_compile(&g_shaft_hdr, &cxt);
-        made = true;
-    }
     pvr_dr_state_t* dr = dc_dr_state();
-    dc_send_hdr(dr, &g_shaft_hdr);
-    shz_xmtrx_load_4x4((shz_mat4x4_t*)dc_camera_get_pv(cam));
-    shz_xmtrx_translate(-cam->pos.x, -cam->pos.y, cam->pos.z);
-
-    alignas(32) DMSVertex q[SHAFT_SIDES * 4];
-    for (int i = 0; i < g.shafts; i++) {
-        const Shaft* s = &g.s[i];
-        shz_vec3_t d = s->dir;
-        shz_vec3_t bu = unit(cross(d, fabsf(d.y) < 0.9f ? shz_vec3_init(0, 1, 0) : shz_vec3_init(1, 0, 0)));
-        shz_vec3_t bv = cross(d, bu);
-        float t = tanf(s->half);
-        float ch = cosf(s->half), sh = sinf(s->half);
-
-        /* Each ring: its corners and how bright */
-        shz_vec3_t at[RINGS][SHAFT_SIDES];
-        uint32_t argb[RINGS][SHAFT_SIDES];
-        for (int r = 0; r < RINGS; r++) {
-            /* Closer together near its start, where it changes most */
-            float f = (float)r / (RINGS - 1);
-            float along = s->start + (s->length - s->start) * f * f;
-            float rad = s->r0 + along * t;
-            shz_vec3_t c = add(s->from, scale(d, along));
-            /* In from nothing at its start, gone by the end */
-            float in = clampf(f * 3.0f);
-            in = in * in * (3.0f - 2.0f * in);
-            float fade = s->strength * in * (1.0f - f) * sqrtf(1.0f - f);
-            for (int k = 0; k < SHAFT_SIDES; k++) {
-                shz_sincos_t a = shz_sincosf(6.2831853f * k / SHAFT_SIDES);
-                shz_vec3_t o = add(scale(bu, a.cos), scale(bv, a.sin));
-                shz_vec3_t p = add(c, scale(o, rad));
-                at[r][k] = p;
-                /* Edge on, a side shows only its thin rim of haze */
-                shz_vec3_t to = unit(shz_vec3_init(cam->pos.x - p.x, cam->pos.y - p.y, cam->pos.z - p.z));
-                float face = fabsf(o.x * to.x + o.y * to.y + o.z * to.z);
-                /* Gone at its true outline (the side leans out by the
-                 * cone's angle), so its edge is soft, not a line */
-                shz_vec3_t n = add(scale(o, ch), scale(d, -sh));
-                face *= clampf(fabsf(n.x * to.x + n.y * to.y + n.z * to.z) * 4.0f);
-                uint32_t al = (uint32_t)(clampf(fade * face) * 255.0f);
-                argb[r][k] = (al << 24) | (s->rgb & 0xFFFFFF);
-            }
-        }
-
-        /* A square for each side between each two rings */
-        for (int r = 0; r + 1 < RINGS; r++) {
-            for (int k = 0; k < SHAFT_SIDES; k++) {
-                int ks[2] = { k, (k + 1) % SHAFT_SIDES };
-                DMSVertex* v = &q[k * 4];
+    if (haze_make()) {
+        dc_send_hdr(dr, &g_haze_hdr);
+        shz_xmtrx_load_4x4((shz_mat4x4_t*)dc_camera_get_pv(cam));
+        shz_xmtrx_translate(-cam->pos.x, -cam->pos.y, cam->pos.z);
+        alignas(32) DMSVertex q[HAZES * 4];
+        static const float cu[4] = { -1, 1, -1, 1 }, cv[4] = { -1, -1, 1, 1 };
+        for (int i = 0; i < g.shafts; i++) {
+            const Shaft* s = &g.s[i];
+            float t = tanf(s->half);
+            int n = 0;
+            for (int k = 0; k < HAZES; k++) {
+                /* Closer together near its start, where it changes most */
+                float f = (k + 0.5f) / HAZES;
+                float along = s->start + (s->length - s->start) * f * f;
+                float rad = (s->r0 + along * t) * 0.8f;
+                shz_vec3_t c = add(s->from, scale(s->dir, along));
+                /* In from nothing at its start, gone by the end; each a
+                 * share of the whole, the far ones (piled up where the
+                 * light lands) less */
+                float in = clampf(f * 3.0f);
+                in = in * in * (3.0f - 2.0f * in);
+                float a = s->strength * in * (1.0f - f) * (1.0f - f) * (0.7f / HAZES);
+                if (a < 0.004f) continue;
+                shz_vec3_t to = unit(shz_vec3_sub(cam->pos, c));
+                shz_vec3_t ru = unit(cross(fabsf(to.y) < 0.95f ? shz_vec3_init(0, 1, 0)
+                                                               : shz_vec3_init(1, 0, 0), to));
+                shz_vec3_t up = cross(to, ru);
+                uint32_t col = ((uint32_t)(clampf(a) * 255.0f) << 24) | (s->rgb & 0xFFFFFF);
+                DMSVertex* v = &q[n * 4];
                 for (int m = 0; m < 4; m++) {
-                    int rr = r + (m >> 1), kk = ks[m & 1];
-                    v[m].x = at[rr][kk].x; v[m].y = at[rr][kk].y; v[m].z = at[rr][kk].z;
-                    v[m].u = v[m].v = 0.0f;
-                    v[m].argb = argb[rr][kk];
+                    shz_vec3_t p = add(c, add(scale(ru, cu[m] * rad), scale(up, cv[m] * rad)));
+                    v[m].x = p.x; v[m].y = p.y; v[m].z = p.z;
+                    v[m].u = (cu[m] + 1.0f) * 0.5f;
+                    v[m].v = (cv[m] + 1.0f) * 0.5f;
+                    v[m].argb = col;
                     v[m].flags = m == 3 ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
                 }
+                n++;
             }
-            dc_model_submit_quads(q, SHAFT_SIDES, dr);
+            dc_model_submit_quads(q, n, dr);
         }
     }
+    if (g_dust > 0.0f && mote_make())
+        for (int i = 0; i < g.shafts; i++) dust_draw(cam, &g.s[i], dr);
 }
 
 void dc_beam_shaft(shz_vec3_t from, shz_vec3_t dir, float r0, float half_angle, float start,

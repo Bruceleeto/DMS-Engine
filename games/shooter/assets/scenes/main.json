@@ -3,8 +3,8 @@
     "background": "#000000",
     "fog": {
         "color": "#000000",
-        "near": 22,
-        "far": 38
+        "near": 6,
+        "far": 32
     },
     "camera": {
         "pos": [
